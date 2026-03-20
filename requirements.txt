@@ -1,14 +1,10 @@
-sheeze==8.8.0
 pandas
 numpy==1.26.1
 pytz
-pymongo
 gunicorn
 tqdm
 xlrd==1.2.0
 openpyxl
-autotraderapi==2.1.2
-ezapi==4.6.0
 requests==2.28.0
 python-dateutil
 plotly

@@ -26,11 +26,8 @@ Option 3 – Bayut API (FREE, 750 calls/month, no credit card)
 
 from __future__ import annotations
 
-import json
-import textwrap
 from datetime import date
 
-import numpy as np
 import polars as pl
 import plotly.colors
 import plotly.graph_objects as go
@@ -39,139 +36,244 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+CSV_PATH = "data/transactions-2026-03-20 unit.csv"
+
 NEIGHBORHOODS: list[str] = [
-    # Premium / waterfront
-    "Palm Jumeirah",
-    "Downtown Dubai",
-    "DIFC",
-    "JBR",
-    "Dubai Creek Harbour",
-    # Mid-tier established
-    "Dubai Marina",
-    "JLT",
-    "Business Bay",
-    "Meydan City",
-    # Suburban / community
-    "Dubai Hills Estate",
-    "Arabian Ranches",
-    "Damac Hills",
-    "Al Furjan",
-    # Affordable / value
-    "Al Barsha",
-    "JVC",
-    "Motor City",
-    "Dubai Sports City",
-    # Emerging / outer
-    "Bur Dubai",
-    "Dubai Silicon Oasis",
-    "Dubai South",
+    # High-volume
+    "JUMEIRAH VILLAGE CIRCLE",
+    "BUSINESS BAY",
+    "MAJAN",
+    "DUBAI MARINA",
+    "BURJ KHALIFA",
+    "JUMEIRAH LAKES TOWERS",
+    "DUBAI CREEK HARBOUR",
+    "ARJAN",
+    "DUBAI SPORTS CITY",
+    "SILICON OASIS",
+    # Mid-volume
+    "INTERNATIONAL CITY PH 1",
+    "MEYDAN ONE",
+    "DISCOVERY GARDENS",
+    "AL FURJAN",
+    "SOBHA HEARTLAND",
+    "PALM JUMEIRAH",
+    "DUBAI HILLS",
+    "THE GREENS",
+    "DUBAI PRODUCTION CITY",
+    "MOTOR CITY",
 ]
 
-# Baseline prices (AED) and price-per-sqft at Jan 2020, calibrated to DLD data
-NEIGHBORHOOD_PARAMS: dict = {
-    # Premium / waterfront
-    "Palm Jumeirah":      {"1BR": 1_800_000, "2BR": 3_500_000, "sqft": 2_800, "min_txn":  40, "max_txn": 120},
-    "Downtown Dubai":     {"1BR": 1_500_000, "2BR": 2_800_000, "sqft": 2_500, "min_txn":  80, "max_txn": 200},
-    "DIFC":               {"1BR": 1_400_000, "2BR": 2_600_000, "sqft": 2_400, "min_txn":  30, "max_txn":  90},
-    "JBR":                {"1BR": 1_300_000, "2BR": 2_400_000, "sqft": 2_200, "min_txn":  60, "max_txn": 160},
-    "Dubai Creek Harbour":{"1BR": 1_200_000, "2BR": 2_200_000, "sqft": 2_050, "min_txn":  50, "max_txn": 140},
-    # Mid-tier established
-    "Dubai Marina":       {"1BR": 1_100_000, "2BR": 2_000_000, "sqft": 1_900, "min_txn": 150, "max_txn": 350},
-    "JLT":                {"1BR":   850_000, "2BR": 1_520_000, "sqft": 1_450, "min_txn": 110, "max_txn": 270},
-    "Business Bay":       {"1BR":   950_000, "2BR": 1_750_000, "sqft": 1_600, "min_txn": 120, "max_txn": 280},
-    "Meydan City":        {"1BR": 1_000_000, "2BR": 1_850_000, "sqft": 1_720, "min_txn":  35, "max_txn": 100},
-    # Suburban / community
-    "Dubai Hills Estate": {"1BR":   900_000, "2BR": 1_600_000, "sqft": 1_500, "min_txn":  80, "max_txn": 200},
-    "Arabian Ranches":    {"1BR":   850_000, "2BR": 1_550_000, "sqft": 1_300, "min_txn":  50, "max_txn": 140},
-    "Damac Hills":        {"1BR":   800_000, "2BR": 1_450_000, "sqft": 1_250, "min_txn":  45, "max_txn": 130},
-    "Al Furjan":          {"1BR":   750_000, "2BR": 1_350_000, "sqft": 1_100, "min_txn":  70, "max_txn": 180},
-    # Affordable / value
-    "Al Barsha":          {"1BR":   750_000, "2BR": 1_350_000, "sqft": 1_100, "min_txn":  90, "max_txn": 220},
-    "JVC":                {"1BR":   700_000, "2BR": 1_250_000, "sqft":   950, "min_txn": 200, "max_txn": 450},
-    "Motor City":         {"1BR":   700_000, "2BR": 1_250_000, "sqft": 1_000, "min_txn":  55, "max_txn": 140},
-    "Dubai Sports City":  {"1BR":   650_000, "2BR": 1_150_000, "sqft":   880, "min_txn":  65, "max_txn": 160},
-    # Emerging / outer
-    "Bur Dubai":          {"1BR":   720_000, "2BR": 1_300_000, "sqft": 1_000, "min_txn": 100, "max_txn": 250},
-    "Dubai Silicon Oasis":{"1BR":   600_000, "2BR": 1_050_000, "sqft":   810, "min_txn":  75, "max_txn": 190},
-    "Dubai South":        {"1BR":   680_000, "2BR": 1_200_000, "sqft":   850, "min_txn":  60, "max_txn": 160},
-}
+DATE_START = date(2026, 2, 2)
+DATE_END   = date(2026, 3, 18)
 
-# Piecewise annual growth rates sourced from DLD RPPI (Residential Properties Price Index)
-ANNUAL_GROWTH: dict[int, float] = {
-    2020: 0.010,   # flat – COVID impact
-    2021: 0.040,   # early recovery
-    2022: 0.160,   # post-Expo 2020 demand surge
-    2023: 0.130,   # continued high demand
-    2024: 0.100,   # market maturing
-    2025: 0.070,   # stabilisation
-    2026: 0.050,   # annualised Q1 2026 rate
+TIER_MAP: dict[str, str] = {}
+TIER_AREAS: dict[str, list[str]] = {
+    "Ultra-premium": [
+        "BLUEWATERS", "DUBAI HARBOUR", "DUBAI WATER CANAL",
+    ],
+    "Premium": [
+        "PALM JUMEIRAH", "BURJ KHALIFA", "DUBAI CREEK HARBOUR", "DUBAI HILLS",
+        "MEYDAN ONE", "JUMEIRAH BEACH RESIDENCE", "AL BARARI",
+    ],
+    "Mid-market": [
+        "DUBAI MARINA", "BUSINESS BAY", "JUMEIRAH LAKES TOWERS", "SOBHA HEARTLAND",
+        "Business Bay", "THE GREENS", "AL FURJAN", "DUBAI HEALTHCARE CITY - PHASE 2",
+        "DAMAC HILLS", "JUMEIRAH VILLAGE TRIANGLE", "TOWN SQUARE", "Al Yelayiss 2",
+    ],
+    "Value": [
+        "JUMEIRAH VILLAGE CIRCLE", "ARJAN", "MOTOR CITY", "DISCOVERY GARDENS",
+        "SILICON OASIS", "DUBAI PRODUCTION CITY", "DUBAI SOUTH",
+    ],
+    "Budget": [
+        "INTERNATIONAL CITY PH 1", "DUBAI LAND RESIDENCE COMPLEX", "LIWAN",
+        "DUBAI SPORTS CITY", "MAJAN", "DUBAI INVESTMENT PARK SECOND",
+    ],
 }
-
-DATE_START = date(2020, 1, 1)
-DATE_END   = date(2026, 3, 1)
+for tier, areas in TIER_AREAS.items():
+    for a in areas:
+        TIER_MAP[a] = tier
+TIER_ORDER = ["Ultra-premium", "Premium", "Mid-market", "Value", "Budget"]
+TIER_COLORS = {
+    "Ultra-premium": "#e377c2",
+    "Premium":       "#ff7f0e",
+    "Mid-market":    "#636efa",
+    "Value":         "#00cc96",
+    "Budget":        "#ffa15a",
+}
 
 # Alphabet palette has 26 entries – enough for 20 neighbourhoods
 COLORS = plotly.colors.qualitative.Alphabet
 COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
 
 # ---------------------------------------------------------------------------
-# Data generation (Polars)
+# Data loading (Polars) – real DLD transaction CSV
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Generating price data…")
+@st.cache_data(show_spinner="Loading transaction data…")
 def generate_dubai_data() -> pl.DataFrame:
-    """Synthetic monthly apartment price data calibrated to DLD statistics.
+    """Load and aggregate real DLD apartment transactions from CSV.
 
-    Methodology:
-      - Baseline prices from NEIGHBORHOOD_PARAMS (DLD Jan 2020 averages)
-      - Monthly compounding of piecewise annual growth rates from ANNUAL_GROWTH
-      - Gaussian noise (σ = 1.5 % price, 1.2 % sqft), seeded for reproducibility
-      - YoY % computed via Polars window pct_change(12) per group
+    Aggregates individual transactions to daily averages per
+    neighbourhood and bedroom type, matching the dashboard schema.
     """
-    rng = np.random.default_rng(seed=42)
-
-    month_dates: list[date] = (
-        pl.date_range(DATE_START, DATE_END, interval="1mo", eager=True).to_list()
-    )
-
-    rows: list[dict] = []
-    for neighborhood, params in NEIGHBORHOOD_PARAMS.items():
-        for br in ("1BR", "2BR"):
-            base_price = float(params[br])
-            base_sqft  = float(params["sqft"])
-            cumulative = 1.0
-
-            for d in month_dates:
-                monthly_rate = (1.0 + ANNUAL_GROWTH[d.year]) ** (1.0 / 12.0)
-                cumulative  *= monthly_rate
-
-                price     = base_price * cumulative * rng.normal(1.0, 0.015)
-                sqft_rate = base_sqft  * cumulative * rng.normal(1.0, 0.012)
-
-                rows.append({
-                    "date":               d,
-                    "neighborhood":       neighborhood,
-                    "bedroom_type":       br,
-                    "avg_price_aed":      round(price, 0),
-                    "price_per_sqft_aed": round(sqft_rate, 1),
-                    "avg_size_sqft":      round(price / sqft_rate, 1),
-                    "transaction_count":  int(rng.integers(params["min_txn"], params["max_txn"] + 1)),
-                })
-
     df = (
-        pl.DataFrame(rows)
-        .sort(["neighborhood", "bedroom_type", "date"])
-        .with_columns(
-            (
-                pl.col("avg_price_aed")
-                .pct_change(n=12)
-                .over(["neighborhood", "bedroom_type"])
-                .mul(100.0)
-                .round(1)
-            ).alias("yoy_change_pct")
+        pl.read_csv(
+            CSV_PATH,
+            encoding="utf8-lossy",
+            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
         )
+        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+        .with_columns([
+            pl.col("INSTANCE_DATE").str.slice(0, 10)
+              .str.to_date("%Y-%m-%d")
+              .alias("date"),
+            pl.col("AREA_EN").alias("neighborhood"),
+            pl.col("ROOMS_EN").str.replace(" B/R", "BR").alias("bedroom_type"),
+            (pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")).alias("price_per_sqft"),
+        ])
+        .group_by(["date", "neighborhood", "bedroom_type"])
+        .agg([
+            pl.col("TRANS_VALUE").mean().round(0).alias("avg_price_aed"),
+            pl.col("price_per_sqft").mean().round(1).alias("price_per_sqft_aed"),
+            pl.col("ACTUAL_AREA").mean().round(1).alias("avg_size_sqft"),
+            pl.col("TRANS_VALUE").count().alias("transaction_count"),
+        ])
     )
     return df
+
+
+@st.cache_data(show_spinner="Computing Dubai-wide aggregates…")
+def generate_dubai_wide_data() -> pl.DataFrame:
+    """Daily Dubai-wide transaction count and median price (all flats)."""
+    return (
+        pl.read_csv(
+            CSV_PATH,
+            encoding="utf8-lossy",
+            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        )
+        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+        .with_columns(
+            pl.col("INSTANCE_DATE").str.slice(0, 10)
+              .str.to_date("%Y-%m-%d")
+              .alias("date"),
+        )
+        .group_by("date")
+        .agg([
+            pl.col("TRANS_VALUE").count().alias("transaction_count"),
+            pl.col("TRANS_VALUE").median().round(0).alias("median_price_aed"),
+            pl.col("TRANS_VALUE").mean().round(0).alias("avg_price_aed"),
+        ])
+        .sort("date")
+    )
+
+
+@st.cache_data(show_spinner="Computing weekly stats…")
+def generate_weekly_data() -> pl.DataFrame:
+    """Weekly Dubai-wide aggregates with % change."""
+    return (
+        pl.read_csv(
+            CSV_PATH,
+            encoding="utf8-lossy",
+            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        )
+        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+        .with_columns(
+            pl.col("INSTANCE_DATE").str.slice(0, 10)
+              .str.to_date("%Y-%m-%d")
+              .dt.truncate("1w")
+              .alias("week"),
+        )
+        .group_by("week")
+        .agg([
+            pl.col("TRANS_VALUE").count().alias("txns"),
+            pl.col("TRANS_VALUE").median().round(0).alias("median"),
+            pl.col("TRANS_VALUE").mean().round(0).alias("mean"),
+        ])
+        .sort("week")
+        .with_columns([
+            pl.col("median").pct_change().mul(100).round(1).alias("median_pct_chg"),
+            pl.col("mean").pct_change().mul(100).round(1).alias("mean_pct_chg"),
+            pl.col("txns").pct_change().mul(100).round(1).alias("txn_pct_chg"),
+            (pl.col("mean") / pl.col("median")).round(2).alias("mean_median_ratio"),
+        ])
+    )
+
+
+@st.cache_data(show_spinner="Computing area-level trends…")
+def generate_area_weekly_change() -> pl.DataFrame:
+    """Per-area first-to-last-week median price % change (min 50 txns)."""
+    raw = (
+        pl.read_csv(
+            CSV_PATH,
+            encoding="utf8-lossy",
+            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        )
+        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+        .with_columns([
+            pl.col("INSTANCE_DATE").str.slice(0, 10)
+              .str.to_date("%Y-%m-%d")
+              .dt.truncate("1w")
+              .alias("week"),
+            pl.col("AREA_EN").alias("area"),
+        ])
+        .group_by(["area", "week"])
+        .agg([
+            pl.col("TRANS_VALUE").count().alias("txns"),
+            pl.col("TRANS_VALUE").median().round(0).alias("median"),
+        ])
+        .sort(["area", "week"])
+    )
+    # Keep areas with >= 50 total transactions
+    area_totals = raw.group_by("area").agg(
+        pl.col("txns").sum().alias("total_txns")
+    ).filter(pl.col("total_txns") >= 50)
+
+    first = raw.group_by("area").first().select(["area", pl.col("median").alias("first_median")])
+    last = raw.group_by("area").last().select(["area", pl.col("median").alias("last_median")])
+
+    return (
+        area_totals
+        .join(first, on="area")
+        .join(last, on="area")
+        .with_columns(
+            ((pl.col("last_median") - pl.col("first_median")) / pl.col("first_median") * 100)
+            .round(1)
+            .alias("pct_change")
+        )
+        .sort("pct_change")
+    )
+
+
+@st.cache_data(show_spinner="Computing tier aggregates…")
+def generate_tier_data() -> pl.DataFrame:
+    """Daily median price per market tier."""
+    return (
+        pl.read_csv(
+            CSV_PATH,
+            encoding="utf8-lossy",
+            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        )
+        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+        .filter(pl.col("AREA_EN").is_in(list(TIER_MAP.keys())))
+        .with_columns([
+            pl.col("INSTANCE_DATE").str.slice(0, 10)
+              .str.to_date("%Y-%m-%d")
+              .alias("date"),
+            pl.col("AREA_EN").replace_strict(TIER_MAP).alias("tier"),
+        ])
+        .group_by(["date", "tier"])
+        .agg([
+            pl.col("TRANS_VALUE").median().round(0).alias("median_price"),
+            pl.col("TRANS_VALUE").count().alias("txns"),
+        ])
+        .sort(["tier", "date"])
+        .with_columns(
+            pl.col("median_price")
+              .rolling_mean(7)
+              .over("tier")
+              .alias("median_7d")
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +381,7 @@ def apply_filters(
         & (pl.col("date") >= start)
         & (pl.col("date") <= end)
     )
-    if bedroom != "Both":
+    if bedroom != "All":
         mask = mask & (pl.col("bedroom_type") == bedroom)
     return df.filter(mask)
 
@@ -291,16 +393,15 @@ def apply_filters(
 def _layout_defaults(title: str) -> dict:
     return dict(
         title=dict(text=title, font=dict(size=13), x=0.01),
-        plot_bgcolor="#ffffff",
-        paper_bgcolor="#ffffff",
-        margin=dict(l=60, r=20, t=48, b=40),
-        font=dict(family="Segoe UI, Arial, sans-serif", size=11),
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font=dict(family="Segoe UI, Arial, sans-serif", size=11, color="#fafafa"),
     )
 
 
 def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
     fig   = go.Figure()
-    dash_ = {"1BR": "solid", "2BR": "dash"}
+    dash_ = {"Studio": "dot", "1BR": "solid", "2BR": "dash", "3BR": "dashdot"}
     nbhds = df["neighborhood"].unique().to_list()
     br_types = df["bedroom_type"].unique().sort().to_list()
 
@@ -334,16 +435,19 @@ def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
     fig.update_layout(
         **_layout_defaults("Average Apartment Price Over Time"),
         xaxis=dict(showgrid=False, zeroline=False),
-        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#e9ecef"),
+        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#2a2e35"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
         hovermode="x unified",
+        margin=dict(l=60, r=20, t=48, b=40),
     )
-    if len(br_types) == 2:
-        fig.add_annotation(
-            text="Solid = 1BR · Dashed = 2BR",
-            xref="paper", yref="paper", x=0.01, y=0.97,
-            showarrow=False, font=dict(size=10, color="#6c757d"),
-        )
+    if len(br_types) > 1:
+        legend_parts = [f"{dash_.get(br, 'solid').capitalize()} = {br}" for br in br_types if br in dash_]
+        if legend_parts:
+            fig.add_annotation(
+                text=" · ".join(legend_parts),
+                xref="paper", yref="paper", x=0.01, y=0.97,
+                showarrow=False, font=dict(size=10, color="#8b949e"),
+            )
     return fig
 
 
@@ -360,7 +464,7 @@ def bar_chart(df: pl.DataFrame, latest_date: date) -> go.Figure:
         .to_list()
     )
 
-    opacity_map = {"1BR": 1.0, "2BR": 0.65}
+    opacity_map = {"Studio": 0.50, "1BR": 1.0, "2BR": 0.80, "3BR": 0.65}
     for br in br_types:
         sub = latest.filter(pl.col("bedroom_type") == br)
         prices = {r["neighborhood"]: r["avg_price_aed"] for r in sub.iter_rows(named=True)}
@@ -377,7 +481,7 @@ def bar_chart(df: pl.DataFrame, latest_date: date) -> go.Figure:
         **_layout_defaults(f"Price Comparison · {latest_date.strftime('%b %Y')}"),
         barmode="group",
         xaxis=dict(tickangle=-35, tickfont=dict(size=10)),
-        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#e9ecef"),
+        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#2a2e35"),
         legend=dict(font=dict(size=10)),
         margin=dict(l=60, r=20, t=48, b=95),
     )
@@ -423,7 +527,7 @@ def price_vs_time_scatter(df: pl.DataFrame) -> go.Figure:
     fig.update_layout(
         **_layout_defaults("Avg Price vs Time — All Neighbourhoods"),
         xaxis=dict(showgrid=False, zeroline=False, title="Date"),
-        yaxis=dict(title="Avg Price (AED)", tickformat=",.0f", gridcolor="#e9ecef"),
+        yaxis=dict(title="Avg Price (AED)", tickformat=",.0f", gridcolor="#2a2e35"),
         legend=dict(
             orientation="v",
             x=1.01, y=1,
@@ -432,6 +536,173 @@ def price_vs_time_scatter(df: pl.DataFrame) -> go.Figure:
         ),
         hovermode="closest",
         margin=dict(l=60, r=140, t=48, b=40),
+    )
+    return fig
+
+
+def dubai_wide_transactions_chart(dw: pl.DataFrame) -> go.Figure:
+    """Daily transaction volume bar chart for all of Dubai."""
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=dw["date"].to_list(),
+        y=dw["transaction_count"].to_list(),
+        marker_color="#636efa",
+        opacity=0.85,
+        hovertemplate="<b>%{x|%d %b %Y}</b><br>Transactions: %{y:,}<extra></extra>",
+    ))
+    fig.update_layout(
+        **_layout_defaults("Daily Transaction Volume — All Dubai Apartments"),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(title="Transactions", gridcolor="#2a2e35"),
+        showlegend=False,
+        margin=dict(l=60, r=20, t=48, b=40),
+    )
+    return fig
+
+
+def dubai_wide_median_price_chart(dw: pl.DataFrame) -> go.Figure:
+    """Daily median/mean price with 7-day rolling averages for all of Dubai."""
+    dw = dw.with_columns([
+        pl.col("median_price_aed").rolling_mean(7).alias("median_7d"),
+        pl.col("avg_price_aed").rolling_mean(7).alias("mean_7d"),
+    ])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dw["date"].to_list(),
+        y=dw["median_price_aed"].to_list(),
+        mode="markers",
+        name="Median (daily)",
+        marker=dict(color="#00cc96", size=5, opacity=0.35),
+        hovertemplate="<b>%{x|%d %b %Y}</b><br>Median: AED %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=dw["date"].to_list(),
+        y=dw["median_7d"].to_list(),
+        mode="lines",
+        name="Median (7d avg)",
+        line=dict(color="#00cc96", width=2.5),
+        hovertemplate="<b>%{x|%d %b %Y}</b><br>Median 7d avg: AED %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=dw["date"].to_list(),
+        y=dw["avg_price_aed"].to_list(),
+        mode="markers",
+        name="Mean (daily)",
+        marker=dict(color="#ab63fa", size=5, opacity=0.35),
+        hovertemplate="<b>%{x|%d %b %Y}</b><br>Mean: AED %{y:,.0f}<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=dw["date"].to_list(),
+        y=dw["mean_7d"].to_list(),
+        mode="lines",
+        name="Mean (7d avg)",
+        line=dict(color="#ab63fa", width=2.5, dash="dash"),
+        hovertemplate="<b>%{x|%d %b %Y}</b><br>Mean 7d avg: AED %{y:,.0f}<extra></extra>",
+    ))
+    fig.update_layout(
+        **_layout_defaults("Daily Median & Mean Price (with 7-day rolling avg) — All Dubai Apartments"),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#2a2e35"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+        hovermode="x unified",
+        margin=dict(l=60, r=20, t=48, b=40),
+    )
+    return fig
+
+
+def weekly_pct_change_chart(wk: pl.DataFrame) -> go.Figure:
+    """Weekly % change in median and mean price."""
+    fig = go.Figure()
+    weeks = wk["week"].to_list()
+    fig.add_trace(go.Bar(
+        x=weeks,
+        y=wk["median_pct_chg"].to_list(),
+        name="Median % chg",
+        marker_color=["#ef553b" if v is not None and v < 0 else "#00cc96" for v in wk["median_pct_chg"].to_list()],
+        hovertemplate="<b>%{x|%d %b}</b><br>Median: %{y:+.1f}%<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=weeks,
+        y=wk["mean_pct_chg"].to_list(),
+        mode="lines+markers",
+        name="Mean % chg",
+        line=dict(color="#ab63fa", width=2),
+        marker=dict(size=6),
+        hovertemplate="<b>%{x|%d %b}</b><br>Mean: %{y:+.1f}%<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dot", line_color="#555555", line_width=1)
+    fig.update_layout(
+        **_layout_defaults("Weekly Median Price % Change — All Dubai Apartments"),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(title="% Change", gridcolor="#2a2e35", zeroline=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+        hovermode="x unified",
+        margin=dict(l=60, r=20, t=48, b=40),
+    )
+    return fig
+
+
+def area_pct_change_chart(area_df: pl.DataFrame) -> go.Figure:
+    """Horizontal bar chart: per-area median price % change (first to last week)."""
+    fig = go.Figure()
+    areas = area_df["area"].to_list()
+    pcts = area_df["pct_change"].to_list()
+    colors = ["#ef553b" if v < 0 else "#00cc96" for v in pcts]
+    fig.add_trace(go.Bar(
+        y=areas,
+        x=pcts,
+        orientation="h",
+        marker_color=colors,
+        hovertemplate="<b>%{y}</b><br>Change: %{x:+.1f}%<extra></extra>",
+    ))
+    fig.add_vline(x=0, line_dash="dot", line_color="#555555", line_width=1)
+    fig.update_layout(
+        **_layout_defaults("Area-Level Median Price Change (first vs last week, min 50 txns)"),
+        xaxis=dict(title="% Change", gridcolor="#2a2e35", zeroline=False),
+        yaxis=dict(tickfont=dict(size=9)),
+        showlegend=False,
+        margin=dict(l=200, r=20, t=48, b=40),
+        height=max(400, len(areas) * 22),
+    )
+    return fig
+
+
+def tier_price_chart(tier_df: pl.DataFrame) -> go.Figure:
+    """Daily median price by market tier with 7-day rolling average."""
+    fig = go.Figure()
+    for tier in TIER_ORDER:
+        sub = tier_df.filter(pl.col("tier") == tier).sort("date")
+        if sub.is_empty():
+            continue
+        color = TIER_COLORS[tier]
+        # Faded daily dots
+        fig.add_trace(go.Scatter(
+            x=sub["date"].to_list(),
+            y=sub["median_price"].to_list(),
+            mode="markers",
+            name=f"{tier} (daily)",
+            legendgroup=tier,
+            showlegend=False,
+            marker=dict(color=color, size=4, opacity=0.3),
+            hovertemplate=f"<b>{tier}</b><br>%{{x|%d %b}}<br>Median: AED %{{y:,.0f}}<extra></extra>",
+        ))
+        # 7-day rolling average line
+        fig.add_trace(go.Scatter(
+            x=sub["date"].to_list(),
+            y=sub["median_7d"].to_list(),
+            mode="lines",
+            name=tier,
+            legendgroup=tier,
+            line=dict(color=color, width=2.5),
+            hovertemplate=f"<b>{tier}</b><br>%{{x|%d %b}}<br>7d avg: AED %{{y:,.0f}}<extra></extra>",
+        ))
+    fig.update_layout(
+        **_layout_defaults("Median Price by Market Tier (7-day rolling avg)"),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#2a2e35"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
+        hovermode="x unified",
+        margin=dict(l=60, r=20, t=48, b=40),
     )
     return fig
 
@@ -463,7 +734,7 @@ st.markdown(
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🏙️ Dubai RE Dashboard")
-    st.caption("Apartments · 1BR & 2BR · Jan 2020 – Mar 2026")
+    st.caption("Apartments · Feb 2026 – Mar 2026 · DLD Transactions")
     st.divider()
 
     neighborhoods = st.multiselect(
@@ -475,8 +746,8 @@ with st.sidebar:
 
     bedroom = st.radio(
         "Bedroom Type",
-        options=["1BR", "2BR", "Both"],
-        index=2,
+        options=["Studio", "1BR", "2BR", "3BR", "All"],
+        index=4,
         horizontal=True,
     )
 
@@ -485,7 +756,7 @@ with st.sidebar:
         value=(DATE_START, DATE_END),
         min_value=DATE_START,
         max_value=DATE_END,
-        format="MMM YYYY",
+        format="YYYY/MM/DD",
     )
     # Safely unpack; user may still be selecting end date
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
@@ -537,8 +808,7 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Data: synthetic, calibrated to DLD RPPI statistics. "
-        "Swap `generate_dubai_data()` for `fetch_dld_live_data()` to use real data."
+        "Data: DLD transactions CSV (apartments only)."
     )
 
 # ── Load & filter data ───────────────────────────────────────────────────────
@@ -592,7 +862,67 @@ with c4:
 
 st.divider()
 
-# ── Charts ────────────────────────────────────────────────────────────────────
+# ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
+DW = generate_dubai_wide_data()
+WK = generate_weekly_data()
+AREA_CHG = generate_area_weekly_change()
+
+# KPI cards for Dubai-wide price momentum
+first_wk = WK.row(0, named=True)
+last_wk = WK.row(-1, named=True)
+total_med_chg = (last_wk["median"] - first_wk["median"]) / first_wk["median"] * 100
+peak_med = WK["median"].max()
+from_peak = (last_wk["median"] - peak_med) / peak_med * 100
+
+st.markdown("### Dubai Market Pulse")
+m1, m2, m3, m4 = st.columns(4)
+with m1:
+    st.metric(
+        "Median Price (latest wk)",
+        f"AED {last_wk['median']:,.0f}",
+        delta=f"{last_wk['median_pct_chg']:+.1f}% vs prev wk",
+        delta_color="inverse",
+    )
+with m2:
+    st.metric(
+        "Period Change",
+        f"{total_med_chg:+.1f}%",
+        delta=f"AED {last_wk['median'] - first_wk['median']:+,.0f}",
+        delta_color="inverse",
+    )
+with m3:
+    st.metric(
+        "From Peak",
+        f"{from_peak:+.1f}%",
+        delta=f"AED {last_wk['median'] - peak_med:+,.0f}",
+        delta_color="inverse",
+        help=f"Peak median was AED {peak_med:,.0f}",
+    )
+with m4:
+    st.metric(
+        "Mean/Median Ratio",
+        f"{last_wk['mean_median_ratio']:.2f}x",
+        help="Values above 1.5x suggest a skewed market with high-end outliers pulling up the mean. "
+             "Rising ratio = premium segment decoupling from the broader market.",
+    )
+
+st.plotly_chart(dubai_wide_median_price_chart(DW), use_container_width=True)
+
+st.plotly_chart(weekly_pct_change_chart(WK), use_container_width=True)
+
+st.plotly_chart(dubai_wide_transactions_chart(DW), use_container_width=True)
+
+st.plotly_chart(area_pct_change_chart(AREA_CHG), use_container_width=True)
+
+st.divider()
+
+# ── Tier chart ────────────────────────────────────────────────────────────────
+TIER_DF = generate_tier_data()
+st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
+
+st.divider()
+
+# ── Filtered charts ───────────────────────────────────────────────────────────
 st.plotly_chart(line_chart(filtered, bedroom), use_container_width=True)
 
 st.plotly_chart(price_vs_time_scatter(filtered), use_container_width=True)
