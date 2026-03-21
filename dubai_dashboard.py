@@ -427,7 +427,7 @@ def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
                 line=dict(color=color, width=2, dash=dash_.get(br, "solid")),
                 hovertemplate=(
                     f"<b>{nbhd} – {br}</b><br>"
-                    "Date: %{x|%b %Y}<br>"
+                    "Date: %{x|%d %b %Y}<br>"
                     "Avg Price: AED %{y:,.0f}<br><extra></extra>"
                 ),
             ))
@@ -517,7 +517,7 @@ def price_vs_time_scatter(df: pl.DataFrame) -> go.Figure:
             customdata=cd,
             hovertemplate=(
                 f"<b>{nbhd}</b><br>"
-                "Date: %{x|%b %Y}<br>"
+                "Date: %{x|%d %b %Y}<br>"
                 "Avg Price: AED %{y:,.0f}<br>"
                 "Type: %{customdata[0]}<br>"
                 "Transactions: %{customdata[1]}<extra></extra>"
