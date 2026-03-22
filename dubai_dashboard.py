@@ -110,19 +110,23 @@ COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
 # ---------------------------------------------------------------------------
 
 @st.cache_data(show_spinner="Loading transaction data…")
-def generate_dubai_data() -> pl.DataFrame:
+def generate_dubai_data(trans_type: str = "All") -> pl.DataFrame:
     """Load and aggregate real DLD apartment transactions from CSV.
 
     Aggregates individual transactions to daily averages per
     neighbourhood and bedroom type, matching the dashboard schema.
     """
-    df = (
+    raw = _trans_type_filter(
         pl.read_csv(
             CSV_PATH,
             encoding="utf8-lossy",
             schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
         )
-        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
+        trans_type,
+    )
+    return (
+        raw
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -139,19 +143,21 @@ def generate_dubai_data() -> pl.DataFrame:
             pl.col("TRANS_VALUE").count().alias("transaction_count"),
         ])
     )
-    return df
 
 
 @st.cache_data(show_spinner="Computing Dubai-wide aggregates…")
-def generate_dubai_wide_data() -> pl.DataFrame:
+def generate_dubai_wide_data(trans_type: str = "All") -> pl.DataFrame:
     """Daily Dubai-wide transaction count and median price (all flats)."""
     return (
-        pl.read_csv(
-            CSV_PATH,
-            encoding="utf8-lossy",
-            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        _trans_type_filter(
+            pl.read_csv(
+                CSV_PATH,
+                encoding="utf8-lossy",
+                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+            )
+            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
+            trans_type,
         )
-        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
         .with_columns(
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -168,15 +174,18 @@ def generate_dubai_wide_data() -> pl.DataFrame:
 
 
 @st.cache_data(show_spinner="Computing weekly stats…")
-def generate_weekly_data() -> pl.DataFrame:
+def generate_weekly_data(trans_type: str = "All") -> pl.DataFrame:
     """Weekly Dubai-wide aggregates with % change."""
     return (
-        pl.read_csv(
-            CSV_PATH,
-            encoding="utf8-lossy",
-            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        _trans_type_filter(
+            pl.read_csv(
+                CSV_PATH,
+                encoding="utf8-lossy",
+                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+            )
+            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
+            trans_type,
         )
-        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
         .with_columns(
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -200,15 +209,18 @@ def generate_weekly_data() -> pl.DataFrame:
 
 
 @st.cache_data(show_spinner="Computing area-level trends…")
-def generate_area_weekly_change() -> pl.DataFrame:
+def generate_area_weekly_change(trans_type: str = "All") -> pl.DataFrame:
     """Per-area first-to-last-week median price % change (min 50 txns)."""
     raw = (
-        pl.read_csv(
-            CSV_PATH,
-            encoding="utf8-lossy",
-            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        _trans_type_filter(
+            pl.read_csv(
+                CSV_PATH,
+                encoding="utf8-lossy",
+                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+            )
+            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
+            trans_type,
         )
-        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -245,15 +257,18 @@ def generate_area_weekly_change() -> pl.DataFrame:
 
 
 @st.cache_data(show_spinner="Computing tier aggregates…")
-def generate_tier_data() -> pl.DataFrame:
+def generate_tier_data(trans_type: str = "All") -> pl.DataFrame:
     """Daily median price per market tier."""
     return (
-        pl.read_csv(
-            CSV_PATH,
-            encoding="utf8-lossy",
-            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+        _trans_type_filter(
+            pl.read_csv(
+                CSV_PATH,
+                encoding="utf8-lossy",
+                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+            )
+            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
+            trans_type,
         )
-        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
         .filter(pl.col("AREA_EN").is_in(list(TIER_MAP.keys())))
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
@@ -368,6 +383,16 @@ def fetch_bayut_transactions(
 # ---------------------------------------------------------------------------
 # Filter helper (Polars)
 # ---------------------------------------------------------------------------
+
+def _trans_type_filter(df: pl.DataFrame, trans_type: str) -> pl.DataFrame:
+    if trans_type == "Sale":
+        return df.filter(pl.col("GROUP_EN") == "Sales")
+    if trans_type == "Mortgage":
+        return df.filter(pl.col("GROUP_EN") == "Mortgage")
+    if trans_type == "Off-Plan":
+        return df.filter(pl.col("IS_OFFPLAN_EN") == "Off-Plan")
+    return df  # "All"
+
 
 def apply_filters(
     df: pl.DataFrame,
@@ -744,6 +769,14 @@ with st.sidebar:
         help="Select one or more Dubai neighbourhoods",
     )
 
+    trans_type = st.radio(
+        "Transaction Type",
+        options=["All", "Sale", "Mortgage", "Off-Plan"],
+        index=0,
+        horizontal=True,
+        help="Sale = ready secondary market · Mortgage = financed purchases · Off-Plan = under-construction units",
+    )
+
     bedroom = st.radio(
         "Bedroom Type",
         options=["Studio", "1BR", "2BR", "3BR", "All"],
@@ -812,7 +845,7 @@ with st.sidebar:
     )
 
 # ── Load & filter data ───────────────────────────────────────────────────────
-DF = generate_dubai_data()
+DF = generate_dubai_data(trans_type)
 
 if not neighborhoods:
     st.warning("Select at least one neighbourhood in the sidebar.")
@@ -846,6 +879,7 @@ st.markdown("## Dubai Apartment Prices")
 st.caption(
     f"Showing **{len(neighborhoods)}** neighbourhood(s) · "
     f"**{bedroom}** · "
+    f"**{trans_type}** · "
     f"{start_date.strftime('%b %Y')} – {end_date.strftime('%b %Y')}"
 )
 
@@ -863,9 +897,9 @@ with c4:
 st.divider()
 
 # ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
-DW = generate_dubai_wide_data()
-WK = generate_weekly_data()
-AREA_CHG = generate_area_weekly_change()
+DW = generate_dubai_wide_data(trans_type)
+WK = generate_weekly_data(trans_type)
+AREA_CHG = generate_area_weekly_change(trans_type)
 
 # KPI cards for Dubai-wide price momentum
 first_wk = WK.row(0, named=True)
@@ -917,7 +951,7 @@ st.plotly_chart(area_pct_change_chart(AREA_CHG), use_container_width=True)
 st.divider()
 
 # ── Tier chart ────────────────────────────────────────────────────────────────
-TIER_DF = generate_tier_data()
+TIER_DF = generate_tier_data(trans_type)
 st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
 
 st.divider()
