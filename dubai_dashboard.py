@@ -291,6 +291,54 @@ def generate_tier_data(trans_type: str = "All") -> pl.DataFrame:
     )
 
 
+@st.cache_data(show_spinner="Computing price vs median…")
+def generate_price_vs_median_data(trans_type: str = "All", bedroom: str = "All") -> pl.DataFrame:
+    """Per-area median price/sqft vs. citywide median — buyer opportunity scanner.
+
+    Returns each area's median AED/sqft, its % deviation from the citywide
+    median, and transaction count. Areas with fewer than 5 transactions are
+    excluded as statistically unreliable.
+    """
+    raw = (
+        _trans_type_filter(
+            pl.read_csv(
+                CSV_PATH,
+                encoding="utf8-lossy",
+                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+            )
+            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+            .filter(pl.col("ACTUAL_AREA") > 0),
+            trans_type,
+        )
+        .with_columns([
+            pl.col("AREA_EN").str.to_uppercase().alias("area"),
+            pl.col("ROOMS_EN").str.replace(" B/R", "BR").alias("bedroom_type"),
+            (pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")).alias("price_per_sqft"),
+        ])
+    )
+    if bedroom != "All":
+        raw = raw.filter(pl.col("bedroom_type") == bedroom)
+
+    citywide_median = raw["price_per_sqft"].median()
+
+    return (
+        raw
+        .group_by("area")
+        .agg([
+            pl.col("price_per_sqft").median().round(0).alias("median_psf"),
+            pl.col("price_per_sqft").count().alias("txns"),
+        ])
+        .filter(pl.col("txns") >= 5)
+        .with_columns([
+            ((pl.col("median_psf") - citywide_median) / citywide_median * 100)
+            .round(1)
+            .alias("pct_vs_median"),
+            pl.lit(float(citywide_median)).round(0).alias("citywide_median_psf"),
+        ])
+        .sort("pct_vs_median")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Live API connector (reference implementation – swap generate_dubai_data)
 # ---------------------------------------------------------------------------
@@ -732,6 +780,76 @@ def tier_price_chart(tier_df: pl.DataFrame) -> go.Figure:
     return fig
 
 
+def price_vs_median_chart(df: pl.DataFrame) -> go.Figure:
+    """Horizontal bar: each area's median AED/sqft vs the citywide median.
+
+    Green  = below median (potential undervaluation)
+    Orange = within ±10% of median (fairly priced)
+    Red    = above median (premium pricing)
+
+    A dashed line marks the −10% buy threshold used in the Metrics Hierarchy.
+    """
+    if df.is_empty():
+        return go.Figure()
+
+    areas   = df["area"].to_list()
+    pcts    = df["pct_vs_median"].to_list()
+    psf     = df["median_psf"].to_list()
+    txns    = df["txns"].to_list()
+    citywide = float(df["citywide_median_psf"][0])
+
+    colors = []
+    for v in pcts:
+        if v <= -10:
+            colors.append("#00cc96")   # strong green — undervalued (≤−10%)
+        elif v < 0:
+            colors.append("#7fddba")   # light green — slightly below median
+        elif v <= 10:
+            colors.append("#ffa15a")   # orange — near median
+        else:
+            colors.append("#ef553b")   # red — premium (>+10%)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        y=areas,
+        x=pcts,
+        orientation="h",
+        marker_color=colors,
+        customdata=list(zip(psf, txns)),
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "%{x:+.1f}% vs citywide median<br>"
+            "AED %{customdata[0]:,.0f} / sqft<br>"
+            "Transactions: %{customdata[1]:,}"
+            "<extra></extra>"
+        ),
+    ))
+
+    fig.add_vline(x=0,   line_dash="dot",  line_color="#555555", line_width=1)
+    fig.add_vline(
+        x=-10,
+        line_dash="dash",
+        line_color="#00cc96",
+        line_width=1.5,
+        annotation_text="−10% buy threshold",
+        annotation_position="bottom right",
+        annotation_font=dict(color="#00cc96", size=9),
+    )
+
+    fig.update_layout(
+        **_layout_defaults(
+            f"Price / sqft vs Citywide Median  ·  "
+            f"Citywide median: AED {citywide:,.0f} / sqft  ·  Buyer Opportunity Scanner"
+        ),
+        xaxis=dict(title="% vs Citywide Median", gridcolor="#2a2e35", zeroline=False),
+        yaxis=dict(tickfont=dict(size=9)),
+        showlegend=False,
+        margin=dict(l=220, r=80, t=54, b=40),
+        height=max(420, len(areas) * 22),
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Streamlit app
 # ---------------------------------------------------------------------------
@@ -953,6 +1071,35 @@ st.divider()
 # ── Tier chart ────────────────────────────────────────────────────────────────
 TIER_DF = generate_tier_data(trans_type)
 st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
+
+st.divider()
+
+# ── Buyer Opportunity Scanner ─────────────────────────────────────────────────
+st.markdown("### Buyer Opportunity Scanner")
+st.caption(
+    "Each bar shows an area's median AED/sqft vs. the citywide median. "
+    "**Green (≤ −10%)** areas are statistically undervalued relative to the market — "
+    "the strongest signal from the Metrics Hierarchy (Metric #3). "
+    "Respects the Transaction Type and Bedroom filters above."
+)
+PRICE_MEDIAN_DF = generate_price_vs_median_data(trans_type, bedroom)
+if PRICE_MEDIAN_DF.is_empty():
+    st.warning("Not enough transactions to compute price vs median for the current filters.")
+else:
+    # KPI callouts: top 3 most undervalued areas
+    undervalued = PRICE_MEDIAN_DF.filter(pl.col("pct_vs_median") <= -10)
+    if not undervalued.is_empty():
+        cols = st.columns(min(3, len(undervalued)))
+        for i, row in enumerate(undervalued.head(3).iter_rows(named=True)):
+            with cols[i]:
+                st.metric(
+                    label=row["area"].title(),
+                    value=f"AED {row['median_psf']:,.0f}/sqft",
+                    delta=f"{row['pct_vs_median']:+.1f}% vs median",
+                    delta_color="inverse",
+                    help=f"Based on {row['txns']:,} transactions",
+                )
+    st.plotly_chart(price_vs_median_chart(PRICE_MEDIAN_DF), use_container_width=True)
 
 st.divider()
 
