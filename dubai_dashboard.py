@@ -291,6 +291,78 @@ def generate_tier_data(trans_type: str = "All") -> pl.DataFrame:
     )
 
 
+@st.cache_data(show_spinner="Computing area price/sqft time series…")
+def generate_area_psf_timeseries(
+    trans_type: str = "All",
+    bedroom: str = "All",
+) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Transaction-level price/sqft and rolling area median — buyer opportunity scanner.
+
+    Rolling window: 14 days (not 7).
+    Rationale: the citywide charts use a 7-day window over ~11k transactions.
+    Individual areas average ~550 transactions each across the full period,
+    or ~12/day — roughly 1/20th the citywide density. Doubling the window
+    to 14 days keeps a comparable effective sample size (~168 observations)
+    while still being reactive enough to show meaningful trend shifts over
+    the 45-day dataset.  min_periods=3 so the line appears from day 3 onward
+    rather than staying blank for the first 13 days.
+
+    Returns
+    -------
+    txns_df   : one row per transaction — [date, area, price_per_sqft]
+    rolling_df: one row per (date, area) — [date, area, daily_median_psf,
+                rolling_median_psf]
+    """
+    raw = (
+        _trans_type_filter(
+            pl.read_csv(
+                CSV_PATH,
+                encoding="utf8-lossy",
+                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
+            )
+            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
+            .filter(pl.col("ACTUAL_AREA") > 0),   # guard against divide-by-zero
+            trans_type,
+        )
+        .with_columns([
+            pl.col("INSTANCE_DATE").str.slice(0, 10)
+              .str.to_date("%Y-%m-%d")
+              .alias("date"),
+            pl.col("AREA_EN").str.to_uppercase().alias("area"),
+            pl.col("ROOMS_EN").str.replace(" B/R", "BR").alias("bedroom_type"),
+            (pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")).alias("price_per_sqft"),
+        ])
+    )
+
+    if bedroom != "All":
+        raw = raw.filter(pl.col("bedroom_type") == bedroom)
+
+    # Individual transactions for scatter dots
+    txns_df = (
+        raw
+        .select(["date", "area", "price_per_sqft"])
+        .sort(["area", "date"])
+    )
+
+    # Daily area median, then 14-day rolling mean of those medians.
+    # We roll over the DAILY median (not raw transactions) so that
+    # high-volume days don't dominate the smoothed line.
+    rolling_df = (
+        raw
+        .group_by(["date", "area"])
+        .agg(pl.col("price_per_sqft").median().round(0).alias("daily_median_psf"))
+        .sort(["area", "date"])
+        .with_columns(
+            pl.col("daily_median_psf")
+              .rolling_mean(14)
+              .over("area")
+              .alias("rolling_median_psf")
+        )
+    )
+
+    return txns_df, rolling_df
+
+
 # ---------------------------------------------------------------------------
 # Live API connector (reference implementation – swap generate_dubai_data)
 # ---------------------------------------------------------------------------
@@ -732,6 +804,81 @@ def tier_price_chart(tier_df: pl.DataFrame) -> go.Figure:
     return fig
 
 
+def area_psf_chart(
+    txns_df: pl.DataFrame,
+    rolling_df: pl.DataFrame,
+    neighborhoods: list[str],
+) -> go.Figure:
+    """Scatter + line chart: individual transactions (dots) and 14-day rolling
+    area median (solid line) for AED/sqft over time.
+
+    Dots below the line = that deal was cheaper than the area's recent median
+    — the clearest transaction-level buy signal available in the data.
+    """
+    fig = go.Figure()
+
+    for nbhd in NEIGHBORHOODS:           # stable ordering
+        if nbhd not in neighborhoods:
+            continue
+        color = COLOR_MAP[nbhd]
+
+        t = txns_df.filter(pl.col("area") == nbhd).sort("date")
+        r = rolling_df.filter(pl.col("area") == nbhd).sort("date")
+
+        if t.is_empty():
+            continue
+
+        # ── Scatter: individual transactions ──────────────────────────────
+        fig.add_trace(go.Scatter(
+            x=t["date"].to_list(),
+            y=t["price_per_sqft"].to_list(),
+            mode="markers",
+            name=nbhd,
+            legendgroup=nbhd,
+            showlegend=True,
+            marker=dict(color=color, size=5, opacity=0.35),
+            hovertemplate=(
+                f"<b>{nbhd}</b><br>"
+                "%{x|%d %b %Y}<br>"
+                "Transaction: AED %{y:,.0f}/sqft"
+                "<extra></extra>"
+            ),
+        ))
+
+        # ── Line: 14-day rolling median of daily area median ──────────────
+        if not r.is_empty():
+            fig.add_trace(go.Scatter(
+                x=r["date"].to_list(),
+                y=r["rolling_median_psf"].to_list(),
+                mode="lines",
+                name=f"{nbhd} 14d median",
+                legendgroup=nbhd,
+                showlegend=False,            # share legend entry with dots
+                line=dict(color=color, width=2.5),
+                hovertemplate=(
+                    f"<b>{nbhd}</b><br>"
+                    "%{x|%d %b %Y}<br>"
+                    "14-day median: AED %{y:,.0f}/sqft"
+                    "<extra></extra>"
+                ),
+            ))
+
+    fig.update_layout(
+        **_layout_defaults(
+            "Price / sqft — Individual Transactions (dots) & 14-day Rolling Area Median (line)"
+        ),
+        xaxis=dict(showgrid=False, zeroline=False),
+        yaxis=dict(title="AED / sqft", tickformat=",.0f", gridcolor="#2a2e35"),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="right", x=1, font=dict(size=9),
+        ),
+        hovermode="closest",
+        margin=dict(l=60, r=20, t=54, b=40),
+    )
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Streamlit app
 # ---------------------------------------------------------------------------
@@ -953,6 +1100,49 @@ st.divider()
 # ── Tier chart ────────────────────────────────────────────────────────────────
 TIER_DF = generate_tier_data(trans_type)
 st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
+
+st.divider()
+
+# ── Buyer Opportunity Scanner (Metric #3) ────────────────────────────────────
+st.markdown("### Buyer Opportunity Scanner — Price / sqft vs Area Median")
+st.caption(
+    "**Dots** = individual DLD transactions. "
+    "**Solid line** = 14-day rolling median of each area's own daily median AED/sqft. "
+    "A dot **below** the line means that specific deal closed cheaper than the area's "
+    "recent median — the clearest transaction-level buy signal in the data (Metric #3)."
+)
+PSF_TXNS, PSF_ROLLING = generate_area_psf_timeseries(trans_type, bedroom)
+
+# KPI row: cheapest current 14-day rolling median among selected areas
+if not PSF_ROLLING.is_empty():
+    latest_rolling = (
+        PSF_ROLLING
+        .filter(pl.col("area").is_in(neighborhoods))
+        .filter(pl.col("rolling_median_psf").is_not_null())
+        .group_by("area")
+        .agg(pl.col("rolling_median_psf").last().alias("latest_median_psf"))
+        .sort("latest_median_psf")
+        .head(3)
+    )
+    if not latest_rolling.is_empty():
+        cols = st.columns(len(latest_rolling))
+        for i, row in enumerate(latest_rolling.iter_rows(named=True)):
+            with cols[i]:
+                st.metric(
+                    label=f"{row['area'].title()} — lowest AED/sqft",
+                    value=f"AED {row['latest_median_psf']:,.0f}/sqft",
+                    help="Latest 14-day rolling median for this area",
+                )
+
+PSF_TXNS_FILTERED = PSF_TXNS.filter(pl.col("area").is_in(neighborhoods))
+PSF_ROLLING_FILTERED = PSF_ROLLING.filter(pl.col("area").is_in(neighborhoods))
+if PSF_TXNS_FILTERED.is_empty():
+    st.warning("No transaction data for the selected filters.")
+else:
+    st.plotly_chart(
+        area_psf_chart(PSF_TXNS_FILTERED, PSF_ROLLING_FILTERED, neighborhoods),
+        use_container_width=True,
+    )
 
 st.divider()
 
