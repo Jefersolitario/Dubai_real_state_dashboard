@@ -1,42 +1,61 @@
 """
 Dubai Real Estate Apartment Dashboard  –  Streamlit + Polars
 =============================================================
-Visualises 1BR / 2BR apartment prices across 20 Dubai neighbourhoods
-for the period Jan 2020 – Mar 2026.
+Visualises apartment prices across Dubai neighbourhoods using the
+production Dubai Data DLD transactions API.
 
 Run
 ---
     pip install streamlit polars plotly numpy
     streamlit run dubai_dashboard.py
 
-Live API access (see sidebar in the app for full instructions)
---------------------------------------------------------------
-Option 1 – DLD Open Data (FREE, no key needed)
-    CSV download: https://dubailand.gov.ae/en/open-data/real-estate-data/
-
-Option 2 – Dubai Pulse API (FREE tier, requires registration)
-    Sign up : https://www.dubaipulse.gov.ae/
-    Dataset : https://www.dubaipulse.gov.ae/data/dld-transactions/dld_transactions-open
-    Free quota available; paid tiers for higher volume (AED per 100 calls).
-
-Option 3 – Bayut API (FREE, 750 calls/month, no credit card)
-    Sign up : https://bayutapi.com/
-    Docs    : https://docs.bayutapi.com/
+Production data source
+----------------------
+Configure DDA credentials through Streamlit secrets or environment variables.
 """
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 import polars as pl
 import plotly.colors
 import plotly.graph_objects as go
 import streamlit as st
 
+from dda_api import (
+    DDAApiError,
+    DEFAULT_MAX_RECORDS,
+    DEFAULT_PAGE_SIZE,
+    DEFAULT_LOOKBACK_MONTHS,
+    build_dld_transactions_params,
+    fetch_dataset_records,
+    infer_column_mapping,
+    last_months_date_range,
+    load_dda_config,
+    normalize_dld_transactions,
+    records_to_dataframe,
+    validate_normalized_columns,
+)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-CSV_PATH = "data/transactions-2026-03-20 unit.csv"
+SOURCE_API = "Dubai Data API - PROD"
+DEFAULT_SOURCE = SOURCE_API
+API_DEFAULT_LOOKBACK_MONTHS = DEFAULT_LOOKBACK_MONTHS
+
+TRANSACTION_SCHEMA = {
+    "INSTANCE_DATE": pl.Utf8,
+    "GROUP_EN": pl.Utf8,
+    "IS_OFFPLAN_EN": pl.Utf8,
+    "AREA_EN": pl.Utf8,
+    "PROP_SB_TYPE_EN": pl.Utf8,
+    "PROCEDURE_EN": pl.Utf8,
+    "TRANS_VALUE": pl.Float64,
+    "ACTUAL_AREA": pl.Float64,
+    "ROOMS_EN": pl.Utf8,
+}
 
 NEIGHBORHOODS: list[str] = [
     # High-volume
@@ -64,7 +83,7 @@ NEIGHBORHOODS: list[str] = [
 ]
 
 DATE_START = date(2026, 2, 2)
-DATE_END   = date(2026, 3, 18)
+DATE_END   = date(2026, 3, 19)
 
 TIER_MAP: dict[str, str] = {}
 TIER_AREAS: dict[str, list[str]] = {
@@ -91,7 +110,7 @@ TIER_AREAS: dict[str, list[str]] = {
 }
 for tier, areas in TIER_AREAS.items():
     for a in areas:
-        TIER_MAP[a] = tier
+        TIER_MAP[a.upper()] = tier
 TIER_ORDER = ["Ultra-premium", "Premium", "Mid-market", "Value", "Budget"]
 TIER_COLORS = {
     "Ultra-premium": "#e377c2",
@@ -106,25 +125,40 @@ COLORS = plotly.colors.qualitative.Alphabet
 COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
 
 # ---------------------------------------------------------------------------
-# Data loading (Polars) – real DLD transaction CSV
+# Data loading (Polars) - production DDA API
 # ---------------------------------------------------------------------------
 
-@st.cache_data(show_spinner="Loading transaction data…")
-def generate_dubai_data(trans_type: str = "All") -> pl.DataFrame:
-    """Load and aggregate real DLD apartment transactions from CSV.
+def _source_raw_transactions(data_source: str) -> pl.DataFrame:
+    api_df = st.session_state.get("api_raw_df")
+    if isinstance(api_df, pl.DataFrame) and not api_df.is_empty():
+        return api_df
+    return pl.DataFrame(schema=TRANSACTION_SCHEMA)
+
+
+def _flat_transactions(data_source: str, trans_type: str) -> pl.DataFrame:
+    return _trans_type_filter(
+        _source_raw_transactions(data_source).filter(
+            pl.col("PROP_SB_TYPE_EN")
+            .cast(pl.Utf8)
+            .str.to_lowercase()
+            == "flat"
+        ),
+        trans_type,
+    )
+
+
+@st.cache_data(show_spinner="Loading transaction data...")
+def generate_dubai_data(
+    trans_type: str = "All",
+    data_source: str = DEFAULT_SOURCE,
+    data_version: int = 0,
+) -> pl.DataFrame:
+    """Aggregate real DLD apartment transactions from the production API.
 
     Aggregates individual transactions to daily averages per
     neighbourhood and bedroom type, matching the dashboard schema.
     """
-    raw = _trans_type_filter(
-        pl.read_csv(
-            CSV_PATH,
-            encoding="utf8-lossy",
-            schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
-        )
-        .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
-        trans_type,
-    )
+    raw = _flat_transactions(data_source, trans_type)
     return (
         raw
         .with_columns([
@@ -145,19 +179,15 @@ def generate_dubai_data(trans_type: str = "All") -> pl.DataFrame:
     )
 
 
-@st.cache_data(show_spinner="Computing Dubai-wide aggregates…")
-def generate_dubai_wide_data(trans_type: str = "All") -> pl.DataFrame:
+@st.cache_data(show_spinner="Computing Dubai-wide aggregates...")
+def generate_dubai_wide_data(
+    trans_type: str = "All",
+    data_source: str = DEFAULT_SOURCE,
+    data_version: int = 0,
+) -> pl.DataFrame:
     """Daily Dubai-wide transaction count and median price (all flats)."""
     return (
-        _trans_type_filter(
-            pl.read_csv(
-                CSV_PATH,
-                encoding="utf8-lossy",
-                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
-            )
-            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
-            trans_type,
-        )
+        _flat_transactions(data_source, trans_type)
         .with_columns(
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -173,19 +203,15 @@ def generate_dubai_wide_data(trans_type: str = "All") -> pl.DataFrame:
     )
 
 
-@st.cache_data(show_spinner="Computing weekly stats…")
-def generate_weekly_data(trans_type: str = "All") -> pl.DataFrame:
+@st.cache_data(show_spinner="Computing weekly stats...")
+def generate_weekly_data(
+    trans_type: str = "All",
+    data_source: str = DEFAULT_SOURCE,
+    data_version: int = 0,
+) -> pl.DataFrame:
     """Weekly Dubai-wide aggregates with % change."""
     return (
-        _trans_type_filter(
-            pl.read_csv(
-                CSV_PATH,
-                encoding="utf8-lossy",
-                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
-            )
-            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
-            trans_type,
-        )
+        _flat_transactions(data_source, trans_type)
         .with_columns(
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -208,19 +234,15 @@ def generate_weekly_data(trans_type: str = "All") -> pl.DataFrame:
     )
 
 
-@st.cache_data(show_spinner="Computing area-level trends…")
-def generate_area_weekly_change(trans_type: str = "All") -> pl.DataFrame:
+@st.cache_data(show_spinner="Computing area-level trends...")
+def generate_area_weekly_change(
+    trans_type: str = "All",
+    data_source: str = DEFAULT_SOURCE,
+    data_version: int = 0,
+) -> pl.DataFrame:
     """Per-area first-to-last-week median price % change (min 50 txns)."""
     raw = (
-        _trans_type_filter(
-            pl.read_csv(
-                CSV_PATH,
-                encoding="utf8-lossy",
-                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
-            )
-            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
-            trans_type,
-        )
+        _flat_transactions(data_source, trans_type)
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -256,19 +278,15 @@ def generate_area_weekly_change(trans_type: str = "All") -> pl.DataFrame:
     )
 
 
-@st.cache_data(show_spinner="Computing tier aggregates…")
-def generate_tier_data(trans_type: str = "All") -> pl.DataFrame:
+@st.cache_data(show_spinner="Computing tier aggregates...")
+def generate_tier_data(
+    trans_type: str = "All",
+    data_source: str = DEFAULT_SOURCE,
+    data_version: int = 0,
+) -> pl.DataFrame:
     """Daily median price per market tier."""
     return (
-        _trans_type_filter(
-            pl.read_csv(
-                CSV_PATH,
-                encoding="utf8-lossy",
-                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
-            )
-            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat"),
-            trans_type,
-        )
+        _flat_transactions(data_source, trans_type)
         .filter(pl.col("AREA_EN").is_in(list(TIER_MAP.keys())))
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
@@ -291,10 +309,12 @@ def generate_tier_data(trans_type: str = "All") -> pl.DataFrame:
     )
 
 
-@st.cache_data(show_spinner="Computing area price/sqft time series…")
+@st.cache_data(show_spinner="Computing area price/sqft time series...")
 def generate_area_psf_timeseries(
     trans_type: str = "All",
     bedroom: str = "All",
+    data_source: str = DEFAULT_SOURCE,
+    data_version: int = 0,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Transaction-level price/sqft and rolling area median — buyer opportunity scanner.
 
@@ -304,7 +324,7 @@ def generate_area_psf_timeseries(
     or ~12/day — roughly 1/20th the citywide density. Doubling the window
     to 14 days keeps a comparable effective sample size (~168 observations)
     while still being reactive enough to show meaningful trend shifts over
-    the 45-day dataset.  min_periods=3 so the line appears from day 3 onward
+    the loaded dataset.  min_periods=3 so the line appears from day 3 onward
     rather than staying blank for the first 13 days.
 
     Returns
@@ -314,16 +334,8 @@ def generate_area_psf_timeseries(
                 rolling_median_psf]
     """
     raw = (
-        _trans_type_filter(
-            pl.read_csv(
-                CSV_PATH,
-                encoding="utf8-lossy",
-                schema_overrides={"TRANS_VALUE": pl.Float64, "ACTUAL_AREA": pl.Float64},
-            )
-            .filter(pl.col("PROP_SB_TYPE_EN") == "Flat")
-            .filter(pl.col("ACTUAL_AREA") > 0),   # guard against divide-by-zero
-            trans_type,
-        )
+        _flat_transactions(data_source, trans_type)
+        .filter(pl.col("ACTUAL_AREA") > 0)   # guard against divide-by-zero
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
@@ -364,63 +376,124 @@ def generate_area_psf_timeseries(
 
 
 # ---------------------------------------------------------------------------
-# Live API connector (reference implementation – swap generate_dubai_data)
+# Legacy connector helpers kept for offline maintenance scripts.
 # ---------------------------------------------------------------------------
+
+def _get_dld_token(
+    api_key: str,
+    api_secret: str,
+    security_application_identifier: str = "",
+) -> str:
+    """Obtain an OAuth2 bearer token from the Dubai Data API."""
+    import requests
+
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    if security_application_identifier:
+        headers["x-DDA-SecurityApplicationIdentifier"] = (
+            security_application_identifier
+        )
+
+    resp = requests.post(
+        "https://apis.data.dubai/oauth/client_credential/accesstoken",
+        params={"grant_type": "client_credentials"},
+        data={"client_id": api_key, "client_secret": api_secret},
+        headers=headers,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+# Column mapping: API field names → CSV field names used by the dashboard
+_API_TO_CSV = {
+    "transaction_id":       "TRANSACTION_NUMBER",
+    "instance_date":        "INSTANCE_DATE",
+    "trans_group_en":       "GROUP_EN",
+    "procedure_name_en":    "PROCEDURE_EN",
+    "reg_type_en":          "IS_OFFPLAN_EN",
+    "property_usage_en":    "USAGE_EN",
+    "area_name_en":         "AREA_EN",
+    "property_type_en":     "PROP_TYPE_EN",
+    "property_sub_type_en": "PROP_SB_TYPE_EN",
+    "actual_worth":         "TRANS_VALUE",
+    "procedure_area":       "ACTUAL_AREA",
+    "rooms_en":             "ROOMS_EN",
+    "has_parking":          "PARKING",
+    "nearest_metro_en":     "NEAREST_METRO_EN",
+    "nearest_mall_en":      "NEAREST_MALL_EN",
+    "nearest_landmark_en":  "NEAREST_LANDMARK_EN",
+    "no_of_parties_role_1": "TOTAL_SELLER",
+    "no_of_parties_role_2": "TOTAL_BUYER",
+    "master_project_en":    "MASTER_PROJECT_EN",
+    "project_name_en":      "PROJECT_EN",
+    "meter_sale_price":     "METER_SALE_PRICE",
+}
+
 
 def fetch_dld_live_data(
     api_key: str,
     api_secret: str,
-    start: str = "2024-01-01",
-    end: str   = "2026-03-01",
+    start: str = "2026-01-17",
+    end: str   = "2026-05-17",
+    security_application_identifier: str = "",
 ) -> pl.DataFrame:
-    """Fetch real transaction data from Dubai Pulse / DLD API.
+    """Fetch real apartment transactions from the Dubai Data / DLD API.
 
     Registration
     ------------
-    1. Go to https://www.dubaipulse.gov.ae/
-    2. Create a free account → request access to the DLD Transactions dataset
-    3. You will receive an API Key and API Secret by email
-    4. Free tier: limited monthly calls; paid tiers at AED per 100 calls
+    1. Go to https://data.dubai/en/
+    2. Create a free account
+    3. Find the DLD Transactions dataset and click "Request API Access Key"
+    4. You will receive an API Key and API Secret in two separate emails
+    5. Free tier: limited monthly calls
 
     Parameters
     ----------
-    api_key    : client_id from Dubai Pulse dashboard
-    api_secret : client_secret from Dubai Pulse dashboard
+    api_key    : client_id from Dubai Data email
+    api_secret : client_secret from Dubai Data email
     start / end: ISO date strings for the transaction date range
     """
-    import requests  # already in requirements.txt
+    import requests
 
-    # Step 1 – OAuth2 client-credentials token
-    token_resp = requests.post(
-        "https://api.dubaipulse.gov.ae/oauth/token",
-        data={
-            "grant_type":    "client_credentials",
-            "client_id":     api_key,
-            "client_secret": api_secret,
-        },
-        timeout=30,
-    )
-    token_resp.raise_for_status()
-    token = token_resp.json()["access_token"]
+    token = _get_dld_token(api_key, api_secret, security_application_identifier)
 
-    # Step 2 – Query DLD transactions (apartments, 1-2 bedrooms)
-    resp = requests.get(
-        "https://api.dubaipulse.gov.ae/dld-transactions/v1/transactions",
-        headers={"Authorization": f"Bearer {token}"},
-        params={
-            "property_type":         "apartment",
-            "transaction_date_from": start,
-            "transaction_date_to":   end,
-            "bedrooms":              "1,2",
-            "page_size":             500,
-        },
-        timeout=60,
-    )
-    resp.raise_for_status()
-    records = resp.json().get("records", [])
+    API_URL = "https://apis.data.dubai/open/dld/dld_transactions-open-api"
+    all_records: list[dict] = []
+    offset = 0
+    page_size = 500
 
-    # Map to the schema expected by this dashboard and return as Polars DataFrame
-    return pl.DataFrame(records)
+    while True:
+        resp = requests.get(
+            API_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            params={
+                "filter": (
+                    f"property_sub_type_en='Flat' AND trans_group_en='Sales'"
+                    f" AND instance_date>='{start}' AND instance_date<='{end}'"
+                ),
+                "order_by": "instance_date",
+                "limit":  page_size,
+                "offset": offset,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        records = data if isinstance(data, list) else data.get("records", data.get("result", []))
+        if not records:
+            break
+        all_records.extend(records)
+        if len(records) < page_size:
+            break
+        offset += page_size
+
+    if not all_records:
+        return pl.DataFrame()
+
+    # Rename API columns to match the CSV column names the dashboard expects
+    df = pl.DataFrame(all_records)
+    rename_map = {k: v for k, v in _API_TO_CSV.items() if k in df.columns}
+    return df.rename(rename_map)
 
 
 def fetch_bayut_transactions(
@@ -452,17 +525,160 @@ def fetch_bayut_transactions(
     return pl.DataFrame(resp.json().get("transactions", []))
 
 
+# Production secrets are read server-side only; no credentials are exposed in
+# the Streamlit interface.
+def _streamlit_secrets() -> dict:
+    try:
+        return dict(st.secrets)
+    except Exception:
+        return {}
+
+
+def _load_api_transactions(
+    config,
+    start: date,
+    end: date,
+    page_size: int,
+    max_records: int,
+) -> tuple[pl.DataFrame, dict]:
+    params = build_dld_transactions_params(start, end, order_desc=True)
+    records = fetch_dataset_records(
+        config,
+        params=params,
+        page_size=page_size,
+        max_records=max_records,
+    )
+    raw_df = records_to_dataframe(records)
+    normalized = normalize_dld_transactions(raw_df)
+    validation = validate_normalized_columns(normalized)
+    return normalized, {
+        "raw_columns": raw_df.columns,
+        "mapping": infer_column_mapping(raw_df.columns),
+        "validation": validation,
+        "params": params,
+        "date_window": {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        },
+    }
+
+
+def _probe_api_columns(config, limit: int = 10) -> tuple[pl.DataFrame, dict]:
+    records = fetch_dataset_records(
+        config,
+        params={"order_by": "instance_date", "order_dir": "desc"},
+        page_size=limit,
+        max_records=limit,
+    )
+    raw_df = records_to_dataframe(records)
+    normalized = normalize_dld_transactions(raw_df)
+    return normalized, {
+        "raw_columns": raw_df.columns,
+        "mapping": infer_column_mapping(raw_df.columns),
+        "validation": validate_normalized_columns(normalized),
+    }
+
+
+def _date_bounds_from_transactions(df: pl.DataFrame) -> tuple[date, date] | None:
+    if df.is_empty() or "INSTANCE_DATE" not in df.columns:
+        return None
+
+    dates = (
+        df
+        .select(
+            pl.col("INSTANCE_DATE")
+            .cast(pl.Utf8)
+            .str.slice(0, 10)
+            .str.to_date("%Y-%m-%d", strict=False)
+            .alias("date")
+        )
+        .drop_nulls()
+    )
+    if dates.is_empty():
+        return None
+    return dates["date"].min(), dates["date"].max()
+
+
+@st.cache_data(
+    show_spinner="Loading latest DLD transactions...",
+    ttl=60 * 60,
+)
+def load_production_transactions() -> tuple[pl.DataFrame, dict]:
+    config = load_dda_config(_streamlit_secrets())
+    missing = config.missing_fields()
+    if missing:
+        raise DDAApiError("Missing production data source configuration.")
+
+    start, end = last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
+    df, meta = _load_api_transactions(
+        config,
+        start,
+        end,
+        DEFAULT_PAGE_SIZE,
+        DEFAULT_MAX_RECORDS,
+    )
+    validation = meta["validation"]
+    if df.is_empty():
+        raise DDAApiError("Production data source returned no records.")
+    if validation["missing_required"]:
+        raise DDAApiError("Production data source schema is incomplete.")
+
+    bounds = _date_bounds_from_transactions(df)
+    return df, {
+        **meta,
+        "loaded_at": datetime.now().isoformat(timespec="seconds"),
+        "date_bounds": {
+            "start": bounds[0].isoformat() if bounds else start.isoformat(),
+            "end": bounds[1].isoformat() if bounds else end.isoformat(),
+        },
+    }
+
+
+def _loaded_date_bounds_for_source(data_source: str) -> tuple[date, date]:
+    api_df = st.session_state.get("api_raw_df")
+    if isinstance(api_df, pl.DataFrame):
+        bounds = _date_bounds_from_transactions(api_df)
+        if bounds:
+            return bounds
+    return last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
+
+
+def _date_picker_bounds(data_source: str) -> tuple[date, date, date]:
+    loaded_start, loaded_end = _loaded_date_bounds_for_source(data_source)
+    return loaded_start, loaded_end, loaded_end
+
+
 # ---------------------------------------------------------------------------
 # Filter helper (Polars)
 # ---------------------------------------------------------------------------
 
 def _trans_type_filter(df: pl.DataFrame, trans_type: str) -> pl.DataFrame:
     if trans_type == "Sale":
-        return df.filter(pl.col("GROUP_EN") == "Sales")
+        return df.filter(pl.col("GROUP_EN").cast(pl.Utf8).str.to_lowercase() == "sales")
     if trans_type == "Mortgage":
-        return df.filter(pl.col("GROUP_EN") == "Mortgage")
+        return df.filter(pl.col("GROUP_EN").cast(pl.Utf8).str.to_lowercase() == "mortgage")
     if trans_type == "Off-Plan":
-        return df.filter(pl.col("IS_OFFPLAN_EN") == "Off-Plan")
+        status_mask = pl.lit(False)
+        if "IS_OFFPLAN_EN" in df.columns:
+            status_mask = (
+                pl.col("IS_OFFPLAN_EN")
+                .cast(pl.Utf8)
+                .str.to_lowercase()
+                .str.contains("off")
+                .fill_null(False)
+            )
+
+        procedure_mask = pl.lit(False)
+        if "PROCEDURE_EN" in df.columns:
+            procedure_mask = (
+                pl.col("PROCEDURE_EN")
+                .cast(pl.Utf8)
+                .str.to_lowercase()
+                .str.contains("development|payment plan")
+                .fill_null(False)
+            )
+
+        return df.filter(status_mask | procedure_mask)
     return df  # "All"
 
 
@@ -903,10 +1119,25 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+data_source = SOURCE_API
+try:
+    api_snapshot, api_meta = load_production_transactions()
+except DDAApiError:
+    st.error(
+        "Production data is unavailable. Ask the deployment owner to configure "
+        "the DDA secrets in the hosting environment."
+    )
+    st.stop()
+
+st.session_state["api_raw_df"] = api_snapshot
+st.session_state["api_meta"] = api_meta
+data_version = api_meta.get("loaded_at", "production")
+active_api_rows = api_snapshot.height
+
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("🏙️ Dubai RE Dashboard")
-    st.caption("Apartments · Feb 2026 – Mar 2026 · DLD Transactions")
+    st.caption("Apartments · Latest DLD Transactions")
     st.divider()
 
     neighborhoods = st.multiselect(
@@ -931,68 +1162,42 @@ with st.sidebar:
         horizontal=True,
     )
 
+    date_min, date_max, default_end = _date_picker_bounds(data_source)
+    default_start = date_min
+
     date_range = st.date_input(
         "Date Range",
-        value=(DATE_START, DATE_END),
-        min_value=DATE_START,
-        max_value=DATE_END,
+        value=(default_start, default_end),
+        min_value=date_min,
+        max_value=date_max,
         format="YYYY/MM/DD",
+        key=f"date_range_{data_source}_{data_version}_{date_min}_{date_max}",
     )
     # Safely unpack; user may still be selecting end date
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
         start_date, end_date = date_range
     else:
         start_date = end_date = date_range[0] if isinstance(date_range, (list, tuple)) else date_range
-
-    st.divider()
-
-    # ── Live API access info ────────────────────────────────────────────────
-    with st.expander("📡 Live API Access", expanded=False):
-        st.markdown(
-            """
-**Option 1 – DLD Open Data (FREE)**
-- No registration needed
-- Download CSV files directly:
-  [dubailand.gov.ae/en/open-data](https://dubailand.gov.ae/en/open-data/real-estate-data/)
-
----
-
-**Option 2 – Dubai Pulse API (FREE tier)**
-- Free quota each month (paid tiers: AED per 100 calls above quota)
-- Register at [dubaipulse.gov.ae](https://www.dubaipulse.gov.ae/)
-- You get an API Key + Secret by email
-- Dataset: DLD Transactions (1.5 M records, 2004–2026)
-- See `fetch_dld_live_data()` in this file for the connector
-
----
-
-**Option 3 – Bayut API (FREE, 750 calls/month)**
-- No credit card required
-- Sign up at [bayutapi.com](https://bayutapi.com/)
-- See `fetch_bayut_transactions()` in this file for the connector
-            """
+    requested_start_date = start_date
+    requested_end_date = end_date
+    start_date = max(start_date, date_min)
+    end_date = min(end_date, date_max)
+    if start_date > end_date:
+        start_date, end_date = date_min, date_max
+    if (start_date, end_date) != (requested_start_date, requested_end_date):
+        st.caption(
+            "Adjusted to loaded data range: "
+            f"{start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}."
         )
-
-    with st.expander("🔑 Connect to Dubai Pulse API", expanded=False):
-        st.caption("Enter credentials to fetch real data (optional)")
-        dp_key    = st.text_input("API Key",    type="password", placeholder="Your Dubai Pulse API Key")
-        dp_secret = st.text_input("API Secret", type="password", placeholder="Your Dubai Pulse API Secret")
-        if st.button("Fetch Live Data", disabled=not (dp_key and dp_secret)):
-            with st.spinner("Fetching from Dubai Pulse…"):
-                try:
-                    live_df = fetch_dld_live_data(dp_key, dp_secret, str(start_date), str(end_date))
-                    st.success(f"Loaded {len(live_df):,} live records.")
-                    st.session_state["live_df"] = live_df
-                except Exception as exc:
-                    st.error(f"API error: {exc}")
-
     st.divider()
-    st.caption(
-        "Data: DLD transactions CSV (apartments only)."
-    )
+    api_bounds = _date_bounds_from_transactions(api_snapshot)
+    date_summary = f"{date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}"
+    if api_bounds:
+        date_summary = f"{api_bounds[0]:%Y-%m-%d} to {api_bounds[1]:%Y-%m-%d}"
+    st.caption(f"Data covers {date_summary} ({active_api_rows:,} transactions).")
 
 # ── Load & filter data ───────────────────────────────────────────────────────
-DF = generate_dubai_data(trans_type)
+DF = generate_dubai_data(trans_type, data_source, data_version)
 
 if not neighborhoods:
     st.warning("Select at least one neighbourhood in the sidebar.")
@@ -1001,7 +1206,10 @@ if not neighborhoods:
 filtered = apply_filters(DF, neighborhoods, bedroom, start_date, end_date)
 
 if filtered.is_empty():
-    st.warning("No data for the selected filters.")
+    st.warning(
+        "No data for the selected filters/date range. "
+        f"The loaded data covers {date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}."
+    )
     st.stop()
 
 # ── KPI cards ────────────────────────────────────────────────────────────────
@@ -1044,9 +1252,9 @@ with c4:
 st.divider()
 
 # ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
-DW = generate_dubai_wide_data(trans_type)
-WK = generate_weekly_data(trans_type)
-AREA_CHG = generate_area_weekly_change(trans_type)
+DW = generate_dubai_wide_data(trans_type, data_source, data_version)
+WK = generate_weekly_data(trans_type, data_source, data_version)
+AREA_CHG = generate_area_weekly_change(trans_type, data_source, data_version)
 
 # KPI cards for Dubai-wide price momentum
 first_wk = WK.row(0, named=True)
@@ -1098,7 +1306,7 @@ st.plotly_chart(area_pct_change_chart(AREA_CHG), use_container_width=True)
 st.divider()
 
 # ── Tier chart ────────────────────────────────────────────────────────────────
-TIER_DF = generate_tier_data(trans_type)
+TIER_DF = generate_tier_data(trans_type, data_source, data_version)
 st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
 
 st.divider()
@@ -1111,7 +1319,12 @@ st.caption(
     "A dot **below** the line means that specific deal closed cheaper than the area's "
     "recent median — the clearest transaction-level buy signal in the data (Metric #3)."
 )
-PSF_TXNS, PSF_ROLLING = generate_area_psf_timeseries(trans_type, bedroom)
+PSF_TXNS, PSF_ROLLING = generate_area_psf_timeseries(
+    trans_type,
+    bedroom,
+    data_source,
+    data_version,
+)
 
 # KPI row: cheapest current 14-day rolling median among selected areas
 if not PSF_ROLLING.is_empty():

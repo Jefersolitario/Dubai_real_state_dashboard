@@ -1,5 +1,10 @@
 __pycache__/
+.venv/
 *.pyc
 *.pyo
 .env
+.streamlit/secrets.toml
+.tmp/
+.venv_broken_*/
+*.log
 *.pdf
