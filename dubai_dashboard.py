@@ -1128,12 +1128,10 @@ st.markdown(
 data_source = SOURCE_API
 try:
     api_snapshot, api_meta = load_production_transactions()
-except DDAApiError as exc:
+except Exception as exc:
     LOGGER.exception("DDA production data source startup failed: %s", exc)
     st.error(
-        "Production data is unavailable. Ask the deployment owner to configure "
-        "the DDA secrets in the hosting environment. Check the Streamlit app "
-        "logs for the missing key names."
+        "Production data is temporarily unavailable. Please try again shortly."
     )
     st.stop()
 

@@ -24,6 +24,7 @@ OPENAPI_PATH = "/secure/ddads/openapi/1.0.0"
 DEFAULT_PAGE_SIZE = 1000
 DEFAULT_MAX_RECORDS = 100_000
 DEFAULT_LOOKBACK_MONTHS = 4
+REQUEST_TIMEOUT = (10, 60)
 
 REQUIRED_DASHBOARD_COLUMNS = [
     "INSTANCE_DATE",
@@ -256,32 +257,49 @@ def load_dda_config(
 
 def request_access_token(config: DDAConfig) -> str:
     _ensure_config(config)
-    payload = _request_secure_access_token(config)
-    if not payload.get("access_token"):
-        payload = _request_oauth_access_token(config)
-    access_token = payload.get("access_token")
-    if not access_token:
-        raise DDAApiError("Access token response did not include access_token.")
-    return access_token
+    token_requesters = (
+        (_request_oauth_access_token,)
+        if _prefers_oauth_token(config)
+        else (_request_secure_access_token, _request_oauth_access_token)
+    )
+    errors: list[str] = []
+    for request_token in token_requesters:
+        try:
+            payload = request_token(config)
+        except DDAApiError as exc:
+            errors.append(str(exc))
+            continue
+
+        access_token = payload.get("access_token")
+        if access_token:
+            return access_token
+
+    detail = " ".join(errors) if errors else "No token endpoint returned access_token."
+    raise DDAApiError("Access token request failed. " + detail)
 
 
 def _request_secure_access_token(config: DDAConfig) -> dict[str, Any]:
-    response = requests.post(
-        config.token_url,
-        headers={
-            "Content-Type": "application/json",
-            "x-DDA-SecurityApplicationIdentifier": (
-                config.security_application_identifier
-            ),
-        },
-        json={
-            "grant_type": "client_credentials",
-            "client_id": config.client_id,
-            "client_secret": config.client_secret,
-        },
-        timeout=30,
-        verify=config.verify_ssl,
-    )
+    try:
+        response = requests.post(
+            config.token_url,
+            headers={
+                "Content-Type": "application/json",
+                "x-DDA-SecurityApplicationIdentifier": (
+                    config.security_application_identifier
+                ),
+            },
+            json={
+                "grant_type": "client_credentials",
+                "client_id": config.client_id,
+                "client_secret": config.client_secret,
+            },
+            timeout=REQUEST_TIMEOUT,
+            verify=config.verify_ssl,
+        )
+    except requests.RequestException as exc:
+        raise DDAApiError(
+            f"Secure access token request failed: {type(exc).__name__}"
+        ) from exc
     if response.status_code in {401, 403, 404, 405, 500}:
         return {}
     _raise_for_status(response, "Secure access token request")
@@ -289,21 +307,26 @@ def _request_secure_access_token(config: DDAConfig) -> dict[str, Any]:
 
 
 def _request_oauth_access_token(config: DDAConfig) -> dict[str, Any]:
-    response = requests.post(
-        config.oauth_token_url,
-        headers={
-            "x-DDA-SecurityApplicationIdentifier": (
-                config.security_application_identifier
-            ),
-        },
-        params={"grant_type": "client_credentials"},
-        data={
-            "client_id": config.client_id,
-            "client_secret": config.client_secret,
-        },
-        timeout=30,
-        verify=config.verify_ssl,
-    )
+    try:
+        response = requests.post(
+            config.oauth_token_url,
+            headers={
+                "x-DDA-SecurityApplicationIdentifier": (
+                    config.security_application_identifier
+                ),
+            },
+            params={"grant_type": "client_credentials"},
+            data={
+                "client_id": config.client_id,
+                "client_secret": config.client_secret,
+            },
+            timeout=REQUEST_TIMEOUT,
+            verify=config.verify_ssl,
+        )
+    except requests.RequestException as exc:
+        raise DDAApiError(
+            f"OAuth access token request failed: {type(exc).__name__}"
+        ) from exc
     _raise_for_status(response, "OAuth access token request")
     return response.json()
 
@@ -328,18 +351,23 @@ def fetch_dataset_records(
             "limit": page_size,
             "offset": offset,
         }
-        response = requests.get(
-            config.dataset_url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "x-DDA-SecurityApplicationIdentifier": (
-                    config.security_application_identifier
-                ),
-            },
-            params=query,
-            timeout=30,
-            verify=config.verify_ssl,
-        )
+        try:
+            response = requests.get(
+                config.dataset_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "x-DDA-SecurityApplicationIdentifier": (
+                        config.security_application_identifier
+                    ),
+                },
+                params=query,
+                timeout=REQUEST_TIMEOUT,
+                verify=config.verify_ssl,
+            )
+        except requests.RequestException as exc:
+            raise DDAApiError(
+                f"Dataset request failed: {type(exc).__name__}"
+            ) from exc
         _raise_for_status(response, "Dataset request")
         page_records = _extract_records(response.json())
         if not page_records:
@@ -369,6 +397,10 @@ def months_before(end: date, months: int) -> date:
 def last_months_date_range(months: int = DEFAULT_LOOKBACK_MONTHS) -> tuple[date, date]:
     end = date.today()
     return months_before(end, months), end
+
+
+def _prefers_oauth_token(config: DDAConfig) -> bool:
+    return config.base_url.rstrip("/").lower() == DEFAULT_BASE_URL.lower()
 
 
 def build_dld_transactions_params(
