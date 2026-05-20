@@ -500,15 +500,16 @@ def _lookup_secret(
         if value is not None and value != "":
             return str(value)
 
-    try:
-        dda_section = source.get("dda")
-    except AttributeError:
-        dda_section = None
-    if isinstance(dda_section, Mapping):
-        for key in keys:
-            value = dda_section.get(key)
-            if value is not None and value != "":
-                return str(value)
+    for section_name in ("dda", "DDA", "data_dubai", "DATA_DUBAI"):
+        try:
+            dda_section = source.get(section_name)
+        except AttributeError:
+            dda_section = None
+        if isinstance(dda_section, Mapping):
+            for key in keys:
+                value = dda_section.get(key)
+                if value is not None and value != "":
+                    return str(value)
     return ""
 
 

@@ -16,6 +16,7 @@ Configure DDA credentials through Streamlit secrets or environment variables.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime
 
 import polars as pl
@@ -37,6 +38,8 @@ from dda_api import (
     records_to_dataframe,
     validate_normalized_columns,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -607,7 +610,10 @@ def load_production_transactions() -> tuple[pl.DataFrame, dict]:
     config = load_dda_config(_streamlit_secrets())
     missing = config.missing_fields()
     if missing:
-        raise DDAApiError("Missing production data source configuration.")
+        raise DDAApiError(
+            "Missing production data source configuration: "
+            + ", ".join(missing)
+        )
 
     start, end = last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
     df, meta = _load_api_transactions(
@@ -1122,10 +1128,12 @@ st.markdown(
 data_source = SOURCE_API
 try:
     api_snapshot, api_meta = load_production_transactions()
-except DDAApiError:
+except DDAApiError as exc:
+    LOGGER.exception("DDA production data source startup failed: %s", exc)
     st.error(
         "Production data is unavailable. Ask the deployment owner to configure "
-        "the DDA secrets in the hosting environment."
+        "the DDA secrets in the hosting environment. Check the Streamlit app "
+        "logs for the missing key names."
     )
     st.stop()
 
