@@ -48,8 +48,6 @@ def load_local_secrets():
 def configured_snapshot(secrets):
     bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
     object_name = setting(secrets, "GCS_TRANSACTIONS_OBJECT") or DEFAULT_TRANSACTIONS_OBJECT
-    if not bucket_name:
-        return "", ""
     return bucket_name, object_name
 
 

@@ -1,4 +1,5 @@
 import argparse
+import io
 import sys
 import uuid
 
@@ -33,9 +34,6 @@ def main() -> int:
         print(f"Writing gs://{bucket_name}/{object_name}")
         blob.upload_from_string(parquet_bytes, content_type="application/vnd.apache.parquet")
 
-        print("Reading object back")
-        import io
-
         actual = pl.read_parquet(io.BytesIO(blob.download_as_bytes()))
 
         if actual.to_dict(as_series=False) != expected.to_dict(as_series=False):
@@ -54,6 +52,7 @@ def main() -> int:
         return 1
 
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

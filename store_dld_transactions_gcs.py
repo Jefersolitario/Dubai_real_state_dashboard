@@ -1,4 +1,5 @@
 import argparse
+import io
 import sys
 from datetime import UTC, datetime
 
@@ -18,10 +19,10 @@ from dda_api import (
 )
 from gcs_storage import (
     DEFAULT_TRANSACTIONS_OBJECT,
+    configured_snapshot,
     dataframe_to_parquet_bytes,
     gcs_client,
     load_local_secrets,
-    setting,
 )
 
 
@@ -38,12 +39,9 @@ def main() -> int:
     args = parser.parse_args()
 
     secrets = load_local_secrets()
-    bucket_name = args.bucket or setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
-    object_name = (
-        args.object
-        or setting(secrets, "GCS_TRANSACTIONS_OBJECT")
-        or DEFAULT_TRANSACTIONS_OBJECT
-    )
+    default_bucket, default_object = configured_snapshot(secrets)
+    bucket_name = args.bucket or default_bucket
+    object_name = args.object or default_object or DEFAULT_TRANSACTIONS_OBJECT
     if not bucket_name:
         print("Missing bucket name. Pass --bucket or set GCS_BUCKET.")
         return 2
@@ -94,8 +92,6 @@ def main() -> int:
         blob.upload_from_string(parquet_bytes, content_type="application/vnd.apache.parquet")
 
         print("Reading object back for verification")
-        import io
-
         readback = pl.read_parquet(io.BytesIO(blob.download_as_bytes()))
         verify_readback(df, readback)
 

@@ -1,54 +1,47 @@
-# Dubai_real_state_dashboard
-Monitor transaction for Aapartments in Dubai
+# Dubai Real Estate Dashboard
 
-Production:
+Streamlit dashboard for Dubai apartment transactions. The production app reads
+normalized DLD transaction data from a Google Cloud Storage Parquet snapshot, so
+the dashboard can start quickly without querying the Dubai Data API on every
+cold start.
 
-- store production credentials in the deployment secret store, not in git
-- for local development, copy `.streamlit/secrets.example.toml` to `.streamlit/secrets.toml`
-- test the last 4 months of Dubai Data API records with `python smoke_test_dda_api.py --limit 100000 --require-records`
-- the deployed dashboard loads the GCS Parquet snapshot first, then falls back to the DDA API only if the cache cannot be read
+## Run Locally
 
-Required secret keys:
+```powershell
+pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run dubai_dashboard.py
+```
 
-- `DDA_BASE_URL`
-- `DDA_SECURITY_APPLICATION_IDENTIFIER`
-- `DDA_CLIENT_ID`
-- `DDA_CLIENT_SECRET`
-- `DDA_ENTITY`
-- `DDA_DATASET`
-- `DDA_VERIFY_SSL`
+## Data Flow
 
-Google Cloud Storage setup:
+1. `store_dld_transactions_gcs.py` fetches recent DLD transactions from the
+   Dubai Data API.
+2. The script normalizes the records and writes:
 
-Current GCS resources created for this project:
+```text
+gs://dubai-real-estate-dashboard-jef/dld_transactions/dld_transactions_latest.parquet
+```
 
-- Google Cloud project: `realstateproject`
-- GCS bucket: `dubai-real-estate-dashboard-jef`
-- Service account: `dubai-dashboard-gcs@realstateproject-500813.iam.gserviceaccount.com`
-- Bucket role granted to the service account: `Cloud Storage -> Storage Object Admin`
+3. `dubai_dashboard.py` loads that GCS Parquet snapshot first.
+4. If the GCS snapshot is unavailable, the dashboard falls back to the DDA API.
 
-Bucket settings:
+Current verified snapshot:
 
-- Public access prevention: enabled
-- Access control: uniform
-- Storage class: standard
-- Location: EU multi-region
+```text
+rows: 48,028
+columns: 69
+date coverage: 2026-03-02 to 2026-06-25
+```
 
-If recreating this setup:
+## Streamlit Secrets
 
-1. Create/select a Google Cloud project.
-2. Create a Cloud Storage bucket with a globally unique lowercase name.
-3. Keep public access prevention enabled.
-4. Create a service account named `dubai-dashboard-gcs`.
-5. Grant that service account bucket-level `Storage Object Admin` access.
-6. Create a JSON key for the service account.
-7. Store the bucket name and JSON key in `.streamlit/secrets.toml`; do not commit secrets.
+Keep secrets in `.streamlit/secrets.toml` locally and in Streamlit Cloud app
+settings for deployment. Do not commit secrets.
 
-Local `.streamlit/secrets.toml` values:
+Minimum GCS secrets:
 
 ```toml
 GCS_BUCKET = "dubai-real-estate-dashboard-jef"
-GCS_TEST_PREFIX = "dubai-dashboard-smoke-tests"
 GCS_TRANSACTIONS_OBJECT = "dld_transactions/dld_transactions_latest.parquet"
 
 GCP_SERVICE_ACCOUNT_JSON = '''
@@ -58,28 +51,63 @@ GCP_SERVICE_ACCOUNT_JSON = '''
 '''
 ```
 
-Smoke test:
+DDA secrets are needed for refreshing the snapshot and for API fallback:
+
+```toml
+DDA_BASE_URL = "https://apis.data.dubai"
+DDA_SECURITY_APPLICATION_IDENTIFIER = "..."
+DDA_CLIENT_ID = "..."
+DDA_CLIENT_SECRET = "..."
+DDA_ENTITY = "dld"
+DDA_DATASET = "dld_transactions-open-api"
+DDA_VERIFY_SSL = true
+```
+
+## GCS Setup
+
+Current resources:
+
+```text
+Project: realstateproject
+Bucket: dubai-real-estate-dashboard-jef
+Service account: dubai-dashboard-gcs@realstateproject-500813.iam.gserviceaccount.com
+Bucket role: Cloud Storage -> Storage Object Admin
+```
+
+Bucket settings:
+
+```text
+Public access prevention: enabled
+Access control: uniform
+Storage class: standard
+Location: EU multi-region
+```
+
+## Maintenance Commands
+
+Test GCS read/write/delete:
 
 ```powershell
 .\.venv\Scripts\python.exe .\smoke_test_gcs.py
 ```
 
-The script writes a tiny Parquet file, reads it back, verifies the round trip,
-and deletes the test object by default. Configure credentials with
-`GOOGLE_APPLICATION_CREDENTIALS`, Google application-default credentials, or
-`GCP_SERVICE_ACCOUNT_JSON`.
-
-Store/update the real DLD transaction snapshot:
+Refresh the production Parquet snapshot:
 
 ```powershell
 .\.venv\Scripts\python.exe .\store_dld_transactions_gcs.py
 ```
 
-The dashboard reads `GCS_TRANSACTIONS_OBJECT` from `GCS_BUCKET` on startup.
-Refresh this object before deploying when you want a fresher production cache.
+Test DDA connectivity:
 
-Next Steps:
+```powershell
+.\.venv\Scripts\python.exe .\smoke_test_dda_api.py --limit 10 --require-records
+```
 
-- refactor
-- add map chart of price changes
-- scrape real state website
+## Commit Safety
+
+Commit code and docs only. Never commit:
+
+```text
+.streamlit/secrets.toml
+*.json service-account keys
+```
