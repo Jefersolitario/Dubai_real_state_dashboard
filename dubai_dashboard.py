@@ -38,6 +38,7 @@ from dda_api import (
     records_to_dataframe,
     validate_normalized_columns,
 )
+from gcs_storage import configured_snapshot, read_parquet_object
 
 LOGGER = logging.getLogger(__name__)
 
@@ -566,6 +567,59 @@ def _load_api_transactions(
     }
 
 
+def _load_gcs_transactions(
+    secrets: dict,
+    bucket_name: str,
+    object_name: str,
+) -> tuple[pl.DataFrame, dict]:
+    raw_df, blob = read_parquet_object(secrets, bucket_name, object_name)
+    normalized = normalize_dld_transactions(raw_df)
+    validation = validate_normalized_columns(normalized)
+    if normalized.is_empty():
+        raise DDAApiError("GCS transaction snapshot is empty.")
+    if validation["missing_required"]:
+        raise DDAApiError("GCS transaction snapshot schema is incomplete.")
+
+    bounds = _date_bounds_from_transactions(normalized)
+    object_metadata = blob.metadata or {}
+    date_start = object_metadata.get("date_start")
+    date_end = object_metadata.get("date_end")
+    if bounds:
+        date_start = date_start or bounds[0].isoformat()
+        date_end = date_end or bounds[1].isoformat()
+
+    return normalized, {
+        "source": "gcs_parquet",
+        "raw_columns": raw_df.columns,
+        "mapping": infer_column_mapping(raw_df.columns),
+        "validation": validation,
+        "params": {
+            "gcs_bucket": bucket_name,
+            "gcs_object": object_name,
+        },
+        "date_window": {
+            "start": date_start,
+            "end": date_end,
+        },
+        "loaded_at": (
+            object_metadata.get("stored_at_utc")
+            or (blob.updated.isoformat() if blob.updated else None)
+            or datetime.now().isoformat(timespec="seconds")
+        ),
+        "date_bounds": {
+            "start": date_start,
+            "end": date_end,
+        },
+        "gcs": {
+            "bucket": bucket_name,
+            "object": object_name,
+            "size": blob.size,
+            "updated": blob.updated.isoformat() if blob.updated else None,
+            "metadata": object_metadata,
+        },
+    }
+
+
 def _probe_api_columns(config, limit: int = 10) -> tuple[pl.DataFrame, dict]:
     records = fetch_dataset_records(
         config,
@@ -607,12 +661,28 @@ def _date_bounds_from_transactions(df: pl.DataFrame) -> tuple[date, date] | None
     ttl=60 * 60,
 )
 def load_production_transactions() -> tuple[pl.DataFrame, dict]:
-    config = load_dda_config(_streamlit_secrets())
+    secrets = _streamlit_secrets()
+    bucket_name, object_name = configured_snapshot(secrets)
+    gcs_error: Exception | None = None
+    if bucket_name:
+        try:
+            return _load_gcs_transactions(secrets, bucket_name, object_name)
+        except Exception as exc:
+            gcs_error = exc
+            LOGGER.exception("GCS transaction snapshot load failed: %s", exc)
+
+    config = load_dda_config(secrets)
     missing = config.missing_fields()
     if missing:
+        fallback_note = ""
+        if gcs_error:
+            fallback_note = f" GCS cache read failed: {gcs_error}"
+        elif not bucket_name:
+            fallback_note = " GCS cache is not configured."
         raise DDAApiError(
             "Missing production data source configuration: "
             + ", ".join(missing)
+            + fallback_note
         )
 
     start, end = last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
@@ -632,11 +702,13 @@ def load_production_transactions() -> tuple[pl.DataFrame, dict]:
     bounds = _date_bounds_from_transactions(df)
     return df, {
         **meta,
+        "source": "dda_api",
         "loaded_at": datetime.now().isoformat(timespec="seconds"),
         "date_bounds": {
             "start": bounds[0].isoformat() if bounds else start.isoformat(),
             "end": bounds[1].isoformat() if bounds else end.isoformat(),
         },
+        "gcs_fallback_error": str(gcs_error) if gcs_error else None,
     }
 
 
