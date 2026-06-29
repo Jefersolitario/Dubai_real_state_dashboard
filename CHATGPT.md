@@ -4,16 +4,13 @@ This file provides guidance to ChatGPT/Codex when working with code in this repo
 
 ## Project Overview
 
-Interactive Streamlit dashboard and PDF report generator for Dubai real estate apartment transactions. The app loads normalized DLD transaction snapshots from Google Cloud Storage Parquet first, with the production Dubai Data API kept as a fallback/source for refreshing the snapshot.
+Interactive Streamlit dashboard for Dubai real estate apartment transactions. The app loads normalized DLD transaction snapshots from Google Cloud Storage Parquet first, with the production Dubai Data API kept as a fallback/source for refreshing the snapshot.
 
 ## Commands
 
 ```bash
 # Run the dashboard from the project virtual environment
 .\.venv\Scripts\python.exe -m streamlit run dubai_dashboard.py
-
-# Generate the PDF market report
-.\.venv\Scripts\python.exe market_report.py
 
 # Test Dubai Data API connectivity and column mapping
 .\.venv\Scripts\python.exe smoke_test_dda_api.py --limit 5
@@ -24,7 +21,7 @@ Interactive Streamlit dashboard and PDF report generator for Dubai real estate a
 # Test Google Cloud Storage Parquet write/read/delete
 .\.venv\Scripts\python.exe smoke_test_gcs.py
 
-# Store the latest normalized DLD transactions snapshot in GCS and verify it
+# Incrementally update the normalized DLD transactions snapshot in GCS and verify it
 .\.venv\Scripts\python.exe store_dld_transactions_gcs.py
 
 # Install dependencies
@@ -39,7 +36,7 @@ Single-file Streamlit app with this flow:
 
 1. **Constants** - tracked neighbourhoods, market tier definitions, chart colors, default data source, and schema assumptions.
 2. **Data loading** - cached GCS Parquet snapshot handling, falling back to the production DDA API when needed.
-3. **Data normalization** - maps DDA API columns and CSV columns into the dashboard schema.
+3. **Data normalization** - maps DDA API columns into the dashboard schema.
 4. **Aggregation helpers** - daily, weekly, Dubai-wide, tier, and area-level metrics using Polars.
 5. **Chart builders** - Plotly figures for price trends, volume, momentum, tiers, and scatter views.
 6. **Streamlit UI** - sidebar filters and API controls, KPI cards, charts, and raw data table.
@@ -71,21 +68,11 @@ Small CLI diagnostic for Google Cloud Storage. It writes a tiny Polars Parquet f
 
 ### store_dld_transactions_gcs.py
 
-Fetches normalized DLD transaction records with the existing `dda_api.py` helpers, writes them to GCS as Parquet, reads the object back, and verifies row count, columns, and date coverage.
-
-### market_report.py
-
-Standalone PDF generator using fpdf2. It builds `report_YYYY-MM-DD.pdf` from the current local analysis assumptions.
-
-### Data
-
-CSV files live in `data/` for offline reference:
-
-```text
-data/transactions-2026-03-20 unit.csv
-```
-
-Important columns include `INSTANCE_DATE`, `AREA_EN`, `ROOMS_EN`, `PROP_SB_TYPE_EN`, `TRANS_VALUE`, and `ACTUAL_AREA`.
+Incrementally updates the GCS Parquet snapshot. It reads the existing snapshot,
+fetches from the current max `INSTANCE_DATE` through today, normalizes, merges,
+deduplicates, rewrites the compact Parquet object, and verifies row count,
+columns, duplicate removal, and date coverage. Use `--full-refresh` to replace
+the snapshot from a requested API window.
 
 ### Google Cloud Storage
 
@@ -115,7 +102,6 @@ GCP_SERVICE_ACCOUNT_JSON = '''
 ## Key Patterns
 
 - Use Polars for data processing. Do not introduce pandas unless there is a strong reason.
-- Use `encoding="utf8-lossy"` for DLD CSV files.
 - Keep the dashboard schema stable: `INSTANCE_DATE`, `GROUP_EN`, `IS_OFFPLAN_EN`, `AREA_EN`, `PROP_SB_TYPE_EN`, `TRANS_VALUE`, `ACTUAL_AREA`, and `ROOMS_EN` are required.
 - `ROOMS_EN` values such as `"1 B/R"` and `"2 B/R"` are normalized to `"1BR"` and `"2BR"`.
 - `AREA_EN` can have casing variants, so compare areas case-insensitively where possible.

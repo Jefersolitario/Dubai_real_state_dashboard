@@ -17,7 +17,7 @@ Configure DDA credentials through Streamlit secrets or environment variables.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 
 import polars as pl
 import plotly.colors
@@ -38,15 +38,23 @@ from dda_api import (
     records_to_dataframe,
     validate_normalized_columns,
 )
-from gcs_storage import configured_snapshot, read_parquet_object
+from gcs_storage import (
+    configured_snapshot,
+    dataframe_to_parquet_bytes,
+    gcs_client,
+    read_parquet_object,
+)
+from store_dld_transactions_gcs import (
+    count_new_rows,
+    dedupe_snapshot,
+    stable_sort,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-SOURCE_API = "Dubai Data API - PROD"
-DEFAULT_SOURCE = SOURCE_API
 API_DEFAULT_LOOKBACK_MONTHS = DEFAULT_LOOKBACK_MONTHS
 
 TRANSACTION_SCHEMA = {
@@ -132,16 +140,16 @@ COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
 # Data loading (Polars) - production DDA API
 # ---------------------------------------------------------------------------
 
-def _source_raw_transactions(data_source: str) -> pl.DataFrame:
+def _source_raw_transactions() -> pl.DataFrame:
     api_df = st.session_state.get("api_raw_df")
     if isinstance(api_df, pl.DataFrame) and not api_df.is_empty():
         return api_df
     return pl.DataFrame(schema=TRANSACTION_SCHEMA)
 
 
-def _flat_transactions(data_source: str, trans_type: str) -> pl.DataFrame:
+def _flat_transactions(trans_type: str) -> pl.DataFrame:
     return _trans_type_filter(
-        _source_raw_transactions(data_source).filter(
+        _source_raw_transactions().filter(
             pl.col("PROP_SB_TYPE_EN")
             .cast(pl.Utf8)
             .str.to_lowercase()
@@ -154,7 +162,6 @@ def _flat_transactions(data_source: str, trans_type: str) -> pl.DataFrame:
 @st.cache_data(show_spinner="Loading transaction data...")
 def generate_dubai_data(
     trans_type: str = "All",
-    data_source: str = DEFAULT_SOURCE,
     data_version: int = 0,
 ) -> pl.DataFrame:
     """Aggregate real DLD apartment transactions from the production API.
@@ -162,7 +169,7 @@ def generate_dubai_data(
     Aggregates individual transactions to daily averages per
     neighbourhood and bedroom type, matching the dashboard schema.
     """
-    raw = _flat_transactions(data_source, trans_type)
+    raw = _flat_transactions(trans_type)
     return (
         raw
         .with_columns([
@@ -186,17 +193,22 @@ def generate_dubai_data(
 @st.cache_data(show_spinner="Computing Dubai-wide aggregates...")
 def generate_dubai_wide_data(
     trans_type: str = "All",
-    data_source: str = DEFAULT_SOURCE,
     data_version: int = 0,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> pl.DataFrame:
     """Daily Dubai-wide transaction count and median price (all flats)."""
-    return (
-        _flat_transactions(data_source, trans_type)
+    raw = (
+        _flat_transactions(trans_type)
         .with_columns(
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
               .alias("date"),
         )
+    )
+    raw = _filter_raw_date_window(raw, start_date, end_date)
+    return (
+        raw
         .group_by("date")
         .agg([
             pl.col("TRANS_VALUE").count().alias("transaction_count"),
@@ -210,18 +222,35 @@ def generate_dubai_wide_data(
 @st.cache_data(show_spinner="Computing weekly stats...")
 def generate_weekly_data(
     trans_type: str = "All",
-    data_source: str = DEFAULT_SOURCE,
     data_version: int = 0,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> pl.DataFrame:
     """Weekly Dubai-wide aggregates with % change."""
-    return (
-        _flat_transactions(data_source, trans_type)
-        .with_columns(
+    raw = (
+        _flat_transactions(trans_type)
+        .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
-              .dt.truncate("1w")
-              .alias("week"),
+              .alias("date"),
+        ])
+    )
+    raw = _filter_raw_date_window(raw, start_date, end_date)
+    raw = raw.with_columns(
+        pl.col("date")
+          .dt.truncate("1w")
+          .alias("week"),
+    )
+    if start_date is not None:
+        raw = raw.with_columns(
+            pl.when(pl.col("week") < start_date)
+              .then(pl.lit(start_date))
+              .otherwise(pl.col("week"))
+              .alias("week")
         )
+
+    return (
+        raw
         .group_by("week")
         .agg([
             pl.col("TRANS_VALUE").count().alias("txns"),
@@ -241,19 +270,27 @@ def generate_weekly_data(
 @st.cache_data(show_spinner="Computing area-level trends...")
 def generate_area_weekly_change(
     trans_type: str = "All",
-    data_source: str = DEFAULT_SOURCE,
     data_version: int = 0,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> pl.DataFrame:
     """Per-area first-to-last-week median price % change (min 50 txns)."""
-    raw = (
-        _flat_transactions(data_source, trans_type)
+    base = (
+        _flat_transactions(trans_type)
         .with_columns([
+            pl.col("INSTANCE_DATE").str.slice(0, 10)
+              .str.to_date("%Y-%m-%d")
+              .alias("date"),
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
               .dt.truncate("1w")
               .alias("week"),
             pl.col("AREA_EN").alias("area"),
         ])
+    )
+    base = _filter_raw_date_window(base, start_date, end_date)
+    raw = (
+        base
         .group_by(["area", "week"])
         .agg([
             pl.col("TRANS_VALUE").count().alias("txns"),
@@ -285,12 +322,13 @@ def generate_area_weekly_change(
 @st.cache_data(show_spinner="Computing tier aggregates...")
 def generate_tier_data(
     trans_type: str = "All",
-    data_source: str = DEFAULT_SOURCE,
     data_version: int = 0,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> pl.DataFrame:
     """Daily median price per market tier."""
-    return (
-        _flat_transactions(data_source, trans_type)
+    raw = (
+        _flat_transactions(trans_type)
         .filter(pl.col("AREA_EN").is_in(list(TIER_MAP.keys())))
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
@@ -298,6 +336,10 @@ def generate_tier_data(
               .alias("date"),
             pl.col("AREA_EN").replace_strict(TIER_MAP).alias("tier"),
         ])
+    )
+    raw = _filter_raw_date_window(raw, start_date, end_date)
+    return (
+        raw
         .group_by(["date", "tier"])
         .agg([
             pl.col("TRANS_VALUE").median().round(0).alias("median_price"),
@@ -317,8 +359,9 @@ def generate_tier_data(
 def generate_area_psf_timeseries(
     trans_type: str = "All",
     bedroom: str = "All",
-    data_source: str = DEFAULT_SOURCE,
     data_version: int = 0,
+    start_date: date | None = None,
+    end_date: date | None = None,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Transaction-level price/sqft and rolling area median — buyer opportunity scanner.
 
@@ -338,7 +381,7 @@ def generate_area_psf_timeseries(
                 rolling_median_psf]
     """
     raw = (
-        _flat_transactions(data_source, trans_type)
+        _flat_transactions(trans_type)
         .filter(pl.col("ACTUAL_AREA") > 0)   # guard against divide-by-zero
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
@@ -349,6 +392,8 @@ def generate_area_psf_timeseries(
             (pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")).alias("price_per_sqft"),
         ])
     )
+
+    raw = _filter_raw_date_window(raw, start_date, end_date)
 
     if bedroom != "All":
         raw = raw.filter(pl.col("bedroom_type") == bedroom)
@@ -656,6 +701,159 @@ def _date_bounds_from_transactions(df: pl.DataFrame) -> tuple[date, date] | None
     return dates["date"].min(), dates["date"].max()
 
 
+def _missing_date_windows(
+    df: pl.DataFrame,
+    requested_start: date,
+    requested_end: date,
+) -> list[tuple[date, date]]:
+    bounds = _date_bounds_from_transactions(df)
+    if not bounds:
+        return [(requested_start, requested_end)]
+
+    loaded_start, loaded_end = bounds
+    windows = []
+    if requested_start < loaded_start:
+        windows.append((requested_start, loaded_start))
+    if requested_end > loaded_end:
+        windows.append((loaded_end, requested_end))
+    return [(start, end) for start, end in windows if start <= end]
+
+
+def _write_gcs_snapshot(
+    secrets: dict,
+    bucket_name: str,
+    object_name: str,
+    df: pl.DataFrame,
+    stats: dict[str, int | str],
+) -> tuple[pl.DataFrame, dict]:
+    bounds = _date_bounds_from_transactions(df)
+    blob = gcs_client(secrets).bucket(bucket_name).blob(object_name)
+    blob.metadata = {
+        "row_count": str(df.height),
+        "date_start": bounds[0].isoformat() if bounds else "",
+        "date_end": bounds[1].isoformat() if bounds else "",
+        "stored_at_utc": datetime.now(UTC).isoformat(timespec="seconds"),
+        **{key: str(value) for key, value in stats.items()},
+    }
+    blob.upload_from_string(
+        dataframe_to_parquet_bytes(df),
+        content_type="application/vnd.apache.parquet",
+    )
+
+    refreshed_df, refreshed_meta = _load_gcs_transactions(
+        secrets,
+        bucket_name,
+        object_name,
+    )
+    if refreshed_df.height != df.height:
+        raise DDAApiError(
+            f"GCS write verification failed: expected {df.height:,} rows, "
+            f"read back {refreshed_df.height:,}."
+        )
+    if dedupe_snapshot(refreshed_df).height != refreshed_df.height:
+        raise DDAApiError("GCS write verification failed: duplicate rows remain.")
+    return refreshed_df, refreshed_meta
+
+
+def _ensure_transactions_cover_range(
+    df: pl.DataFrame,
+    meta: dict,
+    requested_start: date,
+    requested_end: date,
+) -> tuple[pl.DataFrame, dict, dict | None]:
+    windows = _missing_date_windows(df, requested_start, requested_end)
+    if not windows:
+        return df, meta, None
+
+    refresh_key = "|".join(f"{start}:{end}" for start, end in windows)
+    if st.session_state.get("gcs_refresh_checked") == refresh_key:
+        return df, meta, None
+
+    secrets = _streamlit_secrets()
+    config = load_dda_config(secrets)
+    missing = config.missing_fields()
+    if missing:
+        raise DDAApiError(
+            "Cannot refresh missing date range; missing DDA configuration: "
+            + ", ".join(missing)
+        )
+
+    incoming_frames = []
+    fetched_rows = 0
+    for start, end in windows:
+        incoming, incoming_meta = _load_api_transactions(
+            config,
+            start,
+            end,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_MAX_RECORDS,
+        )
+        validation = incoming_meta["validation"]
+        if validation["missing_required"]:
+            raise DDAApiError(
+                "Incremental DDA response schema is incomplete: "
+                + ", ".join(validation["missing_required"])
+            )
+        if not incoming.is_empty():
+            incoming_frames.append(incoming)
+            fetched_rows += incoming.height
+
+    st.session_state["gcs_refresh_checked"] = refresh_key
+    if not incoming_frames:
+        return df, meta, {
+            "mode": "incremental",
+            "fetched_rows": 0,
+            "added_rows": 0,
+            "duplicate_rows_removed": 0,
+            "windows": windows,
+            "written": False,
+        }
+
+    incoming_df = pl.concat(incoming_frames, how="diagonal_relaxed")
+    existing_deduped = dedupe_snapshot(df)
+    incoming_deduped = dedupe_snapshot(incoming_df)
+    combined = pl.concat([existing_deduped, incoming_deduped], how="diagonal_relaxed")
+    final_df = stable_sort(dedupe_snapshot(combined))
+    added_rows = count_new_rows(existing_deduped, final_df)
+    existing_duplicate_rows_removed = df.height - existing_deduped.height
+    incoming_duplicate_rows_removed = incoming_df.height - incoming_deduped.height
+    overlap_duplicate_rows = existing_deduped.height + incoming_deduped.height - final_df.height
+
+    stats = {
+        "mode": "incremental_dashboard",
+        "existing_rows": df.height,
+        "fetched_rows": fetched_rows,
+        "added_rows": added_rows,
+        "existing_duplicate_rows_removed": existing_duplicate_rows_removed,
+        "incoming_duplicate_rows_removed": incoming_duplicate_rows_removed,
+        "overlap_duplicate_rows": overlap_duplicate_rows,
+        "windows": windows,
+    }
+    if added_rows == 0 and existing_duplicate_rows_removed == 0:
+        return df, meta, {**stats, "written": False}
+
+    bucket_name, object_name = configured_snapshot(secrets)
+    if not bucket_name:
+        return final_df, {
+            **meta,
+            "loaded_at": datetime.now().isoformat(timespec="seconds"),
+            "source": "dda_incremental_memory",
+        }, {**stats, "written": False}
+
+    refreshed_df, refreshed_meta = _write_gcs_snapshot(
+        secrets,
+        bucket_name,
+        object_name,
+        final_df,
+        {key: value for key, value in stats.items() if key != "windows"},
+    )
+    try:
+        load_production_transactions.clear()
+    except Exception:
+        pass
+    return refreshed_df, refreshed_meta, {**stats, "written": True}
+
+
 @st.cache_data(
     show_spinner="Loading latest DLD transactions...",
     ttl=60 * 60,
@@ -712,7 +910,7 @@ def load_production_transactions() -> tuple[pl.DataFrame, dict]:
     }
 
 
-def _loaded_date_bounds_for_source(data_source: str) -> tuple[date, date]:
+def _loaded_date_bounds() -> tuple[date, date]:
     api_df = st.session_state.get("api_raw_df")
     if isinstance(api_df, pl.DataFrame):
         bounds = _date_bounds_from_transactions(api_df)
@@ -721,9 +919,10 @@ def _loaded_date_bounds_for_source(data_source: str) -> tuple[date, date]:
     return last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
 
 
-def _date_picker_bounds(data_source: str) -> tuple[date, date, date]:
-    loaded_start, loaded_end = _loaded_date_bounds_for_source(data_source)
-    return loaded_start, loaded_end, loaded_end
+def _date_picker_bounds() -> tuple[date, date, date]:
+    loaded_start, loaded_end = _loaded_date_bounds()
+    default_start, today = last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
+    return min(loaded_start, default_start), today, today
 
 
 # ---------------------------------------------------------------------------
@@ -758,6 +957,24 @@ def _trans_type_filter(df: pl.DataFrame, trans_type: str) -> pl.DataFrame:
 
         return df.filter(status_mask | procedure_mask)
     return df  # "All"
+
+
+def _filter_raw_date_window(
+    df: pl.DataFrame,
+    start: date | None,
+    end: date | None,
+    column: str = "date",
+) -> pl.DataFrame:
+    """Limit a raw transaction frame to the selected date window."""
+    if df.is_empty() or column not in df.columns:
+        return df
+
+    mask = pl.lit(True)
+    if start is not None:
+        mask = mask & (pl.col(column) >= start)
+    if end is not None:
+        mask = mask & (pl.col(column) <= end)
+    return df.filter(mask)
 
 
 def apply_filters(
@@ -1197,7 +1414,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-data_source = SOURCE_API
 try:
     api_snapshot, api_meta = load_production_transactions()
 except Exception as exc:
@@ -1240,7 +1456,7 @@ with st.sidebar:
         horizontal=True,
     )
 
-    date_min, date_max, default_end = _date_picker_bounds(data_source)
+    date_min, date_max, default_end = _date_picker_bounds()
     default_start = date_min
 
     date_range = st.date_input(
@@ -1249,7 +1465,7 @@ with st.sidebar:
         min_value=date_min,
         max_value=date_max,
         format="YYYY/MM/DD",
-        key=f"date_range_{data_source}_{data_version}_{date_min}_{date_max}",
+        key="date_range",
     )
     # Safely unpack; user may still be selecting end date
     if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
@@ -1262,20 +1478,53 @@ with st.sidebar:
     end_date = min(end_date, date_max)
     if start_date > end_date:
         start_date, end_date = date_min, date_max
+    refresh_info = None
+    try:
+        with st.spinner("Refreshing missing DLD transactions..."):
+            api_snapshot, api_meta, refresh_info = _ensure_transactions_cover_range(
+                api_snapshot,
+                api_meta,
+                start_date,
+                end_date,
+            )
+    except Exception as exc:
+        LOGGER.exception("Incremental transaction refresh failed: %s", exc)
+        st.warning(
+            "Could not refresh the missing date range from DDA. "
+            "Showing the available GCS snapshot."
+        )
+
+    st.session_state["api_raw_df"] = api_snapshot
+    st.session_state["api_meta"] = api_meta
+    data_version = api_meta.get("loaded_at", data_version)
+    active_api_rows = api_snapshot.height
+    api_bounds = _date_bounds_from_transactions(api_snapshot)
+    if api_bounds:
+        date_min = min(date_min, api_bounds[0])
+        date_max = max(date_max, api_bounds[1])
+    if refresh_info:
+        if refresh_info.get("written"):
+            added = refresh_info.get("added_rows", 0)
+            if added:
+                st.caption(f"Updated GCS cache: +{added:,} rows.")
+            else:
+                st.caption("Cleaned and verified the GCS cache.")
+        elif refresh_info.get("added_rows", 0) == 0:
+            st.caption("No newer DLD records were available for the requested range.")
+
     if (start_date, end_date) != (requested_start_date, requested_end_date):
         st.caption(
             "Adjusted to loaded data range: "
             f"{start_date:%Y-%m-%d} to {end_date:%Y-%m-%d}."
         )
     st.divider()
-    api_bounds = _date_bounds_from_transactions(api_snapshot)
     date_summary = f"{date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}"
     if api_bounds:
         date_summary = f"{api_bounds[0]:%Y-%m-%d} to {api_bounds[1]:%Y-%m-%d}"
     st.caption(f"Data covers {date_summary} ({active_api_rows:,} transactions).")
 
 # ── Load & filter data ───────────────────────────────────────────────────────
-DF = generate_dubai_data(trans_type, data_source, data_version)
+DF = generate_dubai_data(trans_type, data_version)
 
 if not neighborhoods:
     st.warning("Select at least one neighbourhood in the sidebar.")
@@ -1330,9 +1579,9 @@ with c4:
 st.divider()
 
 # ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
-DW = generate_dubai_wide_data(trans_type, data_source, data_version)
-WK = generate_weekly_data(trans_type, data_source, data_version)
-AREA_CHG = generate_area_weekly_change(trans_type, data_source, data_version)
+DW = generate_dubai_wide_data(trans_type, data_version, start_date, end_date)
+WK = generate_weekly_data(trans_type, data_version, start_date, end_date)
+AREA_CHG = generate_area_weekly_change(trans_type, data_version, start_date, end_date)
 
 # KPI cards for Dubai-wide price momentum
 first_wk = WK.row(0, named=True)
@@ -1384,7 +1633,7 @@ st.plotly_chart(area_pct_change_chart(AREA_CHG), use_container_width=True)
 st.divider()
 
 # ── Tier chart ────────────────────────────────────────────────────────────────
-TIER_DF = generate_tier_data(trans_type, data_source, data_version)
+TIER_DF = generate_tier_data(trans_type, data_version, start_date, end_date)
 st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
 
 st.divider()
@@ -1400,8 +1649,9 @@ st.caption(
 PSF_TXNS, PSF_ROLLING = generate_area_psf_timeseries(
     trans_type,
     bedroom,
-    data_source,
     data_version,
+    start_date,
+    end_date,
 )
 
 # KPI row: cheapest current 14-day rolling median among selected areas

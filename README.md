@@ -14,23 +14,26 @@ pip install -r requirements.txt
 
 ## Data Flow
 
-1. `store_dld_transactions_gcs.py` fetches recent DLD transactions from the
-   Dubai Data API.
-2. The script normalizes the records and writes:
+1. `store_dld_transactions_gcs.py` reads the existing GCS Parquet snapshot.
+2. It fetches DLD records only from the snapshot's latest `INSTANCE_DATE`
+   through today.
+3. It normalizes, merges, deduplicates, and rewrites the compact snapshot:
+   only when new rows are found or the existing snapshot needs cleanup.
 
 ```text
 gs://dubai-real-estate-dashboard-jef/dld_transactions/dld_transactions_latest.parquet
 ```
 
-3. `dubai_dashboard.py` loads that GCS Parquet snapshot first.
-4. If the GCS snapshot is unavailable, the dashboard falls back to the DDA API.
+4. `dubai_dashboard.py` loads that GCS Parquet snapshot first.
+5. If the GCS snapshot is unavailable, the dashboard falls back to the DDA API.
 
 Current verified snapshot:
 
 ```text
-rows: 48,028
+rows: 42,469
 columns: 69
 date coverage: 2026-03-02 to 2026-06-25
+duplicates: 0
 ```
 
 ## Streamlit Secrets
@@ -91,10 +94,16 @@ Test GCS read/write/delete:
 .\.venv\Scripts\python.exe .\smoke_test_gcs.py
 ```
 
-Refresh the production Parquet snapshot:
+Incrementally refresh the production Parquet snapshot:
 
 ```powershell
 .\.venv\Scripts\python.exe .\store_dld_transactions_gcs.py
+```
+
+Force a full replacement from a requested API window:
+
+```powershell
+.\.venv\Scripts\python.exe .\store_dld_transactions_gcs.py --full-refresh --last-months 4
 ```
 
 Test DDA connectivity:
