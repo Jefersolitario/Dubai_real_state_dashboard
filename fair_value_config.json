@@ -1,22 +1,29 @@
 {
- "source": "GCS snapshot",
- "generated_at": "2026-07-04T16:02:48",
- "winner": "hyperparams: slower learning",
- "cv_medape_mean": 0.058461277956132165,
+ "source": "campaign: 52 attempts, selection <2026-05-01, sequestered holdout gate",
+ "generated_at": "2026-07-04T19:55:00",
+ "winner": "MAE + leaves 127 + L2 1.0 (features: repeat_sale + te_hist + rel_size)",
+ "cv_medape_mean": 0.041978339056537015,
+ "cv_medape_std": 0.004496547207891492,
+ "cv_r2_mean": 0.9226900290727809,
+ "holdout_medape": 0.0432,
+ "holdout_note": "one-shot sequestered holdout 2026-05-01+: 4.32% vs 5.91% for prior config",
  "feature_config": {
   "project": true,
   "building": false,
   "amenity": true,
   "comps_area": false,
-  "comps_project": true
+  "comps_project": true,
+  "repeat_sale": true,
+  "te_hist": true,
+  "rel_size": true
  },
  "model_params": {
   "learning_rate": 0.04,
   "max_iter": 800,
-  "max_leaf_nodes": 63,
+  "max_leaf_nodes": 127,
   "early_stopping": true,
-  "validation_fraction": 0.1
- },
- "cv_medape_std": 0.004924713421540223,
- "cv_r2_mean": 0.8920501320700474
+  "validation_fraction": 0.1,
+  "loss": "absolute_error",
+  "l2_regularization": 1.0
+ }
 }

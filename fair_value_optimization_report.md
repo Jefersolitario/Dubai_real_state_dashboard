@@ -76,3 +76,37 @@ re-validation) confirmed the results:
 - Deepest scored "discounts" (spread ≈ −99%) are token/nominal-consideration
   transfers; they are annotated but correctly not labelled distressed because
   no residual-independent signal corroborates them.
+
+## Campaign addendum (2026-07-04): 52 attempts, sequestered-holdout protocol
+
+An extended campaign explored 8 new strictly-past feature groups plus
+hyperparameters, objectives, ensembles, segmentation, and ablations.
+**Anti-overfitting protocol**: every selection decision used only data before
+2026-05-01 (10-fold date-ordered TimeSeriesSplit within that window); the
+final two months were evaluated exactly once, as a ship/no-ship gate.
+
+| Milestone | Selection CV MedAPE |
+|---|---|
+| Baseline (previous shipping config) | 5.69% |
+| + repeat_sale (same unit's prior sale PSF) | 4.76% (−0.93pp, largest gain) |
+| + te_hist (expanding project & building median PSF) | 4.65% |
+| + rel_size (size vs project norm — interaction found on retest) | 4.48% |
+| + absolute_error objective (train what we measure) | 4.26% |
+| + leaves 127 / L2 1.0 | **4.20% ± 0.45%**, R² 0.923 |
+
+44 of 52 attempts were rejected by the ≥0.05pp noise gate, including:
+building categorical, comp window variants, liquidity counts, momentum,
+comp dispersion, indexed repeat-sale, 3-seed bagging, off-plan/ready
+segmentation, encoder capacity, and every ablation (confirming the kept
+features all carry signal). The campaign stopped at diminishing returns —
+continuing toward 100 attempts would only have inflated selection bias.
+
+**Holdout gate (one-shot, untouched May–July 2026, n=17,953):**
+campaign winner **4.32% / R² 0.874** vs prior production config
+**5.91% / R² 0.833** → shipped. The near-match between selection CV (4.20%)
+and holdout (4.32%) indicates minimal winner's curse.
+
+**Winning model importances (out-of-sample permutation):** prior_unit_psf
+0.48, building_hist_psf 0.31, MASTER_PROJECT_EN 0.08, log_sqft 0.05,
+rooms_ord 0.05, project_comp_psf 0.04 — repeat-sales and building-level
+history now dominate, exactly as the research report predicted.
