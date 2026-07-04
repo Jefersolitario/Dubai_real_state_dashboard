@@ -79,6 +79,11 @@ SHIPPING_CONFIG_PATH = Path(__file__).with_name("fair_value_config.json")
 # The live DLD vocabulary should be checked via the value-counts view in the UI.
 DISTRESS_PROCEDURE_PATTERN = r"(?i)court|forc|foreclos|auction|bankrupt|liquidat|execution"
 
+# Procedures inside GROUP_EN="Sales" that are NOT arm's-length market deals:
+# developer registrations and financing structures price at 0.42-0.75x market
+# (data_quality_report.md) — they poison training and surface as fake bargains.
+NON_MARKET_PROCEDURE_PATTERN = r"(?i)development|lease to own|payment plan"
+
 # Columns carried through feature_engineering untouched, for scoring/display.
 PASSTHROUGH_COLUMNS = [
     "TRANSACTION_NUMBER",
@@ -157,9 +162,21 @@ def feature_engineering(
         & (pl.col("PROP_SB_TYPE_EN").cast(pl.Utf8).str.to_lowercase() == "flat")
         & (pl.col("TRANS_VALUE").cast(pl.Float64, strict=False) > 0)
         & (pl.col("ACTUAL_AREA").cast(pl.Float64, strict=False) > 0)
+        & ~pl.col("PROCEDURE_EN")
+        .cast(pl.Utf8)
+        .str.contains(NON_MARKET_PROCEDURE_PATTERN)
+        .fill_null(False)
     )
     if df.is_empty():
         return df
+
+    # Merge case variants (e.g. "Imperial Residence" vs "IMPERIAL RESIDENCE")
+    # so the encoder sees one category per real-world name.
+    df = df.with_columns(
+        pl.col(c).cast(pl.Utf8).str.to_uppercase().alias(c)
+        for c in ("PROJECT_EN", "MASTER_PROJECT_EN", "BUILDING_NAME_EN")
+        if c in df.columns
+    )
 
     df = df.with_columns(
         pl.col("INSTANCE_DATE")
