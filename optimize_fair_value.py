@@ -34,19 +34,24 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 
 from fair_value_model import (
+    DEFAULT_FEATURE_CONFIG,
     DEFAULT_MODEL_PARAMS,
+    SHIPPING_CONFIG_PATH,
     _fold_metrics,
     _make_model,
     cross_validate,
     feature_columns,
     feature_engineering,
     fit_encoders,
+    summarize_folds,
     to_matrix,
     train_fair_value_model,
+    trim_psf,
 )
 
 REPORT_PATH = "fair_value_optimization_report.md"
-STOP_MIN_IMPROVEMENT = 0.002  # 0.2 percentage points of MedAPE
+STOP_MIN_IMPROVEMENT = 0.002    # 0.2 pp of MedAPE: below this, an iteration counts as "no gain"
+ACCEPT_MIN_IMPROVEMENT = 0.0005  # 0.05 pp: smaller gains are fold noise and do not change the config
 STOP_PATIENCE = 2
 MAX_ITERATIONS = 10
 
@@ -56,6 +61,7 @@ MAX_ITERATIONS = 10
 # ---------------------------------------------------------------------------
 
 def load_snapshot_from_gcs() -> pl.DataFrame:
+    from dda_api import normalize_dld_transactions
     from gcs_storage import (
         configured_snapshot,
         gcs_client,
@@ -68,7 +74,10 @@ def load_snapshot_from_gcs() -> pl.DataFrame:
     if blob is None:
         raise SystemExit(f"Snapshot gs://{bucket_name}/{object_name} not found.")
     print(f"Loading gs://{bucket_name}/{object_name} ...")
-    return pl.read_parquet(io.BytesIO(blob.download_as_bytes()))
+    raw = pl.read_parquet(io.BytesIO(blob.download_as_bytes()))
+    # Same normalization as the dashboard path: aliases, types, and null
+    # backfill for optional columns older snapshots may lack.
+    return normalize_dld_transactions(raw)
 
 
 def load_synthetic() -> pl.DataFrame:
@@ -82,13 +91,10 @@ def load_synthetic() -> pl.DataFrame:
 # Evaluation protocols (all share the same time-ordered folds)
 # ---------------------------------------------------------------------------
 
-def _summarize(folds: list[dict], n_rows: int, n_splits: int) -> dict:
-    summary = {"n_splits": n_splits, "n_rows": n_rows, "folds": folds}
-    for key in ("medape", "mae_log", "r2"):
-        values = [f[key] for f in folds]
-        summary[f"{key}_mean"] = float(np.mean(values))
-        summary[f"{key}_std"] = float(np.std(values))
-    return summary
+def _prepared_features(raw: pl.DataFrame, feature_config: dict) -> pl.DataFrame:
+    """Training/evaluation frame: engineered features with the PSF trim
+    applied (target robustness). Scoring in the app uses the untrimmed frame."""
+    return trim_psf(feature_engineering(raw, feature_config))
 
 
 def _fold_slices(df: pl.DataFrame, n_splits: int):
@@ -114,7 +120,24 @@ def eval_area_median_baseline(feats: pl.DataFrame, n_splits: int) -> dict:
             .to_numpy()
         )
         folds.append(_fold_metrics(val_df.get_column("log_psf").to_numpy(), pred))
-    return _summarize(folds, df.height, n_splits)
+    return summarize_folds(folds, n_rows=df.height, n_splits=n_splits)
+
+
+def _impute_train_medians(
+    X_tr: "np.ndarray", X_va: "np.ndarray", n_numeric: int
+) -> tuple["np.ndarray", "np.ndarray"]:
+    """Fill numeric NaNs with the TRAIN column median (never 0.0 — a zero
+    AED/sqft comp or rooms_ord=Studio would corrupt the linear benchmark).
+    Categorical code columns have no NaNs by construction."""
+    X_tr, X_va = X_tr.copy(), X_va.copy()
+    for j in range(n_numeric):
+        col = X_tr[:, j]
+        med = np.nanmedian(col)
+        if np.isnan(med):
+            med = 0.0
+        X_tr[np.isnan(X_tr[:, j]), j] = med
+        X_va[np.isnan(X_va[:, j]), j] = med
+    return X_tr, X_va
 
 
 def eval_ridge(feats: pl.DataFrame, feature_config: dict, n_splits: int) -> dict:
@@ -137,10 +160,10 @@ def eval_ridge(feats: pl.DataFrame, feature_config: dict, n_splits: int) -> dict
         encoders = fit_encoders(train_df, feature_config)
         X_tr, y_tr, _, _ = to_matrix(train_df, encoders, feature_config)
         X_va, y_va, _, _ = to_matrix(val_df, encoders, feature_config)
-        X_tr, X_va = np.nan_to_num(X_tr), np.nan_to_num(X_va)
+        X_tr, X_va = _impute_train_medians(X_tr, X_va, n_numeric=len(numeric))
         model.fit(X_tr, y_tr)
         folds.append(_fold_metrics(y_va, model.predict(X_va)))
-    return _summarize(folds, df.height, n_splits)
+    return summarize_folds(folds, n_rows=df.height, n_splits=n_splits)
 
 
 def eval_blend(
@@ -169,11 +192,12 @@ def eval_blend(
             ]
         )
         ridge = make_pipeline(pre, Ridge(alpha=1.0))
-        ridge.fit(np.nan_to_num(X_tr), y_tr)
+        X_tr_imp, X_va_imp = _impute_train_medians(X_tr, X_va, n_numeric=len(numeric))
+        ridge.fit(X_tr_imp, y_tr)
 
-        pred = 0.5 * hgb.predict(X_va) + 0.5 * ridge.predict(np.nan_to_num(X_va))
+        pred = 0.5 * hgb.predict(X_va) + 0.5 * ridge.predict(X_va_imp)
         folds.append(_fold_metrics(y_va, pred))
-    return _summarize(folds, df.height, n_splits)
+    return summarize_folds(folds, n_rows=df.height, n_splits=n_splits)
 
 
 # ---------------------------------------------------------------------------
@@ -243,13 +267,9 @@ CANDIDATE_LADDER: list[dict] = [
     },
 ]
 
-BASE_FEATURE_CONFIG = {
-    "project": False,
-    "building": False,
-    "amenity": False,
-    "comps_area": False,
-    "comps_project": False,
-}
+# All feature groups off — derived from DEFAULT_FEATURE_CONFIG so a newly
+# added group can never silently leak into the optimizer baseline.
+BASE_FEATURE_CONFIG = {key: False for key in DEFAULT_FEATURE_CONFIG}
 
 
 def resolve_candidate(spec: dict, best: dict) -> dict:
@@ -268,7 +288,7 @@ def resolve_candidate(spec: dict, best: dict) -> dict:
 def evaluate(candidate: dict, feats_by_cfg: dict, raw: pl.DataFrame, n_splits: int) -> dict:
     key = tuple(sorted(candidate["feature_config"].items()))
     if key not in feats_by_cfg:
-        feats_by_cfg[key] = feature_engineering(raw, candidate["feature_config"])
+        feats_by_cfg[key] = _prepared_features(raw, candidate["feature_config"])
     feats = feats_by_cfg[key]
     if candidate["kind"] == "hgb":
         return cross_validate(
@@ -345,7 +365,9 @@ def main() -> int:
         raw = load_synthetic()
         source = "synthetic smoke data"
     elif args.parquet:
-        raw = pl.read_parquet(args.parquet)
+        from dda_api import normalize_dld_transactions
+
+        raw = normalize_dld_transactions(pl.read_parquet(args.parquet))
         source = args.parquet
     else:
         raw = load_snapshot_from_gcs()
@@ -356,7 +378,7 @@ def main() -> int:
 
     # Iteration 0 — the no-ML floor every model iteration must beat.
     base_key = tuple(sorted(BASE_FEATURE_CONFIG.items()))
-    feats_by_cfg[base_key] = feature_engineering(raw, BASE_FEATURE_CONFIG)
+    feats_by_cfg[base_key] = _prepared_features(raw, BASE_FEATURE_CONFIG)
     baseline_feats = feats_by_cfg[base_key]
     print(f"Data: {source} — {baseline_feats.height:,} scoreable apartment sales")
     t0 = time.time()
@@ -397,7 +419,7 @@ def main() -> int:
         metrics = evaluate(candidate, feats_by_cfg, raw, args.n_splits)
         elapsed = time.time() - t0
         improvement = best["metrics"]["medape_mean"] - metrics["medape_mean"]
-        accepted = improvement > 0
+        accepted = improvement >= ACCEPT_MIN_IMPROVEMENT
         if accepted:
             best = {
                 "name": candidate["name"],
@@ -436,7 +458,7 @@ def main() -> int:
     print("Computing permutation feature importances for the winning configuration...")
     best_key = tuple(sorted(best["feature_config"].items()))
     if best_key not in feats_by_cfg:
-        feats_by_cfg[best_key] = feature_engineering(raw, best["feature_config"])
+        feats_by_cfg[best_key] = _prepared_features(raw, best["feature_config"])
     final_result = train_fair_value_model(
         feats_by_cfg[best_key],
         best["feature_config"],
@@ -444,6 +466,29 @@ def main() -> int:
         run_cv=False,
     )
     importances = final_result.importances.to_dicts()
+
+    # Ship the winning configuration to the app (fair_value_model reads this
+    # at train time), unless the winner is not an HGB config the app can run.
+    if best["kind"] in ("hgb", "baseline"):
+        SHIPPING_CONFIG_PATH.write_text(
+            json.dumps(
+                {
+                    "source": source,
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "winner": best["name"],
+                    "cv_medape_mean": best["metrics"]["medape_mean"],
+                    "feature_config": best["feature_config"],
+                    "model_params": best["model_params"],
+                },
+                indent=1,
+            )
+        )
+        print(f"Shipping config written to {SHIPPING_CONFIG_PATH}")
+    else:
+        print(
+            f"Winner kind '{best['kind']}' is not deployable in the app; "
+            "shipping config NOT updated (app keeps HGB defaults)."
+        )
 
     dump_progress(args.progress_json, source, rows, best, "done", importances)
     write_report(args.report, source, rows, best, args.n_splits, importances)

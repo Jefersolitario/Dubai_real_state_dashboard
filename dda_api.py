@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 import os
 import re
+import time
 
 import polars as pl
 import requests
@@ -25,6 +26,8 @@ DEFAULT_PAGE_SIZE = 1000
 DEFAULT_MAX_RECORDS = 1_000_000
 DEFAULT_LOOKBACK_MONTHS = 24
 REQUEST_TIMEOUT = (10, 60)
+PAGE_RETRY_ATTEMPTS = 4
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 REQUIRED_DASHBOARD_COLUMNS = [
     "INSTANCE_DATE",
@@ -357,6 +360,36 @@ def fetch_dataset_records(
             "limit": page_size,
             "offset": offset,
         }
+        response = _request_page_with_retry(config, token, query)
+        page_records = _extract_records(response.json())
+        if not page_records:
+            break
+
+        records.extend(page_records)
+        if max_records is not None and len(records) >= max_records:
+            return records[:max_records]
+        if len(page_records) < page_size:
+            break
+        offset += len(page_records)
+
+    return records
+
+
+def _request_page_with_retry(
+    config: DDAConfig,
+    token: str,
+    query: Mapping[str, Any],
+    attempts: int = PAGE_RETRY_ATTEMPTS,
+) -> requests.Response:
+    """One dataset page, retried with exponential backoff.
+
+    The gateway intermittently answers 502 "policy unavailable" during long
+    paginated pulls; without per-page retry a single blip discards every
+    page already fetched.
+    """
+    delay = 2.0
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
         try:
             response = requests.get(
                 config.dataset_url,
@@ -370,23 +403,22 @@ def fetch_dataset_records(
                 timeout=REQUEST_TIMEOUT,
                 verify=config.verify_ssl,
             )
+            if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts:
+                last_error = DDAApiError(
+                    f"Dataset request failed with HTTP {response.status_code}"
+                )
+            else:
+                _raise_for_status(response, "Dataset request")
+                return response
         except requests.RequestException as exc:
-            raise DDAApiError(
-                f"Dataset request failed: {type(exc).__name__}"
-            ) from exc
-        _raise_for_status(response, "Dataset request")
-        page_records = _extract_records(response.json())
-        if not page_records:
-            break
-
-        records.extend(page_records)
-        if max_records is not None and len(records) >= max_records:
-            return records[:max_records]
-        if len(page_records) < page_size:
-            break
-        offset += len(page_records)
-
-    return records
+            last_error = exc
+            if attempt == attempts:
+                raise DDAApiError(
+                    f"Dataset request failed: {type(exc).__name__}"
+                ) from exc
+        time.sleep(delay)
+        delay *= 2
+    raise DDAApiError(f"Dataset request failed after {attempts} attempts: {last_error}")
 
 
 def months_before(end: date, months: int) -> date:

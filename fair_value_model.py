@@ -18,8 +18,10 @@ trains on the past and validates on the next time block.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -59,8 +61,17 @@ AMENITY_CATEGORICAL = ["NEAREST_METRO_EN", "NEAREST_MALL_EN", "NEAREST_LANDMARK_
 MAX_CATEGORIES = 200  # top-N per categorical; the rest map to OTHER
 UNSEEN_CODE = 0       # shared code for OTHER / UNKNOWN / unseen values
 
-# PSF rows outside these quantiles are treated as data-entry noise.
+# PSF rows outside these quantiles are excluded from TRAINING only (target
+# robustness); scoring covers every row so deep discounts are never hidden.
 PSF_TRIM_QUANTILES = (0.005, 0.995)
+
+# Drop rows where TRANS_VALUE/ACTUAL_AREA disagrees with the DLD-reported
+# METER_SALE_PRICE by more than this relative tolerance (wrong-area guard).
+AREA_MISMATCH_TOLERANCE = 0.10
+
+# Optimizer output consumed at train time so the app ships the winning
+# configuration instead of silently reverting to hard-coded defaults.
+SHIPPING_CONFIG_PATH = Path(__file__).with_name("fair_value_config.json")
 
 # Case-insensitive PROCEDURE_EN patterns suggesting a forced/distressed sale.
 # The live DLD vocabulary should be checked via the value-counts view in the UI.
@@ -113,14 +124,31 @@ def feature_engineering(
 ) -> pl.DataFrame:
     """Filter to scoreable sales and derive model features + target.
 
-    Keeps only apartment Sales rows with positive price and area, trims PSF
-    outliers, and returns one row per transaction with the ``log_psf``
-    target, model features, and passthrough columns for display.
+    Keeps only apartment Sales rows with positive price and area, drops rows
+    whose ACTUAL_AREA contradicts the DLD-reported METER_SALE_PRICE (plot
+    area recorded instead of unit area), and returns one row per transaction
+    with the ``log_psf`` target, model features, and passthrough columns.
+
+    Deliberately does NOT trim PSF outliers: the deepest discounts are the
+    distressed assets this model exists to surface. Apply :func:`trim_psf`
+    to the result before TRAINING so the target stays robust.
 
     ``date_origin`` anchors ``days_since_start``; pass the training origin
     when scoring new data so the trend feature stays aligned.
     """
     cfg = {**DEFAULT_FEATURE_CONFIG, **(feature_config or {})}
+
+    # Frames that bypassed normalize_dld_transactions may lack optional
+    # columns; backfill them as nulls so derivations below never crash.
+    optional_sources = [
+        "PARKING", "TOTAL_BUYER", "TOTAL_SELLER", "METER_SALE_PRICE",
+        "PROCEDURE_EN", "PROJECT_EN", "MASTER_PROJECT_EN", "BUILDING_NAME_EN",
+        "TRANSACTION_NUMBER", "USAGE_EN", "PROP_TYPE_EN",
+        "NEAREST_METRO_EN", "NEAREST_MALL_EN", "NEAREST_LANDMARK_EN",
+    ]
+    missing_sources = [c for c in optional_sources if c not in raw.columns]
+    if missing_sources:
+        raw = raw.with_columns(pl.lit(None).alias(c) for c in missing_sources)
 
     df = raw.filter(
         (pl.col("GROUP_EN").cast(pl.Utf8).str.to_lowercase().str.contains("sale"))
@@ -140,11 +168,17 @@ def feature_engineering(
         (pl.col("TRANS_VALUE") / (pl.col("ACTUAL_AREA") * SQM_TO_SQFT)).alias("psf"),
     ).drop_nulls(["date", "psf"])
 
-    lo, hi = df.select(
-        pl.col("psf").quantile(PSF_TRIM_QUANTILES[0]).alias("lo"),
-        pl.col("psf").quantile(PSF_TRIM_QUANTILES[1]).alias("hi"),
-    ).row(0)
-    df = df.filter(pl.col("psf").is_between(lo, hi))
+    # Units guard: DLD publishes METER_SALE_PRICE (AED per sqm). When present,
+    # TRANS_VALUE / ACTUAL_AREA must agree with it — a large mismatch means
+    # ACTUAL_AREA holds a plot/common area, which would fabricate an extreme
+    # fake discount. Rows without METER_SALE_PRICE are kept.
+    msp = pl.col("METER_SALE_PRICE").cast(pl.Float64, strict=False)
+    psf_sqm = pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")
+    df = df.filter(
+        msp.is_null()
+        | (msp <= 0)
+        | (((psf_sqm - msp) / msp).abs() <= AREA_MISMATCH_TOLERANCE)
+    )
     if df.is_empty():
         return df
 
@@ -203,6 +237,39 @@ def feature_engineering(
     keep += numeric + categorical
     keep += [c for c in PASSTHROUGH_COLUMNS if c in df.columns and c not in keep]
     return df.select(keep).sort("date")
+
+
+def trim_psf(df: pl.DataFrame) -> pl.DataFrame:
+    """Drop PSF outliers for TRAINING (data-entry noise robustness).
+
+    Never apply this to the frame being scored — the trimmed tail is where
+    the deepest distressed discounts live.
+    """
+    if df.is_empty():
+        return df
+    lo, hi = df.select(
+        pl.col("psf").quantile(PSF_TRIM_QUANTILES[0]).alias("lo"),
+        pl.col("psf").quantile(PSF_TRIM_QUANTILES[1]).alias("hi"),
+    ).row(0)
+    return df.filter(pl.col("psf").is_between(lo, hi))
+
+
+def load_shipping_config() -> tuple[dict[str, bool], dict]:
+    """(feature_config, model_params) the app should train with.
+
+    Reads the optimizer-written ``fair_value_config.json`` when present so
+    the dashboard ships the winning configuration; falls back to the module
+    defaults otherwise.
+    """
+    feature_config = dict(DEFAULT_FEATURE_CONFIG)
+    model_params = dict(DEFAULT_MODEL_PARAMS)
+    try:
+        payload = json.loads(SHIPPING_CONFIG_PATH.read_text())
+        feature_config.update(payload.get("feature_config", {}))
+        model_params.update(payload.get("model_params", {}))
+    except (FileNotFoundError, ValueError):
+        pass
+    return feature_config, model_params
 
 
 # ---------------------------------------------------------------------------
@@ -304,9 +371,14 @@ def cross_validate(
         model.fit(X_tr, y_tr)
         folds.append(_fold_metrics(y_va, model.predict(X_va)))
 
+    return summarize_folds(folds, n_rows=df.height, n_splits=n_splits)
+
+
+def summarize_folds(folds: list[dict[str, float]], n_rows: int, n_splits: int) -> dict:
+    """Mean ± std summary of per-fold metrics (shared with the optimizer)."""
     summary = {
         "n_splits": n_splits,
-        "n_rows": df.height,
+        "n_rows": n_rows,
         "folds": folds,
     }
     for key in ("medape", "mae_log", "r2"):
@@ -343,8 +415,10 @@ def train_fair_value_model(
     Reported metrics are honest out-of-time numbers from the 10-fold
     TimeSeriesSplit; the returned model is refit on the full frame
     (standard AVM anomaly-scoring pattern). Permutation importance is
-    computed on the most recent ~10% of rows. Pass ``run_cv=False`` when
-    the CV numbers are already known (e.g. from the optimization loop).
+    OUT-OF-SAMPLE: a helper model fit on all rows except the most recent
+    ~10% is evaluated on that held-out tail, so high-cardinality features
+    don't get inflated by in-sample memorization. Pass ``run_cv=False``
+    when the CV numbers are already known (e.g. from the optimization loop).
     """
     cfg = {**DEFAULT_FEATURE_CONFIG, **(feature_config or {})}
     df = df.sort("date")
@@ -364,8 +438,14 @@ def train_fair_value_model(
     tail_idx = np.arange(df.height - tail, df.height)
     if tail > importance_sample:
         tail_idx = rng.choice(tail_idx, size=importance_sample, replace=False)
+    head_end = df.height - tail
+    if head_end >= 100:
+        pi_model = _make_model(model_params, cat_idx, random_state)
+        pi_model.fit(X[:head_end], y[:head_end])
+    else:  # tiny frames: fall back to the full model
+        pi_model = model
     perm = permutation_importance(
-        model, X[tail_idx], y[tail_idx], n_repeats=5, random_state=random_state
+        pi_model, X[tail_idx], y[tail_idx], n_repeats=5, random_state=random_state
     )
     importances = pl.DataFrame(
         {
@@ -419,30 +499,39 @@ def flag_distress(
     """Flag below-fair-value rows and corroborated distressed-asset candidates.
 
     ``distressed`` requires the spread to be at/below ``spread_threshold``
-    AND at least one corroborating signal, so a single model miss is not
-    enough to label a sale distressed.
+    AND at least one corroborating signal that is INDEPENDENT of the model
+    residual (forced-sale procedure, illiquid project, multiple sellers) —
+    a lone model miss, however large, is never enough. ``sig_deep_discount``
+    is annotated for display but deliberately does not count, since it is
+    derived from the same residual as ``below_fair_value``.
     """
+    procedure = (
+        pl.col("PROCEDURE_EN").cast(pl.Utf8).str.contains(DISTRESS_PROCEDURE_PATTERN).fill_null(False)
+        if "PROCEDURE_EN" in scored.columns
+        else pl.lit(False)
+    )
+    multi_seller = (
+        (pl.col("total_seller") > 1).fill_null(False)
+        if "total_seller" in scored.columns
+        else pl.lit(False)
+    )
     df = scored.with_columns(
         (pl.col("spread_pct") <= spread_threshold).alias("below_fair_value"),
-        pl.col("PROCEDURE_EN")
-        .cast(pl.Utf8)
-        .str.contains(DISTRESS_PROCEDURE_PATTERN)
-        .fill_null(False)
-        .alias("sig_procedure"),
+        procedure.alias("sig_procedure"),
         (pl.col("spread_pct") <= deep_discount).alias("sig_deep_discount"),
         (pl.len().over("PROJECT_EN") < min_project_txns).alias("sig_illiquid_project"),
-        (pl.col("total_seller") > 1).fill_null(False).alias("sig_multi_seller")
-        if "total_seller" in scored.columns
-        else pl.lit(False).alias("sig_multi_seller"),
+        multi_seller.alias("sig_multi_seller"),
     )
+    # Only residual-independent signals corroborate distress.
+    corroborating = ["sig_procedure", "sig_illiquid_project", "sig_multi_seller"]
     signal_labels = {
         "sig_procedure": "forced-sale procedure",
-        "sig_deep_discount": "deep discount",
         "sig_illiquid_project": "illiquid project",
         "sig_multi_seller": "multiple sellers",
+        "sig_deep_discount": "deep discount",
     }
     df = df.with_columns(
-        sum(pl.col(c).cast(pl.Int32) for c in signal_labels).alias("distress_score"),
+        sum(pl.col(c).cast(pl.Int32) for c in corroborating).alias("distress_score"),
     ).with_columns(
         (pl.col("below_fair_value") & (pl.col("distress_score") >= 1)).alias("distressed"),
         pl.concat_str(

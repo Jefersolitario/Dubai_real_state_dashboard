@@ -21,6 +21,7 @@ from fair_value_model import (
     flag_distress,
     score_transactions,
     train_fair_value_model,
+    trim_psf,
 )
 
 N_ROWS = 6000
@@ -36,6 +37,7 @@ AREAS = {
     "NADD HESSA": 800.0,
 }
 PROJECT_FACTORS = {"P1": 0.9, "P2": 1.0, "P3": 1.1, "P4": 1.25}
+BUILDING_FACTORS = {"B1": 0.96, "B2": 1.0, "B3": 1.05}
 ROOM_FACTORS = {"Studio": 1.08, "1 B/R": 1.0, "2 B/R": 0.95, "3 B/R": 0.92}
 
 
@@ -45,6 +47,7 @@ def synthetic_frame() -> tuple[pl.DataFrame, np.ndarray]:
 
     areas = rng.choice(list(AREAS), size=N_ROWS)
     projects = rng.choice(list(PROJECT_FACTORS), size=N_ROWS)
+    buildings = rng.choice(list(BUILDING_FACTORS), size=N_ROWS)
     rooms = rng.choice(list(ROOM_FACTORS), size=N_ROWS)
     day_offsets = rng.integers(0, 730, size=N_ROWS)
     sqm = rng.uniform(35.0, 220.0, size=N_ROWS)
@@ -52,10 +55,11 @@ def synthetic_frame() -> tuple[pl.DataFrame, np.ndarray]:
 
     base = np.array([AREAS[a] for a in areas])
     proj = np.array([PROJECT_FACTORS[p] for p in projects])
+    bldg = np.array([BUILDING_FACTORS[b] for b in buildings])
     room = np.array([ROOM_FACTORS[r] for r in rooms])
     trend = 1.0 + 0.15 * day_offsets / 730.0  # gentle market appreciation
     noise = np.exp(rng.normal(0.0, 0.05, size=N_ROWS))
-    psf = base * proj * room * trend * noise
+    psf = base * proj * bldg * room * trend * noise
 
     planted = rng.random(N_ROWS) < PLANT_SHARE
     psf = np.where(planted, psf * (1.0 - PLANT_DISCOUNT), psf)
@@ -89,7 +93,9 @@ def synthetic_frame() -> tuple[pl.DataFrame, np.ndarray]:
             "TOTAL_SELLER": rng.integers(1, 3, size=N_ROWS).astype(float),
             "PROJECT_EN": projects,
             "MASTER_PROJECT_EN": projects,
+            "BUILDING_NAME_EN": [f"{p}-{b}" for p, b in zip(projects, buildings)],
             "METER_SALE_PRICE": psf * SQM_TO_SQFT,
+            "is_planted": planted,
         }
     )
 
@@ -114,7 +120,8 @@ def main() -> int:
         "mortgage rows excluded from the model frame",
     )
 
-    cv = cross_validate(feats, n_splits=10)
+    train_feats = trim_psf(feats)
+    cv = cross_validate(train_feats, n_splits=10)
     ok &= check(
         all(np.isfinite(cv[k]) for k in ("medape_mean", "mae_log_mean", "r2_mean")),
         f"CV metrics finite (MedAPE {cv['medape_mean']:.3%} ± {cv['medape_std']:.3%}, "
@@ -122,8 +129,8 @@ def main() -> int:
     )
     ok &= check(cv["medape_mean"] < 0.15, "CV MedAPE under 15% on synthetic data")
 
-    result = train_fair_value_model(feats)
-    scored = score_transactions(result, feats)
+    result = train_fair_value_model(train_feats)
+    scored = score_transactions(result, feats)  # scoring covers the untrimmed tail
 
     roundtrip = scored.select(
         ((pl.col("TRANS_VALUE") / pl.col("fair_value_aed") - 1) - pl.col("spread_pct"))
@@ -133,13 +140,9 @@ def main() -> int:
     ok &= check(roundtrip < 1e-9, f"spread math round-trips (max err {roundtrip:.2e})")
 
     flagged = flag_distress(scored, spread_threshold=-0.15)
-    plant_map = dict(
-        zip([f"TX-{i:06d}" for i in range(N_ROWS)], planted.tolist())
-    )
-    flagged = flagged.with_columns(
-        pl.col("TRANSACTION_NUMBER")
-        .replace_strict(plant_map, default=False)
-        .alias("is_planted")
+    plants = raw.select("TRANSACTION_NUMBER", "is_planted").unique("TRANSACTION_NUMBER")
+    flagged = flagged.join(plants, on="TRANSACTION_NUMBER", how="left").with_columns(
+        pl.col("is_planted").fill_null(False)
     )
     below = flagged.filter(pl.col("below_fair_value"))
     n_planted_total = flagged.filter(pl.col("is_planted")).height

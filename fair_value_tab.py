@@ -17,13 +17,20 @@ import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
 
-from dashboard_constants import AREA_DISPLAY, SQM_TO_SQFT
+from dashboard_constants import (
+    SQM_TO_SQFT,
+    area_display_expr,
+    bedroom_type_expr,
+    layout_defaults as _layout_defaults,
+)
 from fair_value_model import (
     FairValueResult,
     feature_engineering,
     flag_distress,
+    load_shipping_config,
     score_transactions,
     train_fair_value_model,
+    trim_psf,
 )
 
 MIN_TRAINING_ROWS = 5_000
@@ -55,15 +62,6 @@ DATA_SOURCES_TABLE = """
 """
 
 
-def _layout_defaults(title: str) -> dict:
-    return dict(
-        title=dict(text=title, font=dict(size=13), x=0.01),
-        plot_bgcolor="#0e1117",
-        paper_bgcolor="#0e1117",
-        font=dict(family="Segoe UI, Arial, sans-serif", size=11, color="#fafafa"),
-    )
-
-
 def _raw_transactions() -> pl.DataFrame:
     df = st.session_state.get("api_raw_df")
     if isinstance(df, pl.DataFrame):
@@ -71,18 +69,33 @@ def _raw_transactions() -> pl.DataFrame:
     return pl.DataFrame()
 
 
+@st.cache_resource(show_spinner="Preparing model features...")
+def get_features(data_version: str) -> pl.DataFrame:
+    """Untrimmed feature frame — one pass per data refresh, used everywhere.
+
+    Untrimmed on purpose: scoring must cover the deep-discount tail; the
+    training path applies trim_psf separately.
+    """
+    feature_config, _ = load_shipping_config()
+    return feature_engineering(_raw_transactions(), feature_config)
+
+
 @st.cache_resource(show_spinner="Training fair-value model (cached per data refresh)...")
 def get_model(data_version: str) -> FairValueResult:
-    feats = feature_engineering(_raw_transactions())
-    return train_fair_value_model(feats)
+    feature_config, model_params = load_shipping_config()
+    return train_fair_value_model(
+        trim_psf(get_features(data_version)), feature_config, model_params
+    )
 
 
-@st.cache_data(show_spinner="Scoring transactions against fair value...")
-def get_scored(data_version: str, spread_threshold: float) -> pl.DataFrame:
-    result = get_model(data_version)
-    feats = feature_engineering(_raw_transactions())
-    scored = score_transactions(result, feats)
-    return flag_distress(scored, spread_threshold=spread_threshold)
+@st.cache_resource(show_spinner="Scoring transactions against fair value...")
+def get_scored(data_version: str) -> pl.DataFrame:
+    """Fair-value predictions for every scoreable row (threshold-independent).
+
+    The threshold slider only re-runs the cheap flag_distress expressions,
+    never this predict pass.
+    """
+    return score_transactions(get_model(data_version), get_features(data_version))
 
 
 def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
@@ -102,8 +115,8 @@ def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
             continue
         fig.add_trace(
             go.Scattergl(
-                x=frame["pred_psf"].to_list(),
-                y=frame["psf"].to_list(),
+                x=frame["pred_psf"].to_numpy(),
+                y=frame["psf"].to_numpy(),
                 mode="markers",
                 name=name,
                 marker=dict(color=color, size=size, opacity=0.55),
@@ -136,7 +149,7 @@ def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
 
 
 def spread_histogram(scored: pl.DataFrame, threshold: float) -> go.Figure:
-    spreads = (scored["spread_pct"] * 100).to_list()
+    spreads = (scored["spread_pct"] * 100).to_numpy()
     fig = go.Figure(
         go.Histogram(
             x=spreads,
@@ -168,16 +181,16 @@ def importance_chart(importances: pl.DataFrame) -> go.Figure:
     top = importances.head(15).sort("importance_mean")
     fig = go.Figure(
         go.Bar(
-            x=top["importance_mean"].to_list(),
+            x=top["importance_mean"].to_numpy(),
             y=top["feature"].to_list(),
             orientation="h",
-            error_x=dict(array=top["importance_std"].to_list(), color="#fafafa"),
+            error_x=dict(array=top["importance_std"].to_numpy(), color="#fafafa"),
             marker_color=COLOR_NORMAL,
             hovertemplate="%{y}: %{x:.4f}<extra></extra>",
         )
     )
     fig.update_layout(
-        **_layout_defaults("Feature Importance (permutation, recent 10% of data)"),
+        **_layout_defaults("Feature Importance (permutation, out-of-sample on most recent 10%)"),
         xaxis_title="Importance (increase in prediction error when shuffled)",
         height=420,
         margin=dict(l=40, r=20, t=45, b=40),
@@ -193,8 +206,8 @@ def _display_filter(
     end_date: date,
 ) -> pl.DataFrame:
     df = scored.with_columns(
-        pl.col("AREA_EN").replace(AREA_DISPLAY).alias("area_display"),
-        pl.col("ROOMS_EN").cast(pl.Utf8).str.replace(" B/R", "BR").alias("bedroom_type"),
+        area_display_expr().alias("area_display"),
+        bedroom_type_expr().alias("bedroom_type"),
     )
     mask = pl.col("date").is_between(start_date, end_date)
     if neighborhoods:
@@ -216,7 +229,7 @@ def render_fair_value_tab(
         st.info("No transaction data loaded.")
         return
 
-    feats_rows = feature_engineering(raw).height
+    feats_rows = get_features(data_version).height
     if feats_rows < MIN_TRAINING_ROWS:
         st.info(
             f"Not enough apartment sales to train a reliable model "
@@ -233,7 +246,9 @@ def render_fair_value_tab(
         "location, project, rooms, off-plan status, amenities, and market trend, then "
         "measures the **spread** between the actual closed price and that fair value. "
         f"It trains on **all {result.trained_rows:,} apartment Sales** in the loaded "
-        "snapshot — the sidebar filters only narrow what is shown below."
+        "snapshot. The neighbourhood, bedroom, and date filters narrow what is shown "
+        "below; the Transaction Type filter does not apply here (this tab always "
+        "analyses Sales — mortgage rows record loan amounts, not market prices)."
     )
 
     threshold_pct = st.slider(
@@ -246,11 +261,11 @@ def render_fair_value_tab(
         help=(
             "A sale is flagged 'below fair value' when its price is at least this far "
             "under the model's predicted fair value. 'Distressed candidate' additionally "
-            "requires a corroborating signal (forced-sale procedure, deep discount, "
-            "illiquid project, or multiple sellers)."
+            "requires a signal independent of the model residual: a forced-sale "
+            "procedure, an illiquid project, or multiple sellers on the deal."
         ),
     )
-    scored = get_scored(data_version, -threshold_pct / 100)
+    scored = flag_distress(get_scored(data_version), spread_threshold=-threshold_pct / 100)
     view = _display_filter(scored, neighborhoods, bedroom, start_date, end_date)
 
     metrics = result.metrics
@@ -283,7 +298,10 @@ def render_fair_value_tab(
         st.metric(
             "Distressed candidates",
             f"{n_distressed:,}",
-            help="Below fair value AND at least one corroborating distress signal.",
+            help=(
+                "Below fair value AND at least one residual-independent signal "
+                "(forced-sale procedure, illiquid project, multiple sellers)."
+            ),
         )
 
     if view.is_empty():
@@ -339,18 +357,22 @@ def render_fair_value_tab(
             "log(AED/sqft), validated with a 10-fold date-ordered `TimeSeriesSplit` "
             "(train on the past, test on the future), then refit on all rows for scoring. "
             "**Spread** = actual price / predicted fair value − 1.\n\n"
-            "**Distressed candidate** = spread at/below the threshold **and** at least one "
-            "corroborating signal: forced-sale procedure keyword in `PROCEDURE_EN`, "
-            "deep discount (≤ −25%), illiquid project (fewer than 8 sales in the window), "
-            "or multiple sellers on the deal.\n"
+            "**Distressed candidate** = spread at/below the threshold **and** at least "
+            "one corroborating signal that is independent of the model residual: "
+            "forced-sale procedure keyword in `PROCEDURE_EN`, illiquid project (fewer "
+            "than 8 sales in the window), or multiple sellers on the deal. A 'deep "
+            "discount' (≤ −25%) is annotated in the Signals column for context but "
+            "never counts as corroboration on its own — that would let a single model "
+            "miss label a normal sale as distressed.\n\n"
+            "Deep-discount outliers are excluded from **training** (0.5%/99.5% PSF trim) "
+            "but always **scored**, so genuine fire-sales stay visible. Rows whose "
+            "recorded area contradicts the official AED/sqm price by more than 10% are "
+            "dropped as data errors.\n"
         )
         st.markdown("**Data needed & sources**")
         st.markdown(DATA_SOURCES_TABLE)
         st.markdown("**Procedure types in the loaded data** (for tuning distress keywords)")
         proc_counts = (
-            feature_engineering(raw)
-            .group_by("PROCEDURE_EN")
-            .len()
-            .sort("len", descending=True)
+            scored.group_by("PROCEDURE_EN").len().sort("len", descending=True)
         )
         st.dataframe(proc_counts, use_container_width=True, height=200)

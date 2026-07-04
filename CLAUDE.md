@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Interactive Streamlit dashboard for Dubai real estate apartment transactions. The app loads normalized DLD transaction snapshots from Google Cloud Storage Parquet first, with the production Dubai Data API kept as a fallback/source for refreshing the snapshot. The snapshot holds 12 months of history.
+Interactive Streamlit dashboard for Dubai real estate apartment transactions. The app loads normalized DLD transaction snapshots from Google Cloud Storage Parquet first, with the production Dubai Data API kept as a fallback/source for refreshing the snapshot. The snapshot holds 24 months of history.
 
 ## Commands
 
@@ -24,8 +24,12 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 # Incrementally update the normalized DLD transactions snapshot in GCS and verify it
 .\.venv\Scripts\python.exe store_dld_transactions_gcs.py
 
-# Force a full snapshot rebuild for the default 12-month window
-.\.venv\Scripts\python.exe store_dld_transactions_gcs.py --full-refresh --last-months 12
+# Force a full snapshot rebuild for the default 24-month window
+.\.venv\Scripts\python.exe store_dld_transactions_gcs.py --full-refresh --last-months 24
+
+# Offline fair-value model checks and optimization
+.\.venv\Scripts\python.exe smoke_test_fair_value.py
+.\.venv\Scripts\python.exe optimize_fair_value.py
 
 # Install dependencies
 pip install -r requirements.txt
@@ -37,12 +41,32 @@ pip install -r requirements.txt
 
 Single-file Streamlit app with this flow:
 
-1. **Constants** - `AREA_DISPLAY` (official DLD district name -> friendly community name), tracked `NEIGHBORHOODS` (display names), market tier definitions, chart colors, and schema assumptions.
+1. **Constants** - schema assumptions and chart colors. `AREA_DISPLAY`, `NEIGHBORHOODS`, tier definitions, `SQM_TO_SQFT`, and shared expressions/`layout_defaults` live in `dashboard_constants.py` (import from there).
 2. **Data loading** - cached GCS Parquet snapshot handling, falling back to the production DDA API when needed.
 3. **Data normalization** - maps DDA API columns into the dashboard schema.
 4. **Aggregation helpers** - daily, weekly, Dubai-wide, tier, and area-level metrics using Polars.
 5. **Chart builders** - Plotly figures for price trends, volume, momentum, tiers, and scatter views.
-6. **Streamlit UI** - sidebar filters and API controls, KPI cards, charts, and raw data table.
+6. **Streamlit UI** - two tabs via `st.tabs`: "Market Overview" (`_render_market_overview`, the original page) and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`); shared sidebar filters.
+
+### dashboard_constants.py
+
+Shared constants and pure Polars/layout helpers (`AREA_DISPLAY`, `NEIGHBORHOODS`, `TIER_*`, `DISTRICT_TIER`, `SQM_TO_SQFT`, `area_display_expr`, `bedroom_type_expr`, `layout_defaults`). No Streamlit/Plotly imports so pure modules can use it.
+
+### fair_value_model.py
+
+Pure Polars + scikit-learn fair-value model: `feature_engineering` (Sales-only apartments, METER_SALE_PRICE area-mismatch guard, no PSF trim — apply `trim_psf` before TRAINING only), 10-fold date-ordered `TimeSeriesSplit` `cross_validate`, `train_fair_value_model` (HistGradientBoostingRegressor on log AED/sqft, out-of-sample permutation importances), `score_transactions` (`spread_pct = actual/fair value − 1`), and `flag_distress` (distressed = below threshold AND ≥1 residual-independent signal: forced-sale procedure, illiquid project, multiple sellers — a deep discount alone never qualifies). Reads `fair_value_config.json` (written by the optimizer) via `load_shipping_config()` so the app trains the winning configuration.
+
+### fair_value_tab.py
+
+Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version), `get_model` (trains on `trim_psf(features)`), `get_scored` (threshold-independent predictions); the threshold slider only re-runs `flag_distress`.
+
+### optimize_fair_value.py
+
+Improvement loop: ladder of feature/model proposals measured by mean CV MedAPE, accepts a change only if it improves ≥0.05pp, stops after <0.2pp gains for 2 consecutive iterations or 10 iterations. Writes `fair_value_optimization_report.md`, optional `--progress-json`, and `fair_value_config.json` (the shipping config).
+
+### smoke_test_fair_value.py
+
+Synthetic end-to-end test of the fair-value pipeline (planted underpriced rows must dominate the flags). Run before touching model logic.
 
 ### dda_api.py
 
@@ -55,7 +79,7 @@ Dubai Data API helper module. It handles:
 - normalizing DLD transaction records to the dashboard column names
 - validating required dashboard columns
 
-`DEFAULT_LOOKBACK_MONTHS = 12` and `DEFAULT_MAX_RECORDS = 500_000` size the default fetch window.
+`DEFAULT_LOOKBACK_MONTHS = 24` and `DEFAULT_MAX_RECORDS = 1_000_000` size the default fetch window. `fetch_dataset_records` retries each page with exponential backoff (the gateway intermittently returns 502).
 
 Default production endpoint:
 

@@ -51,12 +51,13 @@ from store_dld_transactions_gcs import (
 )
 
 from dashboard_constants import (
-    AREA_DISPLAY,
     NEIGHBORHOODS,
     SQM_TO_SQFT,
     TIER_COLORS,
     TIER_MAP,
     TIER_ORDER,
+    area_display_expr as _area_display_expr,
+    layout_defaults as _layout_defaults,
 )
 from fair_value_tab import render_fair_value_tab
 
@@ -82,11 +83,6 @@ TRANSACTION_SCHEMA = {
 # Alphabet palette has 26 entries – enough for 20 neighbourhoods
 COLORS = plotly.colors.qualitative.Alphabet
 COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
-
-
-def _area_display_expr() -> pl.Expr:
-    """AREA_EN mapped to its friendly display name (unmapped pass through)."""
-    return pl.col("AREA_EN").replace(AREA_DISPLAY)
 
 
 # ---------------------------------------------------------------------------
@@ -953,15 +949,6 @@ def apply_filters(
 # ---------------------------------------------------------------------------
 # Chart builders (Plotly)
 # ---------------------------------------------------------------------------
-
-def _layout_defaults(title: str) -> dict:
-    return dict(
-        title=dict(text=title, font=dict(size=13), x=0.01),
-        plot_bgcolor="#0e1117",
-        paper_bgcolor="#0e1117",
-        font=dict(family="Segoe UI, Arial, sans-serif", size=11, color="#fafafa"),
-    )
-
 
 def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
     fig   = go.Figure()

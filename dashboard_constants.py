@@ -1,4 +1,4 @@
-"""Shared dashboard constants.
+"""Shared dashboard constants and pure helpers.
 
 Kept free of Streamlit/Plotly imports so pure modules (fair_value_model,
 optimize_fair_value, smoke tests) can reuse them without pulling UI
@@ -6,6 +6,8 @@ dependencies or triggering the Streamlit app module.
 """
 
 from __future__ import annotations
+
+import polars as pl
 
 # DLD `AREA_EN` values are official district names (e.g. "MARSA DUBAI"),
 # not the community names buyers know. Map them to friendly display names;
@@ -106,12 +108,38 @@ TIER_COLORS = {
     "Budget":        "#ffa15a",
 }
 
-# Official DLD district name -> market tier (via its display name).
+# Official DLD district name -> market tier. Built from the display-name
+# mapping, plus TIER_AREAS entries that are already official district names
+# (e.g. DUBAI INVESTMENT PARK FIRST has no friendly display name).
 DISTRICT_TIER: dict[str, str] = {
     district: TIER_MAP[display]
     for district, display in AREA_DISPLAY.items()
     if display in TIER_MAP
 }
+for _area, _tier in TIER_MAP.items():
+    if _area == _area.upper() and _area not in DISTRICT_TIER:
+        DISTRICT_TIER[_area] = _tier
 
 # DLD reports ACTUAL_AREA in square metres; the dashboard displays sqft.
 SQM_TO_SQFT = 10.7639
+
+
+def area_display_expr() -> pl.Expr:
+    """AREA_EN mapped to its friendly display name (unmapped pass through)."""
+    return pl.col("AREA_EN").replace(AREA_DISPLAY)
+
+
+def bedroom_type_expr() -> pl.Expr:
+    """ROOMS_EN normalized to the dashboard bedroom labels (1 B/R -> 1BR)."""
+    return pl.col("ROOMS_EN").cast(pl.Utf8).str.replace(" B/R", "BR")
+
+
+def layout_defaults(title: str) -> dict:
+    """Shared dark-theme Plotly layout. Must not include margin —
+    individual charts set margins themselves (see CLAUDE.md)."""
+    return dict(
+        title=dict(text=title, font=dict(size=13), x=0.01),
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font=dict(family="Segoe UI, Arial, sans-serif", size=11, color="#fafafa"),
+    )
