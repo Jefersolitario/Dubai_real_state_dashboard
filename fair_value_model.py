@@ -336,17 +336,23 @@ def train_fair_value_model(
     n_splits: int = 10,
     random_state: int = 42,
     importance_sample: int = 20_000,
+    run_cv: bool = True,
 ) -> FairValueResult:
     """CV-validate, then refit on all rows for scoring.
 
     Reported metrics are honest out-of-time numbers from the 10-fold
     TimeSeriesSplit; the returned model is refit on the full frame
     (standard AVM anomaly-scoring pattern). Permutation importance is
-    computed on the most recent ~10% of rows.
+    computed on the most recent ~10% of rows. Pass ``run_cv=False`` when
+    the CV numbers are already known (e.g. from the optimization loop).
     """
     cfg = {**DEFAULT_FEATURE_CONFIG, **(feature_config or {})}
     df = df.sort("date")
-    metrics = cross_validate(df, cfg, model_params, n_splits=n_splits, random_state=random_state)
+    metrics = (
+        cross_validate(df, cfg, model_params, n_splits=n_splits, random_state=random_state)
+        if run_cv
+        else {}
+    )
 
     encoders = fit_encoders(df, cfg)
     X, y, feature_names, cat_idx = to_matrix(df, encoders, cfg)

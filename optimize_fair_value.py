@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import sys
 import time
 from datetime import datetime
@@ -41,6 +42,7 @@ from fair_value_model import (
     feature_engineering,
     fit_encoders,
     to_matrix,
+    train_fair_value_model,
 )
 
 REPORT_PATH = "fair_value_optimization_report.md"
@@ -279,6 +281,53 @@ def evaluate(candidate: dict, feats_by_cfg: dict, raw: pl.DataFrame, n_splits: i
     raise ValueError(candidate["kind"])
 
 
+def dump_progress(
+    path: str | None,
+    source: str,
+    rows: list[dict],
+    best: dict,
+    status: str,
+    importances: list[dict] | None = None,
+) -> None:
+    """Rewrite the live-progress JSON consumed by external trackers."""
+    if not path:
+        return
+    payload = {
+        "status": status,
+        "source": source,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "iterations": [
+            {
+                "iteration": row["iteration"],
+                "name": row["name"],
+                "detail": row["detail"],
+                "medape_mean": row["metrics"]["medape_mean"],
+                "medape_std": row["metrics"]["medape_std"],
+                "mae_log_mean": row["metrics"]["mae_log_mean"],
+                "r2_mean": row["metrics"]["r2_mean"],
+                "decision": row["decision"],
+                "seconds": row["seconds"],
+            }
+            for row in rows
+        ],
+        "best": {
+            "name": best["name"],
+            "kind": best["kind"],
+            "medape_mean": best["metrics"]["medape_mean"],
+            "medape_std": best["metrics"]["medape_std"],
+            "r2_mean": best["metrics"]["r2_mean"],
+            "feature_config": best["feature_config"],
+            "model_params": {
+                k: v for k, v in best["model_params"].items() if not callable(v)
+            },
+            "n_rows": best["metrics"]["n_rows"],
+        },
+        "importances": importances or [],
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=1)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fair-value model improvement loop.")
     parser.add_argument("--parquet", help="Local parquet file instead of the GCS snapshot.")
@@ -286,6 +335,10 @@ def main() -> int:
     parser.add_argument("--n-splits", type=int, default=10)
     parser.add_argument("--max-iterations", type=int, default=MAX_ITERATIONS)
     parser.add_argument("--report", default=REPORT_PATH)
+    parser.add_argument(
+        "--progress-json",
+        help="Rewrite this JSON file after every iteration (for live progress tracking).",
+    )
     args = parser.parse_args()
 
     if args.synthetic:
@@ -330,6 +383,7 @@ def main() -> int:
         "metrics": baseline,
         "kind": "baseline",
     }
+    dump_progress(args.progress_json, source, rows, best, "running")
 
     no_gain_streak = 0
     iteration = 0
@@ -370,6 +424,7 @@ def main() -> int:
             f"[{iteration}] {candidate['name']}: MedAPE {metrics['medape_mean']:.2%} "
             f"± {metrics['medape_std']:.2%} -> {rows[-1]['decision']} ({elapsed:.0f}s)"
         )
+        dump_progress(args.progress_json, source, rows, best, "running")
         if no_gain_streak >= STOP_PATIENCE:
             print(
                 f"Stopping: less than {STOP_MIN_IMPROVEMENT:.1%} MedAPE improvement "
@@ -377,7 +432,21 @@ def main() -> int:
             )
             break
 
-    write_report(args.report, source, rows, best, args.n_splits)
+    # Feature importances for the shipping (HGB) model on the winning config.
+    print("Computing permutation feature importances for the winning configuration...")
+    best_key = tuple(sorted(best["feature_config"].items()))
+    if best_key not in feats_by_cfg:
+        feats_by_cfg[best_key] = feature_engineering(raw, best["feature_config"])
+    final_result = train_fair_value_model(
+        feats_by_cfg[best_key],
+        best["feature_config"],
+        best["model_params"],
+        run_cv=False,
+    )
+    importances = final_result.importances.to_dicts()
+
+    dump_progress(args.progress_json, source, rows, best, "done", importances)
+    write_report(args.report, source, rows, best, args.n_splits, importances)
     print(f"\nBest: {best['name']} — MedAPE {best['metrics']['medape_mean']:.2%}")
     print(f"Feature config: {best['feature_config']}")
     print(f"Model params: {best['model_params']}")
@@ -385,7 +454,14 @@ def main() -> int:
     return 0
 
 
-def write_report(path: str, source: str, rows: list[dict], best: dict, n_splits: int) -> None:
+def write_report(
+    path: str,
+    source: str,
+    rows: list[dict],
+    best: dict,
+    n_splits: int,
+    importances: list[dict] | None = None,
+) -> None:
     lines = [
         "# Fair-Value Model Optimization Report",
         "",
@@ -418,6 +494,20 @@ def write_report(path: str, source: str, rows: list[dict], best: dict, n_splits:
         f"- **Model params**: `{best['model_params']}`",
         f"- **Rows**: {best['metrics']['n_rows']:,}",
         "",
+    ]
+    if importances:
+        lines += [
+            "## Feature importances (permutation, winning model)",
+            "",
+            "| Feature | Importance | ± std |",
+            "|---------|-----------:|------:|",
+        ]
+        lines += [
+            f"| {imp['feature']} | {imp['importance_mean']:.4f} | {imp['importance_std']:.4f} |"
+            for imp in importances[:15]
+        ]
+        lines.append("")
+    lines += [
         "## Phase 2 data candidates (not yet integrated)",
         "",
         "- Live listing asking prices (Bayut / Property Finder) — score offers, not just closed sales.",
