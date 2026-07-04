@@ -1,0 +1,55 @@
+# Fair-Value Model Optimization Report
+
+Generated 2026-07-04 16:02 · data: GCS snapshot · protocol: date-ordered TimeSeriesSplit(10 folds), headline metric = mean CV MedAPE (median |actual − fair value| / fair value on future folds).
+
+Stop rule: < 0.2 pp MedAPE improvement for 2 consecutive iterations, or 10 iterations.
+
+## Iterations
+
+| # | Proposal | Detail | MedAPE (mean ± std) | MAE(log) | R² | Decision | Time |
+|---|----------|--------|--------------------:|---------:|----:|----------|-----:|
+| 0 | Baseline: area median PSF (no ML) | per-area trailing median | 15.47% ± 1.08% | 0.2119 | 0.469 | baseline | 0s |
+| 1 | HGB core features | size, area, rooms, off-plan, tier, time trend | 9.47% ± 0.43% | 0.1355 | 0.762 | accepted (+6.00%) | 36s |
+| 2 | + project categoricals | PROJECT_EN / MASTER_PROJECT_EN (top 200 + OTHER) | 7.94% ± 0.49% | 0.1185 | 0.809 | accepted (+1.53%) | 42s |
+| 3 | + building categorical | BUILDING_NAME_EN (top 200 + OTHER) | 7.94% ± 0.48% | 0.1178 | 0.811 | rejected (+0.01%) | 43s |
+| 4 | + amenity & deal features | nearest metro/mall/landmark, parking, buyer/seller counts | 7.69% ± 0.48% | 0.1142 | 0.823 | accepted (+0.25%) | 49s |
+| 5 | + trailing area comps | 30-day area median PSF, strictly past-only | 7.68% ± 0.46% | 0.1141 | 0.825 | rejected (+0.02%) | 47s |
+| 6 | + trailing project comps | 60-day project median PSF, strictly past-only | 5.91% ± 0.45% | 0.0879 | 0.891 | accepted (+1.78%) | 48s |
+| 7 | hyperparams: slower learning | learning_rate 0.04, max_iter 800 | 5.85% ± 0.49% | 0.0874 | 0.892 | accepted (+0.06%) | 80s |
+| 8 | hyperparams: deeper trees | max_leaf_nodes 127 | 5.86% ± 0.52% | 0.0878 | 0.891 | rejected (-0.02%) | 124s |
+
+## Winning configuration
+
+- **Model**: hgb — hyperparams: slower learning
+- **MedAPE**: 5.85% ± 0.49%
+- **R²**: 0.892
+- **Feature config**: `{'project': True, 'building': False, 'amenity': True, 'comps_area': False, 'comps_project': True}`
+- **Model params**: `{'learning_rate': 0.04, 'max_iter': 800, 'max_leaf_nodes': 63, 'early_stopping': True, 'validation_fraction': 0.1}`
+- **Rows**: 268,997
+
+## Feature importances (permutation, winning model)
+
+| Feature | Importance | ± std |
+|---------|-----------:|------:|
+| project_comp_psf | 0.9476 | 0.0040 |
+| log_sqft | 0.5086 | 0.0056 |
+| rooms_ord | 0.2080 | 0.0042 |
+| MASTER_PROJECT_EN | 0.0774 | 0.0014 |
+| AREA_EN | 0.0600 | 0.0008 |
+| PROJECT_EN | 0.0251 | 0.0004 |
+| IS_OFFPLAN_EN | 0.0149 | 0.0002 |
+| NEAREST_METRO_EN | 0.0058 | 0.0004 |
+| NEAREST_LANDMARK_EN | 0.0028 | 0.0003 |
+| parking_count | 0.0016 | 0.0003 |
+| tier | 0.0007 | 0.0001 |
+| NEAREST_MALL_EN | 0.0006 | 0.0001 |
+| total_seller | 0.0001 | 0.0000 |
+| total_buyer | 0.0001 | 0.0000 |
+| days_since_start | 0.0000 | 0.0000 |
+
+## Phase 2 data candidates (not yet integrated)
+
+- Live listing asking prices (Bayut / Property Finder) — score offers, not just closed sales.
+- Ejari rent contracts (Dubai Pulse `dld_rent_contracts`) — project rental yield feature and distress corroboration.
+- Buildings/units metadata (floor, building age, developer) — strongest missing hedonic features.
+- Official residential sale price index — drift monitoring.

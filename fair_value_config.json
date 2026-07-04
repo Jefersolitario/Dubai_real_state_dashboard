@@ -1,0 +1,20 @@
+{
+ "source": "GCS snapshot",
+ "generated_at": "2026-07-04T16:02:48",
+ "winner": "hyperparams: slower learning",
+ "cv_medape_mean": 0.058461277956132165,
+ "feature_config": {
+  "project": true,
+  "building": false,
+  "amenity": true,
+  "comps_area": false,
+  "comps_project": true
+ },
+ "model_params": {
+  "learning_rate": 0.04,
+  "max_iter": 800,
+  "max_leaf_nodes": 63,
+  "early_stopping": true,
+  "validation_fraction": 0.1
+ }
+}
