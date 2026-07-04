@@ -3,3 +3,5 @@ polars
 plotly
 requests==2.28.0
 google-cloud-storage
+scikit-learn>=1.5
+numpy

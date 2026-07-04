@@ -50,6 +50,16 @@ from store_dld_transactions_gcs import (
     stable_sort,
 )
 
+from dashboard_constants import (
+    AREA_DISPLAY,
+    NEIGHBORHOODS,
+    SQM_TO_SQFT,
+    TIER_COLORS,
+    TIER_MAP,
+    TIER_ORDER,
+)
+from fair_value_tab import render_fair_value_tab
+
 LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -69,111 +79,9 @@ TRANSACTION_SCHEMA = {
     "ROOMS_EN": pl.Utf8,
 }
 
-# DLD `AREA_EN` values are official district names (e.g. "MARSA DUBAI"),
-# not the community names buyers know. Map them to friendly display names;
-# districts not listed here fall back to the raw AREA_EN value.
-AREA_DISPLAY: dict[str, str] = {
-    "MARSA DUBAI": "Dubai Marina",
-    "AL BARSHA SOUTH FOURTH": "Jumeirah Village Circle (JVC)",
-    "AL BARSHA SOUTH FIFTH": "Jumeirah Village Triangle (JVT)",
-    "AL BARSHAA SOUTH THIRD": "Arjan",
-    "AL JADAF": "Al Jadaf",
-    "AL THANYAH FIFTH": "Jumeirah Lakes Towers",
-    "AL THANYAH THIRD": "The Greens / Barsha Heights",
-    "AL KHAIRAN FIRST": "Dubai Creek Harbour",
-    "AL MERKADH": "Sobha Hartland (MBR City)",
-    "BUKADRA": "Sobha Hartland II",
-    "HADAEQ SHEIKH MOHAMMED BIN RASHID": "Dubai Hills Estate",
-    "AL HEBIAH FOURTH": "Dubai Sports City",
-    "AL HEBIAH FIRST": "Motor City",
-    "AL HEBIAH THIRD": "DAMAC Hills",
-    "MADINAT HIND 4": "DAMAC Hills 2",
-    "NADD HESSA": "Dubai Silicon Oasis",
-    "ME'AISEM FIRST": "Dubai Production City",
-    "AL WARSAN FIRST": "International City Phase 1",
-    "WARSAN FOURTH": "International City (Warsan 4)",
-    "MADINAT AL MATAAR": "Dubai South (Expo City)",
-    "AL YELAYISS 2": "Town Square",
-    "PALM DEIRA": "Dubai Islands",
-    "MADINAT DUBAI ALMELAHEYAH": "Dubai Maritime City",
-    "JABAL ALI FIRST": "Al Furjan / Discovery Gardens",
-    "ZAABEEL SECOND": "Za'abeel",
-    "NAD AL SHIBA FIRST": "Nad Al Sheba",
-    "BUSINESS BAY": "Business Bay",
-    "BURJ KHALIFA": "Downtown Dubai (Burj Khalifa)",
-    "PALM JUMEIRAH": "Palm Jumeirah",
-}
-
-# Sidebar options — display names of the highest-volume districts in the data.
-NEIGHBORHOODS: list[str] = [
-    # High-volume
-    "Dubai South (Expo City)",
-    "Jumeirah Village Circle (JVC)",
-    "Al Furjan / Discovery Gardens",
-    "Business Bay",
-    "Dubai Islands",
-    "Dubai Marina",
-    "Arjan",
-    "Dubai Creek Harbour",
-    "Dubai Production City",
-    "Jumeirah Lakes Towers",
-    # Mid-volume
-    "Jumeirah Village Triangle (JVT)",
-    "Sobha Hartland (MBR City)",
-    "Dubai Sports City",
-    "Motor City",
-    "Town Square",
-    "Downtown Dubai (Burj Khalifa)",
-    "Dubai Hills Estate",
-    "Al Jadaf",
-    "Dubai Silicon Oasis",
-    "Palm Jumeirah",
-]
-
-TIER_MAP: dict[str, str] = {}
-TIER_AREAS: dict[str, list[str]] = {
-    "Ultra-premium": [
-        "Palm Jumeirah", "Downtown Dubai (Burj Khalifa)", "Za'abeel",
-    ],
-    "Premium": [
-        "Dubai Marina", "Dubai Creek Harbour", "Dubai Hills Estate",
-        "Sobha Hartland (MBR City)", "Sobha Hartland II", "Business Bay",
-        "Dubai Maritime City", "Dubai Islands",
-    ],
-    "Mid-market": [
-        "Jumeirah Lakes Towers", "Jumeirah Village Triangle (JVT)",
-        "The Greens / Barsha Heights", "Al Jadaf", "Nad Al Sheba",
-        "Town Square", "Al Furjan / Discovery Gardens", "DAMAC Hills",
-    ],
-    "Value": [
-        "Jumeirah Village Circle (JVC)", "Arjan", "Motor City",
-        "Dubai Silicon Oasis", "Dubai Production City", "Dubai Sports City",
-        "Dubai South (Expo City)",
-    ],
-    "Budget": [
-        "International City Phase 1", "International City (Warsan 4)",
-        "DAMAC Hills 2", "DUBAI INVESTMENT PARK FIRST",
-        "DUBAI INVESTMENT PARK SECOND",
-    ],
-}
-for tier, areas in TIER_AREAS.items():
-    for a in areas:
-        TIER_MAP[a] = tier
-TIER_ORDER = ["Ultra-premium", "Premium", "Mid-market", "Value", "Budget"]
-TIER_COLORS = {
-    "Ultra-premium": "#e377c2",
-    "Premium":       "#ff7f0e",
-    "Mid-market":    "#636efa",
-    "Value":         "#00cc96",
-    "Budget":        "#ffa15a",
-}
-
 # Alphabet palette has 26 entries – enough for 20 neighbourhoods
 COLORS = plotly.colors.qualitative.Alphabet
 COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
-
-# DLD reports ACTUAL_AREA in square metres; the dashboard displays sqft.
-SQM_TO_SQFT = 10.7639
 
 
 def _area_display_expr() -> pl.Expr:
@@ -1438,6 +1346,195 @@ def area_psf_chart(
     return fig
 
 
+def _render_market_overview(
+    filtered: pl.DataFrame,
+    neighborhoods: list[str],
+    bedroom: str,
+    trans_type: str,
+    data_version: str,
+    start_date: date,
+    end_date: date,
+    date_min: date,
+    date_max: date,
+) -> None:
+    """Render the original dashboard page as the Market Overview tab."""
+    if filtered.is_empty():
+        st.warning(
+            "No data for the selected filters/date range. "
+            f"The loaded data covers {date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}."
+        )
+        return
+
+    # ── KPI cards ────────────────────────────────────────────────────────────────
+    latest_date = filtered["date"].max()
+    latest_df   = filtered.filter(pl.col("date") == latest_date)
+    prev_date   = date(latest_date.year - 1, latest_date.month, 1)
+    prev_df     = filtered.filter(pl.col("date") == prev_date)
+
+    avg_price   = latest_df["avg_price_aed"].mean()
+    avg_sqft    = latest_df["price_per_sqft_aed"].mean()
+    avg_txn     = int(latest_df["transaction_count"].sum())
+
+    if not prev_df.is_empty():
+        prev_price = prev_df["avg_price_aed"].mean()
+        yoy_delta  = (avg_price - prev_price) / prev_price * 100
+        yoy_str    = f"{yoy_delta:+.1f}%"
+    else:
+        yoy_str    = "N/A"
+        yoy_delta  = None
+
+    st.markdown("## Dubai Apartment Prices")
+    st.caption(
+        f"Showing **{len(neighborhoods)}** neighbourhood(s) · "
+        f"**{bedroom}** · "
+        f"**{trans_type}** · "
+        f"{start_date.strftime('%b %Y')} – {end_date.strftime('%b %Y')}"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Avg Price",     f"AED {avg_price:,.0f}",   help="Mean transaction price in the latest selected month")
+    with c2:
+        st.metric("Price / sqft",  f"AED {avg_sqft:,.0f}",   help="Mean price per square foot")
+    with c3:
+        delta_color = "normal" if yoy_delta is None else ("normal" if yoy_delta >= 0 else "inverse")
+        st.metric("YoY Change",    yoy_str,                    delta=yoy_str if yoy_delta is not None else None, delta_color=delta_color)
+    with c4:
+        st.metric("Transactions",  f"{avg_txn:,}",            help="Total monthly transactions across selected neighbourhoods")
+
+    st.divider()
+
+    # ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
+    DW = generate_dubai_wide_data(trans_type, data_version, start_date, end_date)
+    WK = generate_weekly_data(trans_type, data_version, start_date, end_date)
+    AREA_CHG = generate_area_weekly_change(trans_type, data_version, start_date, end_date)
+
+    # KPI cards for Dubai-wide price momentum
+    first_wk = WK.row(0, named=True)
+    last_wk = WK.row(-1, named=True)
+    total_med_chg = (last_wk["median"] - first_wk["median"]) / first_wk["median"] * 100
+    peak_med = WK["median"].max()
+    from_peak = (last_wk["median"] - peak_med) / peak_med * 100
+
+    st.markdown("### Dubai Market Pulse")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric(
+            "Median Price (latest wk)",
+            f"AED {last_wk['median']:,.0f}",
+            delta=f"{last_wk['median_pct_chg']:+.1f}% vs prev wk",
+            delta_color="inverse",
+        )
+    with m2:
+        st.metric(
+            "Period Change",
+            f"{total_med_chg:+.1f}%",
+            delta=f"AED {last_wk['median'] - first_wk['median']:+,.0f}",
+            delta_color="inverse",
+        )
+    with m3:
+        st.metric(
+            "From Peak",
+            f"{from_peak:+.1f}%",
+            delta=f"AED {last_wk['median'] - peak_med:+,.0f}",
+            delta_color="inverse",
+            help=f"Peak median was AED {peak_med:,.0f}",
+        )
+    with m4:
+        st.metric(
+            "Mean/Median Ratio",
+            f"{last_wk['mean_median_ratio']:.2f}x",
+            help="Values above 1.5x suggest a skewed market with high-end outliers pulling up the mean. "
+                 "Rising ratio = premium segment decoupling from the broader market.",
+        )
+
+    st.plotly_chart(dubai_wide_median_price_chart(DW), use_container_width=True)
+
+    st.plotly_chart(weekly_pct_change_chart(WK), use_container_width=True)
+
+    st.plotly_chart(dubai_wide_transactions_chart(DW), use_container_width=True)
+
+    st.plotly_chart(area_pct_change_chart(AREA_CHG), use_container_width=True)
+
+    st.divider()
+
+    # ── Tier chart ────────────────────────────────────────────────────────────────
+    TIER_DF = generate_tier_data(trans_type, data_version, start_date, end_date)
+    st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
+
+    st.divider()
+
+    # ── Buyer Opportunity Scanner (Metric #3) ────────────────────────────────────
+    st.markdown("### Buyer Opportunity Scanner — Price / sqft vs Area Median")
+    st.caption(
+        "**Dots** = individual DLD transactions. "
+        "**Solid line** = 14-day rolling median of each area's own daily median AED/sqft. "
+        "A dot **below** the line means that specific deal closed cheaper than the area's "
+        "recent median — the clearest transaction-level buy signal in the data (Metric #3)."
+    )
+    PSF_TXNS, PSF_ROLLING = generate_area_psf_timeseries(
+        trans_type,
+        bedroom,
+        data_version,
+        start_date,
+        end_date,
+    )
+
+    # KPI row: cheapest current 14-day rolling median among selected areas
+    if not PSF_ROLLING.is_empty():
+        latest_rolling = (
+            PSF_ROLLING
+            .filter(pl.col("area").is_in(neighborhoods))
+            .filter(pl.col("rolling_median_psf").is_not_null())
+            .group_by("area")
+            .agg(pl.col("rolling_median_psf").last().alias("latest_median_psf"))
+            .sort("latest_median_psf")
+            .head(3)
+        )
+        if not latest_rolling.is_empty():
+            cols = st.columns(len(latest_rolling))
+            for i, row in enumerate(latest_rolling.iter_rows(named=True)):
+                with cols[i]:
+                    st.metric(
+                        label=f"{row['area'].title()} — lowest AED/sqft",
+                        value=f"AED {row['latest_median_psf']:,.0f}/sqft",
+                        help="Latest 14-day rolling median for this area",
+                    )
+
+    PSF_TXNS_FILTERED = PSF_TXNS.filter(pl.col("area").is_in(neighborhoods))
+    PSF_ROLLING_FILTERED = PSF_ROLLING.filter(pl.col("area").is_in(neighborhoods))
+    if PSF_TXNS_FILTERED.is_empty():
+        st.warning("No transaction data for the selected filters.")
+    else:
+        st.plotly_chart(
+            area_psf_chart(PSF_TXNS_FILTERED, PSF_ROLLING_FILTERED, neighborhoods),
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # ── Filtered charts ───────────────────────────────────────────────────────────
+    st.plotly_chart(line_chart(filtered, bedroom), use_container_width=True)
+
+    st.plotly_chart(price_vs_time_scatter(filtered), use_container_width=True)
+
+    st.plotly_chart(bar_chart(filtered, latest_date), use_container_width=True)
+
+    # ── Raw data table ────────────────────────────────────────────────────────────
+    with st.expander("📋 Raw Data Table", expanded=False):
+        display_df = (
+            filtered
+            .sort(["date", "neighborhood", "bedroom_type"], descending=[True, False, False])
+            .with_columns(pl.col("date").cast(pl.Utf8))
+        )
+        st.dataframe(display_df, use_container_width=True, height=300)
+        csv_bytes = "\n".join(
+            [",".join(display_df.columns)] +
+            [",".join(str(v) for v in row) for row in display_df.iter_rows()]
+        ).encode()
+        st.download_button("Download CSV", data=csv_bytes, file_name="dubai_re_data.csv", mime="text/csv")
+
+
 # ---------------------------------------------------------------------------
 # Streamlit app
 # ---------------------------------------------------------------------------
@@ -1580,178 +1677,20 @@ if not neighborhoods:
 
 filtered = apply_filters(DF, neighborhoods, bedroom, start_date, end_date)
 
-if filtered.is_empty():
-    st.warning(
-        "No data for the selected filters/date range. "
-        f"The loaded data covers {date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}."
-    )
-    st.stop()
+tab_overview, tab_fair_value = st.tabs(["📊 Market Overview", "🎯 Fair Value Model"])
 
-# ── KPI cards ────────────────────────────────────────────────────────────────
-latest_date = filtered["date"].max()
-latest_df   = filtered.filter(pl.col("date") == latest_date)
-prev_date   = date(latest_date.year - 1, latest_date.month, 1)
-prev_df     = filtered.filter(pl.col("date") == prev_date)
-
-avg_price   = latest_df["avg_price_aed"].mean()
-avg_sqft    = latest_df["price_per_sqft_aed"].mean()
-avg_txn     = int(latest_df["transaction_count"].sum())
-
-if not prev_df.is_empty():
-    prev_price = prev_df["avg_price_aed"].mean()
-    yoy_delta  = (avg_price - prev_price) / prev_price * 100
-    yoy_str    = f"{yoy_delta:+.1f}%"
-else:
-    yoy_str    = "N/A"
-    yoy_delta  = None
-
-st.markdown("## Dubai Apartment Prices")
-st.caption(
-    f"Showing **{len(neighborhoods)}** neighbourhood(s) · "
-    f"**{bedroom}** · "
-    f"**{trans_type}** · "
-    f"{start_date.strftime('%b %Y')} – {end_date.strftime('%b %Y')}"
-)
-
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    st.metric("Avg Price",     f"AED {avg_price:,.0f}",   help="Mean transaction price in the latest selected month")
-with c2:
-    st.metric("Price / sqft",  f"AED {avg_sqft:,.0f}",   help="Mean price per square foot")
-with c3:
-    delta_color = "normal" if yoy_delta is None else ("normal" if yoy_delta >= 0 else "inverse")
-    st.metric("YoY Change",    yoy_str,                    delta=yoy_str if yoy_delta is not None else None, delta_color=delta_color)
-with c4:
-    st.metric("Transactions",  f"{avg_txn:,}",            help="Total monthly transactions across selected neighbourhoods")
-
-st.divider()
-
-# ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
-DW = generate_dubai_wide_data(trans_type, data_version, start_date, end_date)
-WK = generate_weekly_data(trans_type, data_version, start_date, end_date)
-AREA_CHG = generate_area_weekly_change(trans_type, data_version, start_date, end_date)
-
-# KPI cards for Dubai-wide price momentum
-first_wk = WK.row(0, named=True)
-last_wk = WK.row(-1, named=True)
-total_med_chg = (last_wk["median"] - first_wk["median"]) / first_wk["median"] * 100
-peak_med = WK["median"].max()
-from_peak = (last_wk["median"] - peak_med) / peak_med * 100
-
-st.markdown("### Dubai Market Pulse")
-m1, m2, m3, m4 = st.columns(4)
-with m1:
-    st.metric(
-        "Median Price (latest wk)",
-        f"AED {last_wk['median']:,.0f}",
-        delta=f"{last_wk['median_pct_chg']:+.1f}% vs prev wk",
-        delta_color="inverse",
-    )
-with m2:
-    st.metric(
-        "Period Change",
-        f"{total_med_chg:+.1f}%",
-        delta=f"AED {last_wk['median'] - first_wk['median']:+,.0f}",
-        delta_color="inverse",
-    )
-with m3:
-    st.metric(
-        "From Peak",
-        f"{from_peak:+.1f}%",
-        delta=f"AED {last_wk['median'] - peak_med:+,.0f}",
-        delta_color="inverse",
-        help=f"Peak median was AED {peak_med:,.0f}",
-    )
-with m4:
-    st.metric(
-        "Mean/Median Ratio",
-        f"{last_wk['mean_median_ratio']:.2f}x",
-        help="Values above 1.5x suggest a skewed market with high-end outliers pulling up the mean. "
-             "Rising ratio = premium segment decoupling from the broader market.",
+with tab_overview:
+    _render_market_overview(
+        filtered,
+        neighborhoods,
+        bedroom,
+        trans_type,
+        data_version,
+        start_date,
+        end_date,
+        date_min,
+        date_max,
     )
 
-st.plotly_chart(dubai_wide_median_price_chart(DW), use_container_width=True)
-
-st.plotly_chart(weekly_pct_change_chart(WK), use_container_width=True)
-
-st.plotly_chart(dubai_wide_transactions_chart(DW), use_container_width=True)
-
-st.plotly_chart(area_pct_change_chart(AREA_CHG), use_container_width=True)
-
-st.divider()
-
-# ── Tier chart ────────────────────────────────────────────────────────────────
-TIER_DF = generate_tier_data(trans_type, data_version, start_date, end_date)
-st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
-
-st.divider()
-
-# ── Buyer Opportunity Scanner (Metric #3) ────────────────────────────────────
-st.markdown("### Buyer Opportunity Scanner — Price / sqft vs Area Median")
-st.caption(
-    "**Dots** = individual DLD transactions. "
-    "**Solid line** = 14-day rolling median of each area's own daily median AED/sqft. "
-    "A dot **below** the line means that specific deal closed cheaper than the area's "
-    "recent median — the clearest transaction-level buy signal in the data (Metric #3)."
-)
-PSF_TXNS, PSF_ROLLING = generate_area_psf_timeseries(
-    trans_type,
-    bedroom,
-    data_version,
-    start_date,
-    end_date,
-)
-
-# KPI row: cheapest current 14-day rolling median among selected areas
-if not PSF_ROLLING.is_empty():
-    latest_rolling = (
-        PSF_ROLLING
-        .filter(pl.col("area").is_in(neighborhoods))
-        .filter(pl.col("rolling_median_psf").is_not_null())
-        .group_by("area")
-        .agg(pl.col("rolling_median_psf").last().alias("latest_median_psf"))
-        .sort("latest_median_psf")
-        .head(3)
-    )
-    if not latest_rolling.is_empty():
-        cols = st.columns(len(latest_rolling))
-        for i, row in enumerate(latest_rolling.iter_rows(named=True)):
-            with cols[i]:
-                st.metric(
-                    label=f"{row['area'].title()} — lowest AED/sqft",
-                    value=f"AED {row['latest_median_psf']:,.0f}/sqft",
-                    help="Latest 14-day rolling median for this area",
-                )
-
-PSF_TXNS_FILTERED = PSF_TXNS.filter(pl.col("area").is_in(neighborhoods))
-PSF_ROLLING_FILTERED = PSF_ROLLING.filter(pl.col("area").is_in(neighborhoods))
-if PSF_TXNS_FILTERED.is_empty():
-    st.warning("No transaction data for the selected filters.")
-else:
-    st.plotly_chart(
-        area_psf_chart(PSF_TXNS_FILTERED, PSF_ROLLING_FILTERED, neighborhoods),
-        use_container_width=True,
-    )
-
-st.divider()
-
-# ── Filtered charts ───────────────────────────────────────────────────────────
-st.plotly_chart(line_chart(filtered, bedroom), use_container_width=True)
-
-st.plotly_chart(price_vs_time_scatter(filtered), use_container_width=True)
-
-st.plotly_chart(bar_chart(filtered, latest_date), use_container_width=True)
-
-# ── Raw data table ────────────────────────────────────────────────────────────
-with st.expander("📋 Raw Data Table", expanded=False):
-    display_df = (
-        filtered
-        .sort(["date", "neighborhood", "bedroom_type"], descending=[True, False, False])
-        .with_columns(pl.col("date").cast(pl.Utf8))
-    )
-    st.dataframe(display_df, use_container_width=True, height=300)
-    csv_bytes = "\n".join(
-        [",".join(display_df.columns)] +
-        [",".join(str(v) for v in row) for row in display_df.iter_rows()]
-    ).encode()
-    st.download_button("Download CSV", data=csv_bytes, file_name="dubai_re_data.csv", mime="text/csv")
+with tab_fair_value:
+    render_fair_value_tab(neighborhoods, bedroom, start_date, end_date, data_version)
