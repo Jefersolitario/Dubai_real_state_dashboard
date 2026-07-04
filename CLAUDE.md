@@ -1,10 +1,10 @@
-# CHATGPT.md
+# CLAUDE.md
 
-This file provides guidance to ChatGPT/Codex when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-Interactive Streamlit dashboard for Dubai real estate apartment transactions. The app loads normalized DLD transaction snapshots from Google Cloud Storage Parquet first, with the production Dubai Data API kept as a fallback/source for refreshing the snapshot.
+Interactive Streamlit dashboard for Dubai real estate apartment transactions. The app loads normalized DLD transaction snapshots from Google Cloud Storage Parquet first, with the production Dubai Data API kept as a fallback/source for refreshing the snapshot. The snapshot holds 12 months of history.
 
 ## Commands
 
@@ -24,6 +24,9 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 # Incrementally update the normalized DLD transactions snapshot in GCS and verify it
 .\.venv\Scripts\python.exe store_dld_transactions_gcs.py
 
+# Force a full snapshot rebuild for the default 12-month window
+.\.venv\Scripts\python.exe store_dld_transactions_gcs.py --full-refresh --last-months 12
+
 # Install dependencies
 pip install -r requirements.txt
 ```
@@ -34,7 +37,7 @@ pip install -r requirements.txt
 
 Single-file Streamlit app with this flow:
 
-1. **Constants** - tracked neighbourhoods, market tier definitions, chart colors, default data source, and schema assumptions.
+1. **Constants** - `AREA_DISPLAY` (official DLD district name -> friendly community name), tracked `NEIGHBORHOODS` (display names), market tier definitions, chart colors, and schema assumptions.
 2. **Data loading** - cached GCS Parquet snapshot handling, falling back to the production DDA API when needed.
 3. **Data normalization** - maps DDA API columns into the dashboard schema.
 4. **Aggregation helpers** - daily, weekly, Dubai-wide, tier, and area-level metrics using Polars.
@@ -51,6 +54,8 @@ Dubai Data API helper module. It handles:
 - building DLD transaction filters
 - normalizing DLD transaction records to the dashboard column names
 - validating required dashboard columns
+
+`DEFAULT_LOOKBACK_MONTHS = 12` and `DEFAULT_MAX_RECORDS = 500_000` size the default fetch window.
 
 Default production endpoint:
 
@@ -103,8 +108,9 @@ GCP_SERVICE_ACCOUNT_JSON = '''
 
 - Use Polars for data processing. Do not introduce pandas unless there is a strong reason.
 - Keep the dashboard schema stable: `INSTANCE_DATE`, `GROUP_EN`, `IS_OFFPLAN_EN`, `AREA_EN`, `PROP_SB_TYPE_EN`, `TRANS_VALUE`, `ACTUAL_AREA`, and `ROOMS_EN` are required.
+- `AREA_EN` holds official DLD district names (e.g. `MARSA DUBAI` is Dubai Marina, `AL BARSHA SOUTH FOURTH` is JVC, `AL JADAF` is Al Jadaf). Always map through `AREA_DISPLAY` / `_area_display_expr()` before showing areas to users; unmapped districts pass through unchanged.
+- `ACTUAL_AREA` is in square metres. Convert with `SQM_TO_SQFT` (10.7639) before displaying any sqft figure — `meter_sale_price` in the raw data confirms per-square-metre units.
 - `ROOMS_EN` values such as `"1 B/R"` and `"2 B/R"` are normalized to `"1BR"` and `"2BR"`.
-- `AREA_EN` can have casing variants, so compare areas case-insensitively where possible.
 - The bedroom filter uses `"All"` as the unfiltered option.
 - `_layout_defaults()` should not include `margin`; individual charts set margins themselves.
 - Keep API credentials out of git. `.streamlit/secrets.toml` is intentionally ignored.

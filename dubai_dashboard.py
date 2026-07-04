@@ -69,60 +69,96 @@ TRANSACTION_SCHEMA = {
     "ROOMS_EN": pl.Utf8,
 }
 
+# DLD `AREA_EN` values are official district names (e.g. "MARSA DUBAI"),
+# not the community names buyers know. Map them to friendly display names;
+# districts not listed here fall back to the raw AREA_EN value.
+AREA_DISPLAY: dict[str, str] = {
+    "MARSA DUBAI": "Dubai Marina",
+    "AL BARSHA SOUTH FOURTH": "Jumeirah Village Circle (JVC)",
+    "AL BARSHA SOUTH FIFTH": "Jumeirah Village Triangle (JVT)",
+    "AL BARSHAA SOUTH THIRD": "Arjan",
+    "AL JADAF": "Al Jadaf",
+    "AL THANYAH FIFTH": "Jumeirah Lakes Towers",
+    "AL THANYAH THIRD": "The Greens / Barsha Heights",
+    "AL KHAIRAN FIRST": "Dubai Creek Harbour",
+    "AL MERKADH": "Sobha Hartland (MBR City)",
+    "BUKADRA": "Sobha Hartland II",
+    "HADAEQ SHEIKH MOHAMMED BIN RASHID": "Dubai Hills Estate",
+    "AL HEBIAH FOURTH": "Dubai Sports City",
+    "AL HEBIAH FIRST": "Motor City",
+    "AL HEBIAH THIRD": "DAMAC Hills",
+    "MADINAT HIND 4": "DAMAC Hills 2",
+    "NADD HESSA": "Dubai Silicon Oasis",
+    "ME'AISEM FIRST": "Dubai Production City",
+    "AL WARSAN FIRST": "International City Phase 1",
+    "WARSAN FOURTH": "International City (Warsan 4)",
+    "MADINAT AL MATAAR": "Dubai South (Expo City)",
+    "AL YELAYISS 2": "Town Square",
+    "PALM DEIRA": "Dubai Islands",
+    "MADINAT DUBAI ALMELAHEYAH": "Dubai Maritime City",
+    "JABAL ALI FIRST": "Al Furjan / Discovery Gardens",
+    "ZAABEEL SECOND": "Za'abeel",
+    "NAD AL SHIBA FIRST": "Nad Al Sheba",
+    "BUSINESS BAY": "Business Bay",
+    "BURJ KHALIFA": "Downtown Dubai (Burj Khalifa)",
+    "PALM JUMEIRAH": "Palm Jumeirah",
+}
+
+# Sidebar options — display names of the highest-volume districts in the data.
 NEIGHBORHOODS: list[str] = [
     # High-volume
-    "JUMEIRAH VILLAGE CIRCLE",
-    "BUSINESS BAY",
-    "MAJAN",
-    "DUBAI MARINA",
-    "BURJ KHALIFA",
-    "JUMEIRAH LAKES TOWERS",
-    "DUBAI CREEK HARBOUR",
-    "ARJAN",
-    "DUBAI SPORTS CITY",
-    "SILICON OASIS",
+    "Dubai South (Expo City)",
+    "Jumeirah Village Circle (JVC)",
+    "Al Furjan / Discovery Gardens",
+    "Business Bay",
+    "Dubai Islands",
+    "Dubai Marina",
+    "Arjan",
+    "Dubai Creek Harbour",
+    "Dubai Production City",
+    "Jumeirah Lakes Towers",
     # Mid-volume
-    "INTERNATIONAL CITY PH 1",
-    "MEYDAN ONE",
-    "DISCOVERY GARDENS",
-    "AL FURJAN",
-    "SOBHA HEARTLAND",
-    "PALM JUMEIRAH",
-    "DUBAI HILLS",
-    "THE GREENS",
-    "DUBAI PRODUCTION CITY",
-    "MOTOR CITY",
+    "Jumeirah Village Triangle (JVT)",
+    "Sobha Hartland (MBR City)",
+    "Dubai Sports City",
+    "Motor City",
+    "Town Square",
+    "Downtown Dubai (Burj Khalifa)",
+    "Dubai Hills Estate",
+    "Al Jadaf",
+    "Dubai Silicon Oasis",
+    "Palm Jumeirah",
 ]
-
-DATE_START = date(2026, 2, 2)
-DATE_END   = date(2026, 3, 19)
 
 TIER_MAP: dict[str, str] = {}
 TIER_AREAS: dict[str, list[str]] = {
     "Ultra-premium": [
-        "BLUEWATERS", "DUBAI HARBOUR", "DUBAI WATER CANAL",
+        "Palm Jumeirah", "Downtown Dubai (Burj Khalifa)", "Za'abeel",
     ],
     "Premium": [
-        "PALM JUMEIRAH", "BURJ KHALIFA", "DUBAI CREEK HARBOUR", "DUBAI HILLS",
-        "MEYDAN ONE", "JUMEIRAH BEACH RESIDENCE", "AL BARARI",
+        "Dubai Marina", "Dubai Creek Harbour", "Dubai Hills Estate",
+        "Sobha Hartland (MBR City)", "Sobha Hartland II", "Business Bay",
+        "Dubai Maritime City", "Dubai Islands",
     ],
     "Mid-market": [
-        "DUBAI MARINA", "BUSINESS BAY", "JUMEIRAH LAKES TOWERS", "SOBHA HEARTLAND",
-        "Business Bay", "THE GREENS", "AL FURJAN", "DUBAI HEALTHCARE CITY - PHASE 2",
-        "DAMAC HILLS", "JUMEIRAH VILLAGE TRIANGLE", "TOWN SQUARE", "Al Yelayiss 2",
+        "Jumeirah Lakes Towers", "Jumeirah Village Triangle (JVT)",
+        "The Greens / Barsha Heights", "Al Jadaf", "Nad Al Sheba",
+        "Town Square", "Al Furjan / Discovery Gardens", "DAMAC Hills",
     ],
     "Value": [
-        "JUMEIRAH VILLAGE CIRCLE", "ARJAN", "MOTOR CITY", "DISCOVERY GARDENS",
-        "SILICON OASIS", "DUBAI PRODUCTION CITY", "DUBAI SOUTH",
+        "Jumeirah Village Circle (JVC)", "Arjan", "Motor City",
+        "Dubai Silicon Oasis", "Dubai Production City", "Dubai Sports City",
+        "Dubai South (Expo City)",
     ],
     "Budget": [
-        "INTERNATIONAL CITY PH 1", "DUBAI LAND RESIDENCE COMPLEX", "LIWAN",
-        "DUBAI SPORTS CITY", "MAJAN", "DUBAI INVESTMENT PARK SECOND",
+        "International City Phase 1", "International City (Warsan 4)",
+        "DAMAC Hills 2", "DUBAI INVESTMENT PARK FIRST",
+        "DUBAI INVESTMENT PARK SECOND",
     ],
 }
 for tier, areas in TIER_AREAS.items():
     for a in areas:
-        TIER_MAP[a.upper()] = tier
+        TIER_MAP[a] = tier
 TIER_ORDER = ["Ultra-premium", "Premium", "Mid-market", "Value", "Budget"]
 TIER_COLORS = {
     "Ultra-premium": "#e377c2",
@@ -135,6 +171,15 @@ TIER_COLORS = {
 # Alphabet palette has 26 entries – enough for 20 neighbourhoods
 COLORS = plotly.colors.qualitative.Alphabet
 COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
+
+# DLD reports ACTUAL_AREA in square metres; the dashboard displays sqft.
+SQM_TO_SQFT = 10.7639
+
+
+def _area_display_expr() -> pl.Expr:
+    """AREA_EN mapped to its friendly display name (unmapped pass through)."""
+    return pl.col("AREA_EN").replace(AREA_DISPLAY)
+
 
 # ---------------------------------------------------------------------------
 # Data loading (Polars) - production DDA API
@@ -176,15 +221,16 @@ def generate_dubai_data(
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
               .alias("date"),
-            pl.col("AREA_EN").alias("neighborhood"),
+            _area_display_expr().alias("neighborhood"),
             pl.col("ROOMS_EN").str.replace(" B/R", "BR").alias("bedroom_type"),
-            (pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")).alias("price_per_sqft"),
+            (pl.col("TRANS_VALUE") / (pl.col("ACTUAL_AREA") * SQM_TO_SQFT))
+                .alias("price_per_sqft"),
         ])
         .group_by(["date", "neighborhood", "bedroom_type"])
         .agg([
             pl.col("TRANS_VALUE").mean().round(0).alias("avg_price_aed"),
             pl.col("price_per_sqft").mean().round(1).alias("price_per_sqft_aed"),
-            pl.col("ACTUAL_AREA").mean().round(1).alias("avg_size_sqft"),
+            (pl.col("ACTUAL_AREA") * SQM_TO_SQFT).mean().round(1).alias("avg_size_sqft"),
             pl.col("TRANS_VALUE").count().alias("transaction_count"),
         ])
     )
@@ -285,7 +331,7 @@ def generate_area_weekly_change(
               .str.to_date("%Y-%m-%d")
               .dt.truncate("1w")
               .alias("week"),
-            pl.col("AREA_EN").alias("area"),
+            _area_display_expr().alias("area"),
         ])
     )
     base = _filter_raw_date_window(base, start_date, end_date)
@@ -329,12 +375,13 @@ def generate_tier_data(
     """Daily median price per market tier."""
     raw = (
         _flat_transactions(trans_type)
-        .filter(pl.col("AREA_EN").is_in(list(TIER_MAP.keys())))
+        .with_columns(_area_display_expr().alias("display_area"))
+        .filter(pl.col("display_area").is_in(list(TIER_MAP.keys())))
         .with_columns([
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
               .alias("date"),
-            pl.col("AREA_EN").replace_strict(TIER_MAP).alias("tier"),
+            pl.col("display_area").replace_strict(TIER_MAP).alias("tier"),
         ])
     )
     raw = _filter_raw_date_window(raw, start_date, end_date)
@@ -387,9 +434,10 @@ def generate_area_psf_timeseries(
             pl.col("INSTANCE_DATE").str.slice(0, 10)
               .str.to_date("%Y-%m-%d")
               .alias("date"),
-            pl.col("AREA_EN").str.to_uppercase().alias("area"),
+            _area_display_expr().alias("area"),
             pl.col("ROOMS_EN").str.replace(" B/R", "BR").alias("bedroom_type"),
-            (pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")).alias("price_per_sqft"),
+            (pl.col("TRANS_VALUE") / (pl.col("ACTUAL_AREA") * SQM_TO_SQFT))
+                .alias("price_per_sqft"),
         ])
     )
 

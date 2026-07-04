@@ -12,6 +12,15 @@ pip install -r requirements.txt
 .\.venv\Scripts\python.exe -m streamlit run dubai_dashboard.py
 ```
 
+Or with the virtual environment activated:
+
+```powershell
+streamlit run dubai_dashboard.py
+```
+
+The app starts on http://localhost:8501 (pass `--server.port 8503` to use
+another port).
+
 ## Data Flow
 
 1. `store_dld_transactions_gcs.py` reads the existing GCS Parquet snapshot.
@@ -27,13 +36,13 @@ gs://dubai-real-estate-dashboard-jef/dld_transactions/dld_transactions_latest.pa
 4. `dubai_dashboard.py` loads that GCS Parquet snapshot first.
 5. If the GCS snapshot is unavailable, the dashboard falls back to the DDA API.
 
-Current verified snapshot:
+Current verified snapshot (12-month history):
 
 ```text
-rows: 42,469
+rows: 163,827
 columns: 69
-date coverage: 2026-03-02 to 2026-06-25
-duplicates: 0
+date coverage: 2025-07-04 to 2026-07-02
+full-row duplicates: 0
 ```
 
 ## Streamlit Secrets
@@ -103,7 +112,7 @@ Incrementally refresh the production Parquet snapshot:
 Force a full replacement from a requested API window:
 
 ```powershell
-.\.venv\Scripts\python.exe .\store_dld_transactions_gcs.py --full-refresh --last-months 4
+.\.venv\Scripts\python.exe .\store_dld_transactions_gcs.py --full-refresh --last-months 12
 ```
 
 Test DDA connectivity:
