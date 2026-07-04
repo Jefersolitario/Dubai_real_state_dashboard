@@ -38,12 +38,24 @@ from dashboard_constants import DISTRICT_TIER, SQM_TO_SQFT
 # ---------------------------------------------------------------------------
 
 # Feature groups the optimization loop can toggle independently.
+# Every derived group below is strictly past-only by construction
+# (rolling windows closed="left" or shift over date-sorted frames), so no
+# fold-refitting is needed and no lookahead is possible.
 DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "project": True,        # PROJECT_EN / MASTER_PROJECT_EN categoricals
     "building": False,      # BUILDING_NAME_EN categorical (needs 24-month snapshot)
     "amenity": True,        # nearest metro/mall/landmark, parking, buyer/seller counts
     "comps_area": False,    # trailing 30-day area median PSF (strictly past-only)
     "comps_project": False, # trailing 60-day project median PSF (strictly past-only)
+    # --- campaign feature groups (all strictly past-only) ---
+    "comps_project_windows": False,  # 30d + 90d project median PSF variants
+    "comps_building": False,         # trailing 90-day building median PSF
+    "te_hist": False,                # expanding all-past project & building median PSF
+    "liquidity": False,              # trailing txn counts (project 90d, area 30d)
+    "momentum": False,               # area short/long comp ratio (30d vs 180d)
+    "rel_size": False,               # log_sqft minus past project median log_sqft
+    "comp_dispersion": False,        # trailing 60d project PSF std (uncertainty)
+    "repeat_sale": False,            # prior sale PSF of the same pseudo-unit
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -117,6 +129,22 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric.append("area_comp_psf")
     if cfg["comps_project"]:
         numeric.append("project_comp_psf")
+    if cfg["comps_project_windows"]:
+        numeric += ["project_comp_psf_30", "project_comp_psf_90"]
+    if cfg["comps_building"]:
+        numeric.append("building_comp_psf")
+    if cfg["te_hist"]:
+        numeric += ["project_hist_psf", "building_hist_psf"]
+    if cfg["liquidity"]:
+        numeric += ["project_txn_90d", "area_txn_30d"]
+    if cfg["momentum"]:
+        numeric.append("area_momentum")
+    if cfg["rel_size"]:
+        numeric.append("rel_log_sqft")
+    if cfg["comp_dispersion"]:
+        numeric.append("project_comp_std")
+    if cfg["repeat_sale"]:
+        numeric += ["prior_unit_psf", "days_since_prior_sale"]
     return numeric, categorical
 
 
@@ -223,32 +251,85 @@ def feature_engineering(
             pl.col("TOTAL_SELLER").cast(pl.Float64, strict=False).alias("total_seller"),
         )
 
-    # Trailing comparables: strictly past-only (closed="left" excludes the
-    # current day) so they never leak the transaction's own price.
-    if cfg["comps_area"] or cfg["comps_project"]:
+    # Trailing statistics: strictly past-only (closed="left" excludes the
+    # current day; shift(1) excludes the current row) so they never leak the
+    # transaction's own price or any future information. Rows without a
+    # project/building are masked to null rather than pooled into one
+    # implicit null group (HGB treats NaN natively).
+    derived_groups = (
+        "comps_area", "comps_project", "comps_project_windows",
+        "comps_building", "te_hist", "liquidity", "momentum",
+        "rel_size", "comp_dispersion", "repeat_sale",
+    )
+    if any(cfg[g] for g in derived_groups):
         df = df.sort("date")
+
+        def past_stat(value: str, window: str, group: str, stat: str = "median") -> pl.Expr:
+            rolled = getattr(pl.col(value), f"rolling_{stat}_by")(
+                "date", window_size=window, closed="left"
+            ).over(group)
+            return pl.when(pl.col(group).is_not_null()).then(rolled)
+
         comps = []
         if cfg["comps_area"]:
-            comps.append(
-                pl.col("psf")
-                .rolling_median_by("date", window_size="30d", closed="left")
-                .over("AREA_EN")
-                .alias("area_comp_psf")
-            )
+            comps.append(past_stat("psf", "30d", "AREA_EN").alias("area_comp_psf"))
         if cfg["comps_project"]:
-            # Rows without a project would otherwise pool into one implicit
-            # null group and share a meaningless comp — mask them to null
-            # (HGB treats NaN natively).
+            comps.append(past_stat("psf", "60d", "PROJECT_EN").alias("project_comp_psf"))
+        if cfg["comps_project_windows"]:
+            comps.append(past_stat("psf", "30d", "PROJECT_EN").alias("project_comp_psf_30"))
+            comps.append(past_stat("psf", "90d", "PROJECT_EN").alias("project_comp_psf_90"))
+        if cfg["comps_building"]:
+            comps.append(past_stat("psf", "90d", "BUILDING_NAME_EN").alias("building_comp_psf"))
+        if cfg["te_hist"]:
+            # Expanding all-past medians (window far longer than the data span).
+            comps.append(past_stat("psf", "3650d", "PROJECT_EN").alias("project_hist_psf"))
+            comps.append(past_stat("psf", "3650d", "BUILDING_NAME_EN").alias("building_hist_psf"))
+        if cfg["liquidity"]:
+            df = df.with_columns(pl.lit(1.0).alias("_one"))
+            comps.append(past_stat("_one", "90d", "PROJECT_EN", "sum").alias("project_txn_90d"))
+            comps.append(past_stat("_one", "30d", "AREA_EN", "sum").alias("area_txn_30d"))
+        if cfg["momentum"]:
             comps.append(
-                pl.when(pl.col("PROJECT_EN").is_not_null())
-                .then(
-                    pl.col("psf")
-                    .rolling_median_by("date", window_size="60d", closed="left")
-                    .over("PROJECT_EN")
-                )
-                .alias("project_comp_psf")
+                (
+                    past_stat("psf", "30d", "AREA_EN")
+                    / past_stat("psf", "180d", "AREA_EN")
+                ).alias("area_momentum")
             )
-        df = df.with_columns(comps)
+        if cfg["rel_size"]:
+            comps.append(
+                (pl.col("ACTUAL_AREA").log() - past_stat("ACTUAL_AREA", "3650d", "PROJECT_EN").log())
+                .alias("rel_log_sqft")
+            )
+        if cfg["comp_dispersion"]:
+            comps.append(past_stat("psf", "60d", "PROJECT_EN", "std").alias("project_comp_std"))
+        if comps:
+            df = df.with_columns(comps)
+        if "_one" in df.columns:
+            df = df.drop("_one")
+
+        if cfg["repeat_sale"]:
+            # Pseudo-unit: same building + same room label + same area to
+            # 0.1 sqm. shift(1) over the date-sorted frame = the unit's most
+            # recent PRIOR sale only.
+            unit_key = pl.concat_str(
+                pl.col("BUILDING_NAME_EN").fill_null("?"),
+                pl.col("ROOMS_EN").cast(pl.Utf8).fill_null("?"),
+                (pl.col("ACTUAL_AREA") * 10).round(0).cast(pl.Int64).cast(pl.Utf8),
+                separator="|",
+            )
+            df = df.with_columns(unit_key.alias("_unit"))
+            df = df.with_columns(
+                pl.when(pl.col("BUILDING_NAME_EN").is_not_null())
+                .then(pl.col("psf").shift(1).over("_unit"))
+                .alias("prior_unit_psf"),
+                pl.when(pl.col("BUILDING_NAME_EN").is_not_null())
+                .then(
+                    (pl.col("date") - pl.col("date").shift(1).over("_unit"))
+                    .dt.total_days()
+                    .cast(pl.Float64)
+                )
+                .alias("days_since_prior_sale"),
+            ).drop("_unit")
 
     _, categorical = feature_columns(cfg)
     missing = [c for c in categorical if c not in df.columns]
