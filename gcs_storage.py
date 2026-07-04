@@ -9,6 +9,7 @@ from google.oauth2 import service_account
 
 
 DEFAULT_TRANSACTIONS_OBJECT = "dld_transactions/dld_transactions_latest.parquet"
+DEFAULT_MODEL_OBJECT = "fair_value_model/fair_value_model_latest.pkl"
 
 
 def gcs_client(secrets):
@@ -49,6 +50,31 @@ def configured_snapshot(secrets):
     bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
     object_name = setting(secrets, "GCS_TRANSACTIONS_OBJECT") or DEFAULT_TRANSACTIONS_OBJECT
     return bucket_name, object_name
+
+
+def configured_model_object(secrets):
+    bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
+    object_name = setting(secrets, "GCS_MODEL_OBJECT") or DEFAULT_MODEL_OBJECT
+    return bucket_name, object_name
+
+
+def read_model_bundle_bytes(secrets):
+    """Raw bytes of the pre-trained fair-value model bundle, plus its blob."""
+    bucket_name, object_name = configured_model_object(secrets)
+    blob = gcs_client(secrets).bucket(bucket_name).get_blob(object_name)
+    if blob is None:
+        raise FileNotFoundError(f"gs://{bucket_name}/{object_name}")
+    return blob.download_as_bytes(), blob
+
+
+def write_model_bundle_bytes(secrets, data, metadata=None):
+    """Upload the fair-value model bundle; returns the gs:// URI."""
+    bucket_name, object_name = configured_model_object(secrets)
+    blob = gcs_client(secrets).bucket(bucket_name).blob(object_name)
+    if metadata:
+        blob.metadata = {key: str(value) for key, value in metadata.items()}
+    blob.upload_from_string(data, content_type="application/octet-stream")
+    return f"gs://{bucket_name}/{object_name}"
 
 
 def read_parquet_object(secrets, bucket_name, object_name):

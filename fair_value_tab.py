@@ -11,7 +11,7 @@ snapshot; the sidebar filters only narrow what is displayed.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import plotly.graph_objects as go
 import polars as pl
@@ -27,11 +27,15 @@ from fair_value_model import (
     FairValueResult,
     feature_engineering,
     flag_distress,
+    load_bundle,
     load_shipping_config,
     score_transactions,
     train_fair_value_model,
     trim_psf,
 )
+from gcs_storage import read_model_bundle_bytes
+
+MODEL_STALE_DAYS = 7
 
 MIN_TRAINING_ROWS = 5_000
 SCATTER_MAX_POINTS = 15_000
@@ -80,22 +84,38 @@ def get_features(data_version: str) -> pl.DataFrame:
     return feature_engineering(_raw_transactions(), feature_config)
 
 
-@st.cache_resource(show_spinner="Training fair-value model (cached per data refresh)...")
-def get_model(data_version: str) -> FairValueResult:
+@st.cache_resource(
+    ttl=6 * 3600, show_spinner="Loading pre-trained fair-value model..."
+)
+def get_model(data_version: str) -> tuple[FairValueResult, dict]:
+    """Load the pre-trained inference bundle from GCS — the app never trains.
+
+    Training happens offline via ``python train_fair_value.py`` (weekly
+    cadence); the TTL picks up a fresh bundle without an app restart.
+    """
+    data, _ = read_model_bundle_bytes(st.secrets)
+    return load_bundle(data)
+
+
+@st.cache_resource(show_spinner="Training fair-value model (heavy, local use)...")
+def train_local_model(data_version: str) -> tuple[FairValueResult, dict]:
+    """Manual fallback when no bundle exists — only ever runs on button click."""
     feature_config, model_params = load_shipping_config()
-    return train_fair_value_model(
-        trim_psf(get_features(data_version)), feature_config, model_params
+    result = train_fair_value_model(
+        trim_psf(get_features(data_version)), feature_config, model_params, run_cv=False
     )
+    return result, {"trained_at": None, "source": "trained in this session"}
 
 
 @st.cache_resource(show_spinner="Scoring transactions against fair value...")
-def get_scored(data_version: str) -> pl.DataFrame:
+def get_scored(data_version: str, _result: FairValueResult) -> pl.DataFrame:
     """Fair-value predictions for every scoreable row (threshold-independent).
 
     The threshold slider only re-runs the cheap flag_distress expressions,
-    never this predict pass.
+    never this predict pass. ``_result`` is underscore-prefixed so Streamlit
+    keys the cache on data_version only (the bundle is stable per version).
     """
-    return score_transactions(get_model(data_version), get_features(data_version))
+    return score_transactions(_result, get_features(data_version))
 
 
 def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
@@ -229,27 +249,57 @@ def render_fair_value_tab(
         st.info("No transaction data loaded.")
         return
 
-    feats_rows = get_features(data_version).height
-    if feats_rows < MIN_TRAINING_ROWS:
+    try:
+        result, meta = get_model(data_version)
+    except FileNotFoundError:
         st.info(
-            f"Not enough apartment sales to train a reliable model "
-            f"({feats_rows:,} rows; need at least {MIN_TRAINING_ROWS:,}). "
-            "Widen the loaded data range."
+            "No pre-trained model bundle found in GCS. Publish one with "
+            "`python train_fair_value.py` (run offline — training is too heavy "
+            "for this deployment)."
         )
+        feats_rows = get_features(data_version).height
+        if feats_rows < MIN_TRAINING_ROWS:
+            st.info(
+                f"Local training also unavailable: only {feats_rows:,} apartment "
+                f"sales loaded (need at least {MIN_TRAINING_ROWS:,})."
+            )
+            return
+        if not st.button("Train in this session (heavy — local use only)"):
+            return
+        result, meta = train_local_model(data_version)
+    except Exception as exc:  # unreadable bundle, GCS outage, version break
+        st.error(f"Could not load the fair-value model bundle: {exc}")
         return
 
-    result = get_model(data_version)
+    if get_features(data_version).is_empty():
+        st.warning("No scoreable apartment sales in the loaded data.")
+        return
 
     st.markdown("### Fair Value Model — Below-Market & Distressed-Asset Scanner")
     st.caption(
         "The model predicts each apartment sale's **fair value** (AED/sqft) from size, "
         "location, project, rooms, off-plan status, amenities, and market trend, then "
         "measures the **spread** between the actual closed price and that fair value. "
-        f"It trains on **all {result.trained_rows:,} apartment Sales** in the loaded "
-        "snapshot. The neighbourhood, bedroom, and date filters narrow what is shown "
-        "below; the Transaction Type filter does not apply here (this tab always "
-        "analyses Sales — mortgage rows record loan amounts, not market prices)."
+        f"It was trained offline on **{result.trained_rows:,} apartment Sales**. "
+        "The neighbourhood, bedroom, and date filters narrow what is shown below; "
+        "the Transaction Type filter does not apply here (this tab always analyses "
+        "Sales — mortgage rows record loan amounts, not market prices)."
     )
+
+    trained_at = meta.get("trained_at")
+    if trained_at:
+        trained_dt = datetime.fromisoformat(trained_at)
+        age_days = (datetime.now(timezone.utc) - trained_dt).days
+        st.caption(
+            f"Model trained **{trained_dt:%Y-%m-%d}** "
+            f"({meta.get('data_min_date')} – {meta.get('data_max_date')} data)."
+        )
+        if age_days > MODEL_STALE_DAYS:
+            st.warning(
+                f"The model is {age_days} days old. Refresh it by running "
+                "`python store_dld_transactions_gcs.py` then "
+                "`python train_fair_value.py` (offline)."
+            )
 
     threshold_pct = st.slider(
         "Below-fair-value threshold",
@@ -265,27 +315,33 @@ def render_fair_value_tab(
             "procedure, an illiquid project, or multiple sellers on the deal."
         ),
     )
-    scored = flag_distress(get_scored(data_version), spread_threshold=-threshold_pct / 100)
+    scored = flag_distress(
+        get_scored(data_version, result), spread_threshold=-threshold_pct / 100
+    )
     view = _display_filter(scored, neighborhoods, bedroom, start_date, end_date)
 
-    metrics = result.metrics
+    metrics = result.metrics or {}
     n_below = view.filter(pl.col("below_fair_value")).height
     n_distressed = view.filter(pl.col("distressed")).height
+    medape = metrics.get("medape_mean")
+    medape_std = metrics.get("medape_std")
+    r2 = metrics.get("r2_mean")
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric(
             "Model error (MedAPE)",
-            f"{metrics['medape_mean']:.1%}",
+            f"{medape:.1%}" if medape is not None else "—",
             help=(
                 "Median absolute % gap between actual price and predicted fair value on "
                 "out-of-time validation folds (10-fold TimeSeriesSplit: always trained "
-                f"on the past, tested on the future). ± {metrics['medape_std']:.1%} across folds."
+                "on the past, tested on the future)."
+                + (f" ± {medape_std:.1%} across folds." if medape_std is not None else "")
             ),
         )
     with c2:
         st.metric(
             "Model R² (log price/sqft)",
-            f"{metrics['r2_mean']:.2f}",
+            f"{r2:.2f}" if r2 is not None else "—",
             help="Share of price variation the model explains on out-of-time validation folds.",
         )
     with c3:

@@ -17,8 +17,10 @@ import polars as pl
 from dashboard_constants import SQM_TO_SQFT
 from fair_value_model import (
     cross_validate,
+    export_bundle,
     feature_engineering,
     flag_distress,
+    load_bundle,
     score_transactions,
     train_fair_value_model,
     trim_psf,
@@ -171,6 +173,18 @@ def main() -> int:
     unseen_scored = score_transactions(result, unseen_feats)
     finite = unseen_scored.select(pl.col("pred_psf").is_finite().all()).item()
     ok &= check(bool(finite), f"unseen categories score finitely ({unseen_feats.height} rows)")
+
+    bundle = export_bundle(result, extra={"source": "smoke"})
+    loaded, _meta = load_bundle(bundle)
+    rescored = score_transactions(loaded, feats)
+    identical = np.allclose(
+        scored.get_column("pred_psf").to_numpy(),
+        rescored.get_column("pred_psf").to_numpy(),
+    )
+    ok &= check(
+        identical,
+        f"model bundle round-trips with identical predictions ({len(bundle) / 1e6:.1f} MB)",
+    )
 
     top = result.importances.head(3).get_column("feature").to_list()
     print(f"       top importances: {top}")

@@ -29,6 +29,8 @@ from dda_api import (
     DEFAULT_MAX_RECORDS,
     DEFAULT_PAGE_SIZE,
     DEFAULT_LOOKBACK_MONTHS,
+    OPTIONAL_DASHBOARD_COLUMNS,
+    REQUIRED_DASHBOARD_COLUMNS,
     build_dld_transactions_params,
     fetch_dataset_records,
     infer_column_mapping,
@@ -577,6 +579,19 @@ def _load_gcs_transactions(
     if validation["missing_required"]:
         raise DDAApiError("GCS transaction snapshot schema is incomplete.")
 
+    # The snapshot retains raw API columns alongside the normalized ones
+    # (~70 total); keep only the dashboard schema — cuts every in-memory
+    # copy by ~70% (267 MB -> 77 MB measured).
+    raw_columns = raw_df.columns
+    mapping = infer_column_mapping(raw_columns)
+    del raw_df
+    needed = [
+        column
+        for column in REQUIRED_DASHBOARD_COLUMNS + OPTIONAL_DASHBOARD_COLUMNS
+        if column in normalized.columns
+    ]
+    normalized = normalized.select(needed)
+
     bounds = _date_bounds_from_transactions(normalized)
     object_metadata = blob.metadata or {}
     date_start = object_metadata.get("date_start")
@@ -587,8 +602,8 @@ def _load_gcs_transactions(
 
     return normalized, {
         "source": "gcs_parquet",
-        "raw_columns": raw_df.columns,
-        "mapping": infer_column_mapping(raw_df.columns),
+        "raw_columns": raw_columns,
+        "mapping": mapping,
         "validation": validation,
         "params": {
             "gcs_bucket": bucket_name,
@@ -806,7 +821,9 @@ def _ensure_transactions_cover_range(
     return refreshed_df, refreshed_meta, {**stats, "written": True}
 
 
-@st.cache_data(
+# cache_resource (not cache_data): avoids keeping a full pickle copy of the
+# ~300k-row frame resident plus a deserialize copy on every rerun.
+@st.cache_resource(
     show_spinner="Loading latest DLD transactions...",
     ttl=60 * 60,
 )
@@ -954,7 +971,8 @@ def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
     fig   = go.Figure()
     dash_ = {"Studio": "dot", "1BR": "solid", "2BR": "dash", "3BR": "dashdot"}
     nbhds = df["neighborhood"].unique().to_list()
-    br_types = df["bedroom_type"].unique().sort().to_list()
+    # drop_nulls: a null bedroom label would compare as null and warn
+    br_types = df["bedroom_type"].unique().drop_nulls().sort().to_list()
 
     for nbhd in NEIGHBORHOODS:          # stable iteration order
         if nbhd not in nbhds:
@@ -1005,7 +1023,7 @@ def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
 def bar_chart(df: pl.DataFrame, latest_date: date) -> go.Figure:
     fig     = go.Figure()
     latest  = df.filter(pl.col("date") == latest_date)
-    br_types = latest["bedroom_type"].unique().sort().to_list()
+    br_types = latest["bedroom_type"].unique().drop_nulls().sort().to_list()
 
     # Sort neighbourhoods by descending avg price
     order = (

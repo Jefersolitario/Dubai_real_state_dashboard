@@ -478,6 +478,8 @@ def main() -> int:
                     "generated_at": datetime.now().isoformat(timespec="seconds"),
                     "winner": best["name"],
                     "cv_medape_mean": best["metrics"]["medape_mean"],
+                    "cv_medape_std": best["metrics"]["medape_std"],
+                    "cv_r2_mean": best["metrics"]["r2_mean"],
                     "feature_config": best["feature_config"],
                     "model_params": best["model_params"],
                 },

@@ -19,8 +19,10 @@ trains on the past and validates on the next time block.
 from __future__ import annotations
 
 import json
+import pickle
+import warnings
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -480,6 +482,73 @@ def train_fair_value_model(
         date_origin=origin,
         trained_rows=df.height,
     )
+
+
+# ---------------------------------------------------------------------------
+# Model bundle (offline training -> light inference artifact)
+# ---------------------------------------------------------------------------
+
+BUNDLE_VERSION = 1
+
+
+def export_bundle(result: FairValueResult, extra: dict | None = None) -> bytes:
+    """Serialize a trained model + everything inference needs.
+
+    The bundle is what the Streamlit app loads instead of training —
+    training happens offline (train_fair_value.py) where CPU/RAM exist.
+    """
+    import sklearn
+
+    payload = {
+        "bundle_version": BUNDLE_VERSION,
+        "sklearn_version": sklearn.__version__,
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "model": result.model,
+        "encoders": result.encoders,
+        "feature_names": result.feature_names,
+        "categorical_idx": result.categorical_idx,
+        "feature_config": result.feature_config,
+        "metrics": result.metrics,
+        "importances": result.importances.to_dicts(),
+        "date_origin": result.date_origin,
+        "trained_rows": result.trained_rows,
+        **(extra or {}),
+    }
+    return pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_bundle(data: bytes) -> tuple[FairValueResult, dict]:
+    """(FairValueResult, metadata) from export_bundle bytes.
+
+    Warns (does not fail) on sklearn version mismatch — HGB pickles are
+    generally forward-compatible within minor releases, and the weekly
+    retrain refreshes the bundle anyway.
+    """
+    import sklearn
+
+    payload = pickle.loads(data)
+    if payload.get("sklearn_version") != sklearn.__version__:
+        warnings.warn(
+            "Model bundle was trained with scikit-learn "
+            f"{payload.get('sklearn_version')} but {sklearn.__version__} is "
+            "installed; retrain with train_fair_value.py if predictions look off.",
+            stacklevel=2,
+        )
+    result = FairValueResult(
+        model=payload["model"],
+        encoders=payload["encoders"],
+        feature_names=payload["feature_names"],
+        categorical_idx=payload["categorical_idx"],
+        feature_config=payload["feature_config"],
+        metrics=payload["metrics"],
+        importances=pl.DataFrame(payload["importances"]),
+        date_origin=payload["date_origin"],
+        trained_rows=payload["trained_rows"],
+    )
+    meta_keys = ("bundle_version", "sklearn_version", "trained_at",
+                 "data_min_date", "data_max_date", "source")
+    metadata = {key: payload.get(key) for key in meta_keys}
+    return result, metadata
 
 
 # ---------------------------------------------------------------------------

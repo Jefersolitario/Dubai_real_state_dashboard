@@ -31,6 +31,10 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe smoke_test_fair_value.py
 .\.venv\Scripts\python.exe optimize_fair_value.py
 
+# Train the fair-value model offline and publish the inference bundle to GCS
+# (run after each snapshot refresh — weekly cadence; the app never trains)
+.\.venv\Scripts\python.exe train_fair_value.py
+
 # Install dependencies
 pip install -r requirements.txt
 ```
@@ -59,6 +63,17 @@ Pure Polars + scikit-learn fair-value model: `feature_engineering` (Sales-only a
 ### fair_value_tab.py
 
 Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version), `get_model` (trains on `trim_psf(features)`), `get_scored` (threshold-independent predictions); the threshold slider only re-runs `flag_distress`.
+
+### train_fair_value.py
+
+Offline training CLI: loads the snapshot, trains the shipping configuration,
+and publishes a pickled inference bundle to
+`gs://<bucket>/fair_value_model/fair_value_model_latest.pkl`
+(`GCS_MODEL_OBJECT`). The Streamlit tab only loads this bundle (6h cache TTL)
+and predicts — training is too heavy for Streamlit Cloud (the in-app CV was
+profiled at ~2-4 minutes and caused watchdog kills). Ops flow: refresh
+snapshot (`store_dld_transactions_gcs.py`) → `train_fair_value.py` → the
+deployed app picks the new bundle up automatically.
 
 ### optimize_fair_value.py
 
@@ -120,6 +135,7 @@ Expected local/Streamlit secrets:
 GCS_BUCKET = "dubai-real-estate-dashboard-jef"
 GCS_TEST_PREFIX = "dubai-dashboard-smoke-tests"
 GCS_TRANSACTIONS_OBJECT = "dld_transactions/dld_transactions_latest.parquet"
+GCS_MODEL_OBJECT = "fair_value_model/fair_value_model_latest.pkl"
 
 GCP_SERVICE_ACCOUNT_JSON = '''
 {
