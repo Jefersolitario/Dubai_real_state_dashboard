@@ -367,7 +367,12 @@ def render_fair_value_tab(
             "Deep-discount outliers are excluded from **training** (0.5%/99.5% PSF trim) "
             "but always **scored**, so genuine fire-sales stay visible. Rows whose "
             "recorded area contradicts the official AED/sqm price by more than 10% are "
-            "dropped as data errors.\n"
+            "dropped as data errors.\n\n"
+            "**Accuracy caveats** (independent audit on an untouched 2-month holdout): "
+            "the honest error is ≈ 6% overall — ~5.9% for the ~97% of sales whose "
+            "project has recent comparable sales, but ~12% for cold-start sales (a "
+            "project's first transactions in a 60-day window). Treat flags on "
+            "first-in-project sales with extra care.\n"
         )
         st.markdown("**Data needed & sources**")
         st.markdown(DATA_SOURCES_TABLE)

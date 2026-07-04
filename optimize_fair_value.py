@@ -107,7 +107,8 @@ def _fold_slices(df: pl.DataFrame, n_splits: int):
 
 
 def eval_area_median_baseline(feats: pl.DataFrame, n_splits: int) -> dict:
-    """No-ML floor: predict each area's trailing median log PSF."""
+    """No-ML floor: predict each area's training-window median log PSF
+    (median over the fold's full training slice — strictly past-only)."""
     df = feats.sort("date")
     folds = []
     for train_df, val_df in _fold_slices(df, n_splits):

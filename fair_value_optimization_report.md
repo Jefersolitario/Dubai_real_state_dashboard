@@ -53,3 +53,26 @@ Stop rule: < 0.2 pp MedAPE improvement for 2 consecutive iterations, or 10 itera
 - Ejari rent contracts (Dubai Pulse `dld_rent_contracts`) — project rental yield feature and distress corroboration.
 - Buildings/units metadata (floor, building age, developer) — strongest missing hedonic features.
 - Official residential sale price index — drift monitoring.
+
+## Independent audit addendum (2026-07-04)
+
+A post-run audit (code-mechanics review with live Polars experiments + empirical
+re-validation) confirmed the results:
+
+- **Untouched holdout** (train < 2026-05-01, test on the final ~2 months the
+  selection loop never optimized against): MedAPE **5.92%** trimmed / **6.00%**
+  untrimmed, R² 0.82–0.85, vs 14.4% area-median baseline on the same period —
+  the CV headline is not selection-inflated.
+- **No leakage**: `project_comp_psf` is strictly past-only (verified: a
+  project's first sales get null comps, never their own price; same-day sales
+  never see each other). Shuffling the training target collapses the model to
+  R² ≈ 0, as a clean model should.
+- **Honesty notes**: the CV credited the project-comps feature +1.78pp; the
+  untouched holdout shows +1.06pp (mild selection optimism from choosing the
+  config on the same folds — quote the true error as ≈ 6%). The headline also
+  blends ~5.9% MedAPE for the 96.8% of rows with recent project comps and
+  ~12% for the 3.2% cold-start rows (a project's first sales in a 60-day
+  window).
+- Deepest scored "discounts" (spread ≈ −99%) are token/nominal-consideration
+  transfers; they are annotated but correctly not labelled distressed because
+  no residual-independent signal corroborates them.

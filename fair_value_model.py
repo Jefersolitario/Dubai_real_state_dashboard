@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -217,10 +217,16 @@ def feature_engineering(
                 .alias("area_comp_psf")
             )
         if cfg["comps_project"]:
+            # Rows without a project would otherwise pool into one implicit
+            # null group and share a meaningless comp — mask them to null
+            # (HGB treats NaN natively).
             comps.append(
-                pl.col("psf")
-                .rolling_median_by("date", window_size="60d", closed="left")
-                .over("PROJECT_EN")
+                pl.when(pl.col("PROJECT_EN").is_not_null())
+                .then(
+                    pl.col("psf")
+                    .rolling_median_by("date", window_size="60d", closed="left")
+                    .over("PROJECT_EN")
+                )
                 .alias("project_comp_psf")
             )
         df = df.with_columns(comps)
@@ -455,6 +461,14 @@ def train_fair_value_model(
         }
     ).sort("importance_mean", descending=True)
 
+    # Recover the origin days_since_start was actually derived from
+    # (feature_engineering's untrimmed min date): for any row,
+    # origin = date - days_since_start. Using the trimmed frame's min date
+    # here would offset the trend axis when re-featurizing fresh data with
+    # date_origin=result.date_origin.
+    first_date, first_days = df.select("date", "days_since_start").row(0)
+    origin = first_date - timedelta(days=int(first_days))
+
     return FairValueResult(
         model=model,
         encoders=encoders,
@@ -463,7 +477,7 @@ def train_fair_value_model(
         feature_config=cfg,
         metrics=metrics,
         importances=importances,
-        date_origin=df.select(pl.col("date").min()).item(),
+        date_origin=origin,
         trained_rows=df.height,
     )
 
