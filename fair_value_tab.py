@@ -364,14 +364,6 @@ def render_fair_value_tab(
         st.warning("No scored transactions for the selected filters/date range.")
         return
 
-    st.plotly_chart(pred_vs_actual_chart(view), use_container_width=True)
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.plotly_chart(spread_histogram(view, -threshold_pct / 100), use_container_width=True)
-    with col_b:
-        st.plotly_chart(importance_chart(result.importances), use_container_width=True)
-
     st.markdown("#### Flagged transactions")
     st.caption(
         "Sorted distressed-first, deepest discount on top. **Spread** = actual price vs "
@@ -406,6 +398,14 @@ def render_fair_value_tab(
         file_name="fair_value_flagged_transactions.csv",
         mime="text/csv",
     )
+
+    st.plotly_chart(pred_vs_actual_chart(view), use_container_width=True)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.plotly_chart(spread_histogram(view, -threshold_pct / 100), use_container_width=True)
+    with col_b:
+        st.plotly_chart(importance_chart(result.importances), use_container_width=True)
 
     with st.expander("📚 Data & methodology", expanded=False):
         st.markdown(
