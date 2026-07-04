@@ -194,6 +194,12 @@ CANDIDATE_LADDER: list[dict] = [
         "toggle": {"project": True},
     },
     {
+        "name": "+ building categorical",
+        "detail": "BUILDING_NAME_EN (top 200 + OTHER)",
+        "kind": "hgb",
+        "toggle": {"building": True},
+    },
+    {
         "name": "+ amenity & deal features",
         "detail": "nearest metro/mall/landmark, parking, buyer/seller counts",
         "kind": "hgb",
@@ -224,12 +230,6 @@ CANDIDATE_LADDER: list[dict] = [
         "params": {"max_leaf_nodes": 127},
     },
     {
-        "name": "hyperparams: shallower trees",
-        "detail": "max_leaf_nodes 31",
-        "kind": "hgb",
-        "params": {"max_leaf_nodes": 31},
-    },
-    {
         "name": "Ridge linear hedonic benchmark",
         "detail": "one-hot categoricals + scaled numerics",
         "kind": "ridge",
@@ -243,6 +243,7 @@ CANDIDATE_LADDER: list[dict] = [
 
 BASE_FEATURE_CONFIG = {
     "project": False,
+    "building": False,
     "amenity": False,
     "comps_area": False,
     "comps_project": False,

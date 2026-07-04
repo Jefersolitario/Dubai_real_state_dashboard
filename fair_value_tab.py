@@ -303,6 +303,11 @@ def render_fair_value_tab(
         "Sorted distressed-first, deepest discount on top. **Spread** = actual price vs "
         "predicted fair value; negative means the deal closed under fair value."
     )
+    building_cols = (
+        [pl.col("BUILDING_NAME_EN").alias("Building")]
+        if "BUILDING_NAME_EN" in view.columns
+        else []
+    )
     table = (
         view.filter(pl.col("below_fair_value"))
         .sort(["distressed", "spread_pct"], descending=[True, False])
@@ -310,6 +315,7 @@ def render_fair_value_tab(
             pl.col("date").cast(pl.Utf8).alias("Date"),
             pl.col("area_display").alias("Area"),
             pl.col("PROJECT_EN").alias("Project"),
+            *building_cols,
             pl.col("bedroom_type").alias("Rooms"),
             (pl.col("ACTUAL_AREA") * SQM_TO_SQFT).round(0).alias("Size (sqft)"),
             pl.col("TRANS_VALUE").round(0).alias("Actual price (AED)"),

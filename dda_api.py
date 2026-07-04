@@ -51,6 +51,7 @@ OPTIONAL_DASHBOARD_COLUMNS = [
     "TOTAL_SELLER",
     "MASTER_PROJECT_EN",
     "PROJECT_EN",
+    "BUILDING_NAME_EN",
     "METER_SALE_PRICE",
 ]
 
@@ -173,6 +174,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "PROJECT_EN",
         "project_name_en",
         "project_en",
+    ],
+    "BUILDING_NAME_EN": [
+        "BUILDING_NAME_EN",
+        "building_name_en",
+        "building_name",
     ],
     "METER_SALE_PRICE": [
         "METER_SALE_PRICE",

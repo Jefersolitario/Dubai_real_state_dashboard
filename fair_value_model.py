@@ -36,6 +36,7 @@ from dashboard_constants import DISTRICT_TIER, SQM_TO_SQFT
 # Feature groups the optimization loop can toggle independently.
 DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "project": True,        # PROJECT_EN / MASTER_PROJECT_EN categoricals
+    "building": False,      # BUILDING_NAME_EN categorical (needs 24-month snapshot)
     "amenity": True,        # nearest metro/mall/landmark, parking, buyer/seller counts
     "comps_area": False,    # trailing 30-day area median PSF (strictly past-only)
     "comps_project": False, # trailing 60-day project median PSF (strictly past-only)
@@ -74,6 +75,7 @@ PASSTHROUGH_COLUMNS = [
     "AREA_EN",
     "PROJECT_EN",
     "MASTER_PROJECT_EN",
+    "BUILDING_NAME_EN",
     "ROOMS_EN",
     "IS_OFFPLAN_EN",
     "TRANS_VALUE",
@@ -88,6 +90,8 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
     categorical = list(CORE_CATEGORICAL)
     if cfg["project"]:
         categorical += PROJECT_CATEGORICAL
+    if cfg["building"]:
+        categorical.append("BUILDING_NAME_EN")
     if cfg["amenity"]:
         numeric += AMENITY_NUMERIC
         categorical += AMENITY_CATEGORICAL
@@ -188,6 +192,9 @@ def feature_engineering(
         df = df.with_columns(comps)
 
     _, categorical = feature_columns(cfg)
+    missing = [c for c in categorical if c not in df.columns]
+    if missing:
+        df = df.with_columns(pl.lit(None, dtype=pl.Utf8).alias(c) for c in missing)
     df = df.with_columns(
         pl.col(c).cast(pl.Utf8).fill_null("UNKNOWN").alias(c) for c in categorical
     )
