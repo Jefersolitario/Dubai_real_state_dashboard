@@ -56,6 +56,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "rel_size": False,               # log_sqft minus past project median log_sqft
     "comp_dispersion": False,        # trailing 60d project PSF std (uncertainty)
     "repeat_sale": False,            # prior sale PSF of the same pseudo-unit
+    "repeat_sale_adj": False,        # prior unit PSF indexed by area market movement since
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -145,6 +146,8 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric.append("project_comp_std")
     if cfg["repeat_sale"]:
         numeric += ["prior_unit_psf", "days_since_prior_sale"]
+    if cfg["repeat_sale_adj"]:
+        numeric.append("prior_unit_psf_adj")
     return numeric, categorical
 
 
@@ -259,7 +262,7 @@ def feature_engineering(
     derived_groups = (
         "comps_area", "comps_project", "comps_project_windows",
         "comps_building", "te_hist", "liquidity", "momentum",
-        "rel_size", "comp_dispersion", "repeat_sale",
+        "rel_size", "comp_dispersion", "repeat_sale", "repeat_sale_adj",
     )
     if any(cfg[g] for g in derived_groups):
         df = df.sort("date")
@@ -307,7 +310,7 @@ def feature_engineering(
         if "_one" in df.columns:
             df = df.drop("_one")
 
-        if cfg["repeat_sale"]:
+        if cfg["repeat_sale"] or cfg["repeat_sale_adj"]:
             # Pseudo-unit: same building + same room label + same area to
             # 0.1 sqm. shift(1) over the date-sorted frame = the unit's most
             # recent PRIOR sale only.
@@ -329,7 +332,22 @@ def feature_engineering(
                     .cast(pl.Float64)
                 )
                 .alias("days_since_prior_sale"),
-            ).drop("_unit")
+            )
+            if cfg["repeat_sale_adj"]:
+                # Index the prior price by area-market movement since the
+                # prior sale: both comp values are strictly past their rows.
+                df = df.with_columns(
+                    past_stat("psf", "30d", "AREA_EN").alias("_area_now")
+                ).with_columns(
+                    pl.col("_area_now").shift(1).over("_unit").alias("_area_then")
+                ).with_columns(
+                    (
+                        pl.col("prior_unit_psf")
+                        * pl.col("_area_now")
+                        / pl.col("_area_then")
+                    ).alias("prior_unit_psf_adj")
+                ).drop("_area_now", "_area_then")
+            df = df.drop("_unit")
 
     _, categorical = feature_columns(cfg)
     missing = [c for c in categorical if c not in df.columns]
@@ -391,13 +409,14 @@ def fit_encoders(
     ``MAX_CATEGORIES - 1`` values get codes 1..N.
     """
     _, categorical = feature_columns(feature_config)
+    max_categories = int((feature_config or {}).get("max_categories", MAX_CATEGORIES))
     encoders: dict[str, dict[str, int]] = {}
     for col in categorical:
         top = (
             df.group_by(col)
             .len()
             .sort(["len", col], descending=[True, False])
-            .head(MAX_CATEGORIES - 1)
+            .head(max_categories - 1)
             .get_column(col)
             .to_list()
         )
