@@ -110,3 +110,49 @@ and holdout (4.32%) indicates minimal winner's curse.
 0.48, building_hist_psf 0.31, MASTER_PROJECT_EN 0.08, log_sqft 0.05,
 rooms_ord 0.05, project_comp_psf 0.04 — repeat-sales and building-level
 history now dominate, exactly as the research report predicted.
+
+
+---
+
+## Campaign 2 addendum (2026-07-05) — 59 rounds, iterations 52–110
+
+**Shipped:** floor features + per-unit-type comps, single model.
+CV MedAPE **4.08%** (was 4.20%); one-shot holdout **4.15%** (was 4.32%);
+P90 15.67% vs 16.01%; false-flag propensity 6.25% vs 6.53%. Forced-sale
+lift unmeasurable (zero forced-sale procedures in the holdout window).
+
+**Accepted (2 of 59):**
+1. `unit_floor + project_meta + rel_floor` (4.20 → 4.14): DLD units-registry
+   join — exact floor where a layout's area is unique in its project (4.6%),
+   floor distribution + balcony area elsewhere (76% coverage). Biggest gains
+   on cold-start sales (error 12% → 6.4%): registry data needs no price history.
+2. `comps_rooms` (4.14 → 4.08): trailing comps within the same unit type
+   (project × rooms 90d, area × rooms 30d) instead of pooled.
+
+**Protocol upgrade mid-campaign** (metric review): every iteration records
+P90 APE and false-flag propensity (share of ordinary sales pushed below −15%
+spread by model error alone); acceptance additionally requires no tail
+worsening (+0.1pp / +0.05pp tolerances). Ship decisions check forced-sale
+lift on untrimmed rows. Flagged deals are now ranked by **signal strength**
+(spread ÷ segment expected error: 4.0% established / 6.5% cold-start).
+
+**Notable rejections:** rent level/yield/density (area × rooms granularity is
+too coarse next to project-level price history); project metadata alone;
+service charges; liquidity/momentum/dispersion variants; hyperparameter
+re-tunes (already at plateau); time-decay weights and short windows (drift
+already captured by trend + trailing comps); official sale index (dataset
+frozen at 2024-05 — dead until DLD refreshes it). Seed-noise floor measured
+at ±0.01–0.02pp, validating the 0.05pp gate.
+
+**Ensemble finding:** 5-seed bagging reached 4.02% CV (accepted on MedAPE)
+but improved false-flag propensity by only 0.04pp — far below the
+pre-registered ≥0.3pp bar for accepting 5× complexity. Declined; the single
+model ships. bag7 = bag5 confirmed diminishing returns.
+
+**Ops note:** shipping this model required rebuilding the GCS snapshot from
+the raw 24-month pull — the normalized snapshot predated the PROJECT_NUMBER
+column and could not back-fill it (99.8% null), which crashed training and
+would have nulled all reference features in the app. Snapshot now carries
+90.1% PROJECT_NUMBER coverage; verified.
+
+**Next lever:** building reviews + comfort sentiment (see phase3_plan.md).

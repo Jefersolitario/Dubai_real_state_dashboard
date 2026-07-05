@@ -1,12 +1,14 @@
 {
- "source": "campaign: 52 attempts, selection <2026-05-01, sequestered holdout gate",
- "generated_at": "2026-07-04T19:55:00",
- "winner": "MAE + leaves 127 + L2 1.0 (features: repeat_sale + te_hist + rel_size)",
- "cv_medape_mean": 0.041978339056537015,
- "cv_medape_std": 0.004496547207891492,
- "cv_r2_mean": 0.9226900290727809,
- "holdout_medape": 0.0432,
- "holdout_note": "one-shot sequestered holdout 2026-05-01+: 4.32% vs 5.91% for prior config",
+ "source": "campaign 2: 59 rounds (iterations 52-110), selection < 2026-05-01, MedAPE gate + tail no-worsening veto, one-shot sequestered holdout",
+ "generated_at": "2026-07-05T13:17:23",
+ "winner": "floor features + per-unit-type comps (single model; bag5 ensemble declined: tail gain 0.04pp < 0.3pp complexity bar)",
+ "cv_medape_mean": 0.04084924931943775,
+ "cv_medape_std": 0.004563006005845571,
+ "cv_r2_mean": 0.9247788393950799,
+ "cv_p90_ape": 0.157481,
+ "cv_flag_prop": 0.049029,
+ "holdout_medape": 0.041536,
+ "holdout_note": "one-shot holdout 2026-05-01+ (17,953 sales): MedAPE 4.15% vs 4.32% shipped, P90 15.67% vs 16.01%, false-flag 6.25% vs 6.53%; forced-sale lift unmeasurable (0 forced-sale procedures in window)",
  "feature_config": {
   "project": true,
   "building": false,
@@ -15,7 +17,11 @@
   "comps_project": true,
   "repeat_sale": true,
   "te_hist": true,
-  "rel_size": true
+  "rel_size": true,
+  "unit_floor": true,
+  "project_meta": true,
+  "rel_floor": true,
+  "comps_rooms": true
  },
  "model_params": {
   "learning_rate": 0.04,
