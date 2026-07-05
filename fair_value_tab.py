@@ -478,8 +478,13 @@ def render_fair_value_tab(
 
     st.markdown("#### Flagged transactions")
     st.caption(
-        "Sorted distressed-first, deepest discount on top. **Spread** = actual price vs "
-        "predicted fair value; negative means the deal closed under fair value."
+        "Sorted distressed-first, strongest signal on top. **Spread** = actual price vs "
+        "predicted fair value; negative means the deal closed under fair value. "
+        "**Signal (×)** = the discount divided by the model's typical error for that "
+        "kind of sale — a −15% spread is ~3.6× the typical error where a project has "
+        "recent comparable sales, but under 1.5× for a cold-start sale (first sales in "
+        "a project in a while), where the same discount is weak evidence. Prefer "
+        "high-× deals."
     )
     building_cols = (
         [pl.col("BUILDING_NAME_EN").alias("Building")]
@@ -488,7 +493,7 @@ def render_fair_value_tab(
     )
     table = (
         view.filter(pl.col("below_fair_value"))
-        .sort(["distressed", "spread_pct"], descending=[True, False])
+        .sort(["distressed", "signal_strength"], descending=[True, True])
         .select(
             pl.col("date").cast(pl.Utf8).alias("Date"),
             pl.col("area_display").alias("Area"),
@@ -499,6 +504,8 @@ def render_fair_value_tab(
             pl.col("TRANS_VALUE").round(0).alias("Actual price (AED)"),
             pl.col("fair_value_aed").round(0).alias("Fair value (AED)"),
             (pl.col("spread_pct") * 100).round(1).alias("Spread (%)"),
+            pl.col("signal_strength").round(1).alias("Signal (×)"),
+            pl.col("cold_start").alias("Cold start"),
             pl.col("distressed").alias("Distressed"),
             pl.col("signals").alias("Signals"),
         )
@@ -548,6 +555,10 @@ def render_fair_value_tab(
             "decision. Caveat: sales in projects with no recent comparable sales "
             "('cold starts', a few % of rows) carry roughly double the error — treat "
             "flags on a project's first sales in a while with extra care.\n\n"
+            "**Signal strength (×)** standardizes the discount by the model's typical "
+            "error for that segment (established projects vs cold starts), so the list "
+            "ranks by *how unusual* a price is, not just how low. The same −15% can be "
+            "strong evidence in a liquid project and noise in a cold start.\n\n"
             "**Distressed candidate** = spread at/below the threshold **and** at least "
             "one corroborating signal that is independent of the model residual: "
             "forced-sale procedure keyword in `PROCEDURE_EN`, illiquid project (fewer "

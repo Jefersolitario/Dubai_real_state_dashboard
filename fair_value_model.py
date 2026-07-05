@@ -690,6 +690,9 @@ def to_matrix(
 # Validation + training
 # ---------------------------------------------------------------------------
 
+FLAG_SPREAD_THRESHOLD = -0.15  # default dashboard flag threshold
+
+
 def _fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     resid = y_true - y_pred  # log(actual) - log(fair value)
     spread = np.expm1(resid)  # actual / fair value - 1
@@ -699,6 +702,12 @@ def _fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
         "medape": float(np.median(np.abs(spread))),
         "mae_log": float(np.mean(np.abs(resid))),
         "r2": 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan"),
+        # Tail metrics: flags live in the error tail, which the median cannot
+        # see. p90_ape = worst-decile error; flag_prop = share of ordinary
+        # validation sales the model's error alone pushes below the flag
+        # threshold (one-sided: overestimated fair value = false bargain).
+        "p90_ape": float(np.percentile(np.abs(spread), 90)),
+        "flag_prop": float(np.mean(spread <= FLAG_SPREAD_THRESHOLD)),
     }
 
 
@@ -746,10 +755,11 @@ def summarize_folds(folds: list[dict[str, float]], n_rows: int, n_splits: int) -
         "n_rows": n_rows,
         "folds": folds,
     }
-    for key in ("medape", "mae_log", "r2"):
-        values = [f[key] for f in folds]
-        summary[f"{key}_mean"] = float(np.mean(values))
-        summary[f"{key}_std"] = float(np.std(values))
+    for key in ("medape", "mae_log", "r2", "p90_ape", "flag_prop"):
+        values = [f[key] for f in folds if key in f]
+        if values:
+            summary[f"{key}_mean"] = float(np.mean(values))
+            summary[f"{key}_std"] = float(np.std(values))
     return summary
 
 
@@ -930,11 +940,22 @@ def score_transactions(result: FairValueResult, df: pl.DataFrame) -> pl.DataFram
     )
 
 
+# Expected model error by comparable-data segment, used to standardize the
+# spread into a signal strength. Sales in projects with recent comparable
+# sales carry ~4% typical error; cold-start sales (no trailing project comp)
+# carry roughly 2-3x that, so the same raw discount is much weaker evidence.
+# Overridden by bundle metrics when the shipped model records segment errors.
+EXPECTED_ERR_ESTABLISHED = 0.042
+EXPECTED_ERR_COLD_START = 0.11
+
+
 def flag_distress(
     scored: pl.DataFrame,
     spread_threshold: float = -0.15,
     deep_discount: float = -0.25,
     min_project_txns: int = 8,
+    expected_err_established: float = EXPECTED_ERR_ESTABLISHED,
+    expected_err_cold: float = EXPECTED_ERR_COLD_START,
 ) -> pl.DataFrame:
     """Flag below-fair-value rows and corroborated distressed-asset candidates.
 
@@ -944,6 +965,11 @@ def flag_distress(
     a lone model miss, however large, is never enough. ``sig_deep_discount``
     is annotated for display but deliberately does not count, since it is
     derived from the same residual as ``below_fair_value``.
+
+    ``signal_strength`` standardizes the discount by the model's expected
+    error for the row's segment (established vs cold-start): a -15% spread
+    is ~3.6x the typical error where comps are rich, but barely 1.4x for a
+    cold-start sale — the same discount, very different evidence.
     """
     procedure = (
         pl.col("PROCEDURE_EN").cast(pl.Utf8).str.contains(DISTRESS_PROCEDURE_PATTERN).fill_null(False)
@@ -955,12 +981,24 @@ def flag_distress(
         if "total_seller" in scored.columns
         else pl.lit(False)
     )
+    cold = (
+        pl.col("project_comp_psf").is_null()
+        if "project_comp_psf" in scored.columns
+        else pl.lit(False)
+    )
+    expected_err = (
+        pl.when(cold)
+        .then(pl.lit(expected_err_cold))
+        .otherwise(pl.lit(expected_err_established))
+    )
     df = scored.with_columns(
         (pl.col("spread_pct") <= spread_threshold).alias("below_fair_value"),
         procedure.alias("sig_procedure"),
         (pl.col("spread_pct") <= deep_discount).alias("sig_deep_discount"),
         (pl.len().over("PROJECT_EN") < min_project_txns).alias("sig_illiquid_project"),
         multi_seller.alias("sig_multi_seller"),
+        (-pl.col("spread_pct") / expected_err).alias("signal_strength"),
+        cold.alias("cold_start"),
     )
     # Only residual-independent signals corroborate distress.
     corroborating = ["sig_procedure", "sig_illiquid_project", "sig_multi_seller"]
