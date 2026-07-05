@@ -317,6 +317,7 @@ def feature_engineering(
         df = df.sort("date")
 
         def past_stat(value: str, window: str, group: str, stat: str = "median") -> pl.Expr:
+            """Strictly-past rolling ``stat`` of ``value`` per ``group`` (closed left)."""
             rolled = getattr(pl.col(value), f"rolling_{stat}_by")(
                 "date", window_size=window, closed="left"
             ).over(group)
@@ -455,21 +456,21 @@ def feature_engineering(
             .unique("project_number", keep="first")
         )
         if cfg["project_meta"]:
-            bagg = reference["buildings_agg"].select(
+            buildings_per_project = reference["buildings_agg"].select(
                 pl.col("project_id").cast(pl.Int64, strict=False),
                 pl.col("project_max_floors").cast(pl.Float64, strict=False),
             ).unique("project_id")
-            lookup = lookup.join(bagg, on="project_id", how="left")
+            lookup = lookup.join(buildings_per_project, on="project_id", how="left")
         if cfg["service_charge"]:
-            sc = reference["service_charges"].select(
+            service_charge_lookup = reference["service_charges"].select(
                 pl.col("project_id").cast(pl.Int64, strict=False),
                 pl.col("service_cost").cast(pl.Float64, strict=False),
             ).unique("project_id")
-            lookup = lookup.join(sc, on="project_id", how="left")
+            lookup = lookup.join(service_charge_lookup, on="project_id", how="left")
         df = (
-            df.with_columns(pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_pn"))
-            .join(lookup.rename({"project_number": "_pn"}).drop("project_id"), on="_pn", how="left")
-            .drop("_pn")
+            df.with_columns(pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_project_number"))
+            .join(lookup.rename({"project_number": "_project_number"}).drop("project_id"), on="_project_number", how="left")
+            .drop("_project_number")
         )
         if cfg["project_meta"]:
             df = df.with_columns(
@@ -495,7 +496,7 @@ def feature_engineering(
         )
         grid_cols = [
             pl.col("AREA_EN").cast(pl.Utf8),
-            pl.col("rooms_band").cast(pl.Utf8).alias("_band"),
+            pl.col("rooms_band").cast(pl.Utf8).alias("_rooms_band"),
             pl.col("week").cast(pl.Date),
             pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
         ]
@@ -506,17 +507,17 @@ def feature_engineering(
         grid = (
             reference["rent_index"]
             .select(grid_cols)
-            .drop_nulls(["AREA_EN", "_band", "week"])
+            .drop_nulls(["AREA_EN", "_rooms_band", "week"])
             .sort("week")
         )
-        df = df.with_columns(band.alias("_band")).sort("date")
+        df = df.with_columns(band.alias("_rooms_band")).sort("date")
         df = df.join_asof(
             grid,
             left_on="date",
             right_on="week",
-            by=["AREA_EN", "_band"],
+            by=["AREA_EN", "_rooms_band"],
             strategy="backward",
-        ).drop("_band", "week")
+        ).drop("_rooms_band", "week")
         if cfg["rent_yield"]:
             denom_cols = [c for c in ("project_comp_psf", "area_comp_psf") if c in df.columns]
             if denom_cols:
@@ -536,11 +537,11 @@ def feature_engineering(
         bridge = (
             reference["projects"]
             .select(
-                pl.col("project_number").cast(pl.Int64, strict=False).alias("_pn"),
-                pl.col("project_id").cast(pl.Int64, strict=False).alias("_pid"),
+                pl.col("project_number").cast(pl.Int64, strict=False).alias("_project_number"),
+                pl.col("project_id").cast(pl.Int64, strict=False).alias("_project_id"),
             )
             .drop_nulls()
-            .unique("_pn")
+            .unique("_project_number")
         )
         # Area-key precision is configurable: 2dp = strict (fewer, surer
         # matches), 1dp/0dp = looser (more matches, blurrier layouts).
@@ -548,16 +549,16 @@ def feature_engineering(
         units = (
             reference["units"]
             .select(
-                pl.col("project_id").cast(pl.Int64, strict=False).alias("_pid"),
+                pl.col("project_id").cast(pl.Int64, strict=False).alias("_project_id"),
                 pl.col("floor_num").cast(pl.Float64, strict=False),
                 pl.col("actual_area").cast(pl.Float64, strict=False)
-                .round(akey_round).alias("_akey"),
+                .round(akey_round).alias("_area_key"),
                 pl.col("unit_balcony_area").cast(pl.Float64, strict=False),
             )
-            .drop_nulls(["_pid", "_akey"])
+            .drop_nulls(["_project_id", "_area_key"])
         )
         layouts = (
-            units.group_by("_pid", "_akey")
+            units.group_by("_project_id", "_area_key")
             .agg(
                 pl.len().cast(pl.Float64).alias("layout_units"),
                 pl.col("floor_num").mean().alias("layout_floor_mean"),
@@ -574,12 +575,12 @@ def feature_engineering(
         )
         df = (
             df.with_columns(
-                pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_pn"),
-                pl.col("ACTUAL_AREA").cast(pl.Float64).round(akey_round).alias("_akey"),
+                pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_project_number"),
+                pl.col("ACTUAL_AREA").cast(pl.Float64).round(akey_round).alias("_area_key"),
             )
-            .join(bridge, on="_pn", how="left")
-            .join(layouts, on=["_pid", "_akey"], how="left")
-            .drop("_pn", "_pid", "_akey")
+            .join(bridge, on="_project_number", how="left")
+            .join(layouts, on=["_project_id", "_area_key"], how="left")
+            .drop("_project_number", "_project_id", "_area_key")
         )
 
     if cfg["rel_floor"]:
@@ -704,6 +705,7 @@ FLAG_SPREAD_THRESHOLD = -0.15  # default dashboard flag threshold
 
 
 def _fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """Per-fold accuracy + tail metrics from log-price truths and predictions."""
     resid = y_true - y_pred  # log(actual) - log(fair value)
     spread = np.expm1(resid)  # actual / fair value - 1
     ss_res = float(np.sum(resid**2))
@@ -721,7 +723,10 @@ def _fold_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
     }
 
 
-def _make_model(model_params: dict | None, categorical_idx: list[int], random_state: int):
+def _make_model(
+    model_params: dict | None, categorical_idx: list[int], random_state: int
+) -> HistGradientBoostingRegressor:
+    """Configured HGB regressor (defaults merged under ``model_params``)."""
     params = {**DEFAULT_MODEL_PARAMS, **(model_params or {})}
     return HistGradientBoostingRegressor(
         categorical_features=categorical_idx,

@@ -273,6 +273,7 @@ def load_dda_config(
 
 
 def request_access_token(config: DDAConfig) -> str:
+    """OAuth bearer token via whichever endpoint the config prefers."""
     _ensure_config(config)
     token_requesters = (
         (_request_oauth_access_token,)
@@ -430,6 +431,7 @@ def _request_page_with_retry(
 
 
 def months_before(end: date, months: int) -> date:
+    """Calendar-exact date ``months`` before ``end`` (clamped to month length)."""
     if months < 0:
         raise ValueError("months must be non-negative")
 
@@ -441,6 +443,7 @@ def months_before(end: date, months: int) -> date:
 
 
 def last_months_date_range(months: int = DEFAULT_LOOKBACK_MONTHS) -> tuple[date, date]:
+    """(start, today) spanning the trailing ``months`` calendar months."""
     end = date.today()
     return months_before(end, months), end
 
@@ -481,6 +484,12 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pl.DataFrame:
 
 
 def normalize_dld_transactions(data: list[dict[str, Any]] | pl.DataFrame) -> pl.DataFrame:
+    """Raw API records/frame -> the canonical 24-column dashboard schema.
+
+    Maps raw column aliases onto the dashboard names, backfills missing
+    optional columns as nulls, normalizes dtypes, and projects to the
+    canonical column set (see project_dashboard_columns).
+    """
     if isinstance(data, pl.DataFrame):
         df = data.clone()
     elif data:
@@ -509,6 +518,7 @@ def normalize_dld_transactions(data: list[dict[str, Any]] | pl.DataFrame) -> pl.
 
 
 def infer_column_mapping(columns: list[str]) -> dict[str, list[str]]:
+    """{dashboard column: [raw source columns]} for the given raw header."""
     lookup: dict[str, list[str]] = {}
     for column in columns:
         lookup.setdefault(_canonical_column(column), []).append(column)
@@ -609,6 +619,7 @@ def _ensure_config(config: DDAConfig) -> None:
 
 
 def _raise_for_status(response: requests.Response, context: str) -> None:
+    """Raise DDAApiError with the response detail on non-2xx statuses."""
     if response.ok:
         return
     try:
@@ -619,6 +630,7 @@ def _raise_for_status(response: requests.Response, context: str) -> None:
 
 
 def _extract_records(payload: Any) -> list[dict[str, Any]]:
+    """Find the records list inside the gateway's nested response shapes."""
     if isinstance(payload, list):
         return [record for record in payload if isinstance(record, dict)]
 
@@ -653,6 +665,7 @@ def project_dashboard_columns(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _add_missing_optional_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Add any absent optional dashboard column as a null column."""
     expressions = []
     for column in OPTIONAL_DASHBOARD_COLUMNS:
         if column not in df.columns:
@@ -663,6 +676,7 @@ def _add_missing_optional_columns(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _normalize_types(df: pl.DataFrame) -> pl.DataFrame:
+    """Cast numeric/text dashboard columns to their canonical dtypes."""
     expressions = []
 
     for column in NUMERIC_COLUMNS:

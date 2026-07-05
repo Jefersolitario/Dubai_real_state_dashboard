@@ -5,6 +5,7 @@ from datetime import UTC, date, datetime
 import polars as pl
 
 from dda_api import (
+    DDAConfig,
     DEFAULT_LOOKBACK_MONTHS,
     DEFAULT_MAX_RECORDS,
     DEFAULT_PAGE_SIZE,
@@ -30,6 +31,7 @@ IGNORED_DEDUPE_COLUMNS = {"load_timestamp"}
 
 
 def main() -> int:
+    """CLI entry point: incremental (default) or --full-refresh snapshot update."""
     parser = argparse.ArgumentParser(
         description="Incrementally update the DLD transactions GCS Parquet snapshot."
     )
@@ -92,7 +94,8 @@ def main() -> int:
     return 0
 
 
-def load_existing_snapshot(secrets, bucket_name: str, object_name: str) -> pl.DataFrame | None:
+def load_existing_snapshot(secrets: dict, bucket_name: str, object_name: str) -> pl.DataFrame | None:
+    """Current GCS snapshot as a normalized frame, or None when absent."""
     try:
         df, blob = read_parquet_object(secrets, bucket_name, object_name)
     except FileNotFoundError:
@@ -112,7 +115,8 @@ def load_existing_snapshot(secrets, bucket_name: str, object_name: str) -> pl.Da
     return df
 
 
-def api_window(args, existing: pl.DataFrame | None) -> tuple[date | None, date | None]:
+def api_window(args: argparse.Namespace, existing: pl.DataFrame | None) -> tuple[date | None, date | None]:
+    """(start, end) dates to fetch from the API for this run."""
     if args.start_date or args.end_date:
         return args.start_date, args.end_date or date.today()
 
@@ -123,11 +127,12 @@ def api_window(args, existing: pl.DataFrame | None) -> tuple[date | None, date |
 
 
 def fetch_api_snapshot(
-    config,
+    config: DDAConfig,
     start_date: date | None,
     end_date: date | None,
     limit: int,
 ) -> pl.DataFrame:
+    """Fetch and normalize DLD transactions for the requested window."""
     if start_date and end_date and start_date > end_date:
         print(f"Skipping API fetch; start date {start_date} is after end date {end_date}.")
         return pl.DataFrame()
@@ -152,6 +157,7 @@ def merge_snapshots(
     incoming: pl.DataFrame,
     full_refresh: bool,
 ) -> tuple[pl.DataFrame, dict[str, int | str]]:
+    """Combine existing + fetched rows: dedupe, stable-sort, report stats."""
     if full_refresh or existing is None:
         final = dedupe_snapshot(incoming)
         return stable_sort(final), {
@@ -186,7 +192,7 @@ def merge_snapshots(
     }
 
 
-def write_snapshot(secrets, bucket_name: str, object_name: str, df: pl.DataFrame, stats: dict) -> None:
+def write_snapshot(secrets: dict, bucket_name: str, object_name: str, df: pl.DataFrame, stats: dict) -> None:
     validation = validate_normalized_columns(df)
     if validation["missing_required"]:
         raise ValueError("Missing required columns: " + ", ".join(validation["missing_required"]))
@@ -223,6 +229,7 @@ def write_snapshot(secrets, bucket_name: str, object_name: str, df: pl.DataFrame
 
 
 def validate_snapshot(label: str, df: pl.DataFrame) -> pl.DataFrame:
+    """Fail fast when required dashboard columns are missing; returns df."""
     validation = validate_normalized_columns(df)
     if df.is_empty():
         raise ValueError(f"{label} is empty.")
@@ -234,11 +241,13 @@ def validate_snapshot(label: str, df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def parse_date(value: str):
+def parse_date(value: str) -> date:
+    """YYYY-MM-DD string to date (argparse converter)."""
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
 def stable_sort(df: pl.DataFrame) -> pl.DataFrame:
+    """Deterministic ordering (date, then keys) so rewrites diff cleanly."""
     columns = ["INSTANCE_DATE"]
     if "TRANSACTION_NUMBER" in df.columns:
         columns.append("TRANSACTION_NUMBER")
@@ -246,12 +255,14 @@ def stable_sort(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def dedupe_snapshot(df: pl.DataFrame) -> pl.DataFrame:
+    """Drop exact duplicate rows over the canonical column set."""
     if df.is_empty():
         return df
     return df.unique(subset=dedupe_key_columns(df), keep="last", maintain_order=True)
 
 
 def dedupe_key_columns(df: pl.DataFrame) -> list[str]:
+    """Columns that participate in duplicate detection (all present ones)."""
     return [
         column
         for column in df.columns
@@ -260,6 +271,7 @@ def dedupe_key_columns(df: pl.DataFrame) -> list[str]:
 
 
 def count_new_rows(existing: pl.DataFrame, final: pl.DataFrame) -> int:
+    """How many rows of ``final`` were not already in ``existing``."""
     if existing.is_empty():
         return final.height
 
@@ -270,11 +282,13 @@ def count_new_rows(existing: pl.DataFrame, final: pl.DataFrame) -> int:
 
 
 def key_hashes(df: pl.DataFrame, key_columns: list[str]) -> pl.DataFrame:
+    """One hash per row over ``key_columns`` for set comparisons."""
     aligned_columns = [column for column in key_columns if column in df.columns]
     return pl.DataFrame({"_key": df.select(aligned_columns).hash_rows()}).unique()
 
 
 def date_bound(df: pl.DataFrame, bound: str) -> str:
+    """Min/max INSTANCE_DATE (YYYY-MM-DD) for metadata and log lines."""
     if "INSTANCE_DATE" not in df.columns or df.is_empty():
         return ""
     expression = pl.col("INSTANCE_DATE").min() if bound == "min" else pl.col("INSTANCE_DATE").max()
@@ -283,6 +297,7 @@ def date_bound(df: pl.DataFrame, bound: str) -> str:
 
 
 def verify_readback(expected: pl.DataFrame, actual: pl.DataFrame) -> None:
+    """Raise unless the re-downloaded snapshot matches what was written."""
     if actual.height != expected.height:
         raise ValueError(f"Row count mismatch: expected {expected.height}, got {actual.height}")
     if actual.columns != expected.columns:

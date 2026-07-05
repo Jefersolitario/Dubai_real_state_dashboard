@@ -22,12 +22,13 @@ import io
 import sys
 import time
 from dataclasses import replace
+from typing import Callable
 from datetime import date
 
 import polars as pl
 
 from dashboard_constants import SQM_TO_SQFT
-from dda_api import fetch_dataset_records, load_dda_config
+from dda_api import DDAConfig, fetch_dataset_records, load_dda_config
 from gcs_storage import dataframe_to_parquet_bytes, gcs_client, load_local_secrets, setting
 
 REFERENCE_PREFIX = "dld_reference"
@@ -40,8 +41,9 @@ RENT_ANNUAL_MIN, RENT_ANNUAL_MAX = 5_000, 5_000_000
 RENT_AREA_MIN, RENT_AREA_MAX = 15.0, 1_000.0  # sqm
 
 
-def fetch_dataset(config, dataset: str, params: dict | None = None,
+def fetch_dataset(config: "DDAConfig", dataset: str, params: dict | None = None,
                   max_records: int = 5_000_000) -> pl.DataFrame:
+    """Fetch one gateway dataset into a frame (schema inferred over all rows)."""
     cfg = replace(config, dataset=dataset)
     t0 = time.time()
     records = fetch_dataset_records(cfg, params=params or {}, max_records=max_records)
@@ -52,7 +54,8 @@ def fetch_dataset(config, dataset: str, params: dict | None = None,
     return pl.DataFrame(records, infer_schema_length=None)
 
 
-def upload(secrets, name: str, df: pl.DataFrame) -> None:
+def upload(secrets: dict, name: str, df: pl.DataFrame) -> None:
+    """Write a reference frame to gs://<bucket>/dld_reference/<name> and verify readback."""
     bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
     object_name = f"{REFERENCE_PREFIX}/{name}"
     blob = gcs_client(secrets).bucket(bucket_name).blob(object_name)
@@ -66,25 +69,27 @@ def upload(secrets, name: str, df: pl.DataFrame) -> None:
     print(f"uploaded gs://{bucket_name}/{object_name} ({df.height:,} rows, verified)", flush=True)
 
 
-def pull_projects(config, secrets) -> None:
-    proj = fetch_dataset(config, "dld_projects-open-api")
-    dev = fetch_dataset(config, "dld_developers-open-api")
-    dev_names = dev.select(
+def pull_projects(config: "DDAConfig", secrets: dict) -> None:
+    """Publish the full projects table, with developer names joined in."""
+    projects_df = fetch_dataset(config, "dld_projects-open-api")
+    developers_df = fetch_dataset(config, "dld_developers-open-api")
+    developer_names = developers_df.select(
         pl.col("developer_id").cast(pl.Int64, strict=False),
         pl.col("developer_name_en").alias("developer_name_lkp"),
     ).unique("developer_id")
-    proj = proj.with_columns(
+    projects_df = projects_df.with_columns(
         pl.col("developer_id").cast(pl.Int64, strict=False)
-    ).join(dev_names, on="developer_id", how="left").with_columns(
+    ).join(developer_names, on="developer_id", how="left").with_columns(
         pl.coalesce(pl.col("developer_name"), pl.col("developer_name_lkp")).alias("developer_name")
     ).drop("developer_name_lkp")
-    upload(secrets, "projects.parquet", proj)
+    upload(secrets, "projects.parquet", projects_df)
 
 
-def pull_buildings(config, secrets) -> None:
-    b = fetch_dataset(config, "dld_buildings-open-api", max_records=1_000_000)
+def pull_buildings(config: "DDAConfig", secrets: dict) -> None:
+    """Publish per-project building aggregates (max/mean floors, flats, count)."""
+    buildings_df = fetch_dataset(config, "dld_buildings-open-api", max_records=1_000_000)
     agg = (
-        b.with_columns(
+        buildings_df.with_columns(
             pl.col("floors").cast(pl.Float64, strict=False),
             pl.col("flats").cast(pl.Float64, strict=False),
         )
@@ -100,10 +105,11 @@ def pull_buildings(config, secrets) -> None:
     upload(secrets, "project_buildings_agg.parquet", agg)
 
 
-def pull_service_charges(config, secrets) -> None:
-    s = fetch_dataset(config, "dld_oa_service_charges-open-api", max_records=1_000_000)
+def pull_service_charges(config: "DDAConfig", secrets: dict) -> None:
+    """Publish the latest budget-year total service cost per project."""
+    charges_df = fetch_dataset(config, "dld_oa_service_charges-open-api", max_records=1_000_000)
     latest = (
-        s.with_columns(
+        charges_df.with_columns(
             pl.col("budget_year").cast(pl.Int64, strict=False),
             pl.col("service_cost").cast(pl.Float64, strict=False),
         )
@@ -128,8 +134,9 @@ UNITS_ROOMS_CHUNKS = [
 ]
 
 
-def fetch_chunked(config, dataset: str, param_chunks: list[tuple[str, dict]],
-                  max_records: int, transform=None) -> pl.DataFrame:
+def fetch_chunked(config: "DDAConfig", dataset: str,
+                  param_chunks: list[tuple[str, dict]], max_records: int,
+                  transform: "Callable[[pl.DataFrame], pl.DataFrame] | None" = None) -> pl.DataFrame:
     """Fetch a long pull as labelled chunks with a chunk-level retry.
 
     ``transform`` (chunk DataFrame -> DataFrame) is applied per chunk before
@@ -177,6 +184,7 @@ def _floor_number_expr() -> pl.Expr:
 
 
 def _slim_units(chunk: pl.DataFrame) -> pl.DataFrame:
+    """Reduce a raw units chunk to the 6 columns the model join needs."""
     return chunk.select(
         pl.col("project_id").cast(pl.Int64, strict=False),
         pl.col("building_number").cast(pl.Utf8),
@@ -187,7 +195,8 @@ def _slim_units(chunk: pl.DataFrame) -> pl.DataFrame:
     ).drop_nulls(["project_id", "actual_area"])
 
 
-def pull_units(config, secrets) -> None:
+def pull_units(config: "DDAConfig", secrets: dict) -> None:
+    """Publish the slim flats registry (floor, exact area, balcony), chunked by rooms."""
     chunks = [
         (rooms, {"filter": f"property_sub_type_en='Flat' AND rooms_en='{rooms}'"})
         for rooms in UNITS_ROOMS_CHUNKS
@@ -199,10 +208,11 @@ def pull_units(config, secrets) -> None:
     upload(secrets, "units_slim.parquet", slim)
 
 
-def pull_sale_index(config, secrets) -> None:
-    s = fetch_dataset(config, "dld_residential_sale_index-open-api", max_records=10_000)
-    idx = (
-        s.select(
+def pull_sale_index(config: "DDAConfig", secrets: dict) -> None:
+    """Publish the official monthly flat sale index (frozen at 2024-05 upstream)."""
+    index_df = fetch_dataset(config, "dld_residential_sale_index-open-api", max_records=10_000)
+    monthly = (
+        index_df.select(
             pl.col("first_date_of_month").cast(pl.Utf8).str.slice(0, 10)
             .str.to_date("%Y-%m-%d", strict=False).alias("month"),
             pl.col("flat_monthly_price_index").cast(pl.Float64, strict=False)
@@ -214,7 +224,7 @@ def pull_sale_index(config, secrets) -> None:
         .unique("month")
         .sort("month")
     )
-    upload(secrets, "sale_index.parquet", idx)
+    upload(secrets, "sale_index.parquet", monthly)
 
 
 ROOMS_BAND_MAP = {
@@ -227,6 +237,7 @@ ROOMS_BAND_MAP = {
 
 
 def rooms_band_expr() -> pl.Expr:
+    """Map Ejari sub-type text to the dashboard rooms bands (Studio..4BR+)."""
     sub = pl.col("ejari_property_sub_type_en").cast(pl.Utf8).str.to_lowercase()
     expr = pl.lit(None, dtype=pl.Utf8)
     for needle, band in reversed(list(ROOMS_BAND_MAP.items())):
@@ -249,6 +260,7 @@ def _month_starts(start: date, end: date) -> list[date]:
 
 
 def _slim_rents(chunk: pl.DataFrame) -> pl.DataFrame:
+    """Reduce a raw Ejari chunk to the columns the weekly rent grid needs."""
     return chunk.select(
         pl.col("contract_start_date").cast(pl.Utf8).str.slice(0, 10)
         .str.to_date("%Y-%m-%d", strict=False).alias("start"),
@@ -261,7 +273,8 @@ def _slim_rents(chunk: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def pull_rents(config, secrets) -> None:
+def pull_rents(config: "DDAConfig", secrets: dict) -> None:
+    """Publish the weekly area x rooms-band trailing-180d rent-PSF grid."""
     # Monthly chunks: a ~11M-row pull runs for hours, and one unrecoverable
     # gateway error mid-pagination used to discard everything fetched so far.
     # Per-chunk the page retry still applies; a failed chunk is retried once
@@ -329,6 +342,7 @@ def pull_rents(config, secrets) -> None:
 
 
 def main() -> int:
+    """CLI entry point: pull the datasets selected via --only."""
     parser = argparse.ArgumentParser(description=__doc__)
     # saleindex is opt-in only: the gateway dataset is frozen at 2024-05 and
     # no model feature consumes it — no point spending a pull on it by default.

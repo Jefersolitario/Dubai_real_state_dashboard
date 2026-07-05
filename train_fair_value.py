@@ -42,7 +42,8 @@ from fair_value_model import (
 from store_dld_transactions_gcs import dedupe_snapshot
 
 
-def load_snapshot(args) -> tuple[pl.DataFrame, str]:
+def load_snapshot(args: argparse.Namespace) -> tuple[pl.DataFrame, str]:
+    """Normalized, deduped snapshot from GCS or a local parquet, plus its source."""
     if args.parquet:
         raw = pl.read_parquet(args.parquet)
         source = args.parquet
@@ -80,6 +81,7 @@ def config_metrics() -> dict:
 
 
 def main() -> int:
+    """Train the shipping config and publish the verified bundle to GCS."""
     parser = argparse.ArgumentParser(
         description="Train the fair-value model and publish the inference bundle."
     )

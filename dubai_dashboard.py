@@ -26,6 +26,7 @@ import streamlit as st
 
 from dda_api import (
     DDAApiError,
+    DDAConfig,
     DEFAULT_MAX_RECORDS,
     DEFAULT_PAGE_SIZE,
     DEFAULT_LOOKBACK_MONTHS,
@@ -91,6 +92,7 @@ COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
 # ---------------------------------------------------------------------------
 
 def _source_raw_transactions() -> pl.DataFrame:
+    """The session's loaded transactions (empty typed frame before load)."""
     api_df = st.session_state.get("api_raw_df")
     if isinstance(api_df, pl.DataFrame) and not api_df.is_empty():
         return api_df
@@ -98,6 +100,7 @@ def _source_raw_transactions() -> pl.DataFrame:
 
 
 def _flat_transactions(trans_type: str) -> pl.DataFrame:
+    """Apartment (flat) rows only, filtered to the transaction type."""
     return _trans_type_filter(
         _source_raw_transactions().filter(
             pl.col("PROP_SB_TYPE_EN")
@@ -537,12 +540,13 @@ def _streamlit_secrets() -> dict:
 
 
 def _load_api_transactions(
-    config,
+    config: DDAConfig,
     start: date,
     end: date,
     page_size: int,
     max_records: int,
 ) -> tuple[pl.DataFrame, dict]:
+    """Fetch a window of transactions straight from the DDA API."""
     params = build_dld_transactions_params(start, end, order_desc=True)
     records = fetch_dataset_records(
         config,
@@ -570,6 +574,7 @@ def _load_gcs_transactions(
     bucket_name: str,
     object_name: str,
 ) -> tuple[pl.DataFrame, dict]:
+    """Load + normalize the GCS snapshot; returns (frame, metadata) or None."""
     raw_df, blob = read_parquet_object(secrets, bucket_name, object_name)
     normalized = normalize_dld_transactions(raw_df)
     validation = validate_normalized_columns(normalized)
@@ -625,7 +630,8 @@ def _load_gcs_transactions(
     }
 
 
-def _probe_api_columns(config, limit: int = 10) -> tuple[pl.DataFrame, dict]:
+def _probe_api_columns(config: DDAConfig, limit: int = 10) -> tuple[pl.DataFrame, dict]:
+    """Small raw fetch to report the API's current column vocabulary."""
     records = fetch_dataset_records(
         config,
         params={"order_by": "instance_date", "order_dir": "desc"},
@@ -642,6 +648,7 @@ def _probe_api_columns(config, limit: int = 10) -> tuple[pl.DataFrame, dict]:
 
 
 def _date_bounds_from_transactions(df: pl.DataFrame) -> tuple[date, date] | None:
+    """(min, max) INSTANCE_DATE in the frame, or None when empty."""
     if df.is_empty() or "INSTANCE_DATE" not in df.columns:
         return None
 
@@ -666,6 +673,7 @@ def _missing_date_windows(
     requested_start: date,
     requested_end: date,
 ) -> list[tuple[date, date]]:
+    """Date spans the loaded snapshot does not cover for the request."""
     bounds = _date_bounds_from_transactions(df)
     if not bounds:
         return [(requested_start, requested_end)]
@@ -686,6 +694,7 @@ def _write_gcs_snapshot(
     df: pl.DataFrame,
     stats: dict[str, int | str],
 ) -> tuple[pl.DataFrame, dict]:
+    """Upload the merged snapshot and verify the readback matches."""
     bounds = _date_bounds_from_transactions(df)
     blob = gcs_client(secrets).bucket(bucket_name).blob(object_name)
     blob.metadata = {
@@ -721,6 +730,7 @@ def _ensure_transactions_cover_range(
     requested_start: date,
     requested_end: date,
 ) -> tuple[pl.DataFrame, dict, dict | None]:
+    """Top up the snapshot from the API when the picker exceeds coverage."""
     windows = _missing_date_windows(df, requested_start, requested_end)
     if not windows:
         return df, meta, None
@@ -823,6 +833,7 @@ def _ensure_transactions_cover_range(
     ttl=60 * 60,
 )
 def load_production_transactions() -> tuple[pl.DataFrame, dict]:
+    """Session data loader: GCS snapshot first, DDA API fallback (cached)."""
     secrets = _streamlit_secrets()
     bucket_name, object_name = configured_snapshot(secrets)
     gcs_error: Exception | None = None
@@ -875,6 +886,7 @@ def load_production_transactions() -> tuple[pl.DataFrame, dict]:
 
 
 def _loaded_date_bounds() -> tuple[date, date]:
+    """Date coverage of the currently loaded transactions."""
     api_df = st.session_state.get("api_raw_df")
     if isinstance(api_df, pl.DataFrame):
         bounds = _date_bounds_from_transactions(api_df)
@@ -884,6 +896,7 @@ def _loaded_date_bounds() -> tuple[date, date]:
 
 
 def _date_picker_bounds() -> tuple[date, date, date]:
+    """(min, max, default_end) limits for the sidebar date picker."""
     loaded_start, loaded_end = _loaded_date_bounds()
     default_start, today = last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
     return min(loaded_start, default_start), today, today
@@ -894,6 +907,7 @@ def _date_picker_bounds() -> tuple[date, date, date]:
 # ---------------------------------------------------------------------------
 
 def _trans_type_filter(df: pl.DataFrame, trans_type: str) -> pl.DataFrame:
+    """Filter rows to Sale / Mortgage / Off-Plan; 'All' passes through."""
     if trans_type == "Sale":
         return df.filter(pl.col("GROUP_EN").cast(pl.Utf8).str.to_lowercase() == "sales")
     if trans_type == "Mortgage":
@@ -948,6 +962,7 @@ def apply_filters(
     start: date,
     end: date,
 ) -> pl.DataFrame:
+    """Narrow the aggregated frame to the sidebar selections."""
     mask = (
         pl.col("neighborhood").is_in(neighborhoods)
         & (pl.col("date") >= start)
@@ -963,6 +978,7 @@ def apply_filters(
 # ---------------------------------------------------------------------------
 
 def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
+    """Neighbourhood line chart with the shared layout defaults."""
     fig   = go.Figure()
     dash_ = {"Studio": "dot", "1BR": "solid", "2BR": "dash", "3BR": "dashdot"}
     nbhds = df["neighborhood"].unique().to_list()
@@ -1016,6 +1032,7 @@ def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
 
 
 def bar_chart(df: pl.DataFrame, latest_date: date) -> go.Figure:
+    """Neighbourhood bar chart with the shared layout defaults."""
     fig     = go.Figure()
     latest  = df.filter(pl.col("date") == latest_date)
     br_types = latest["bedroom_type"].unique().drop_nulls().sort().to_list()
@@ -1405,15 +1422,15 @@ def _render_market_overview(
     st.divider()
 
     # ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
-    DW = generate_dubai_wide_data(trans_type, data_version, start_date, end_date)
-    WK = generate_weekly_data(trans_type, data_version, start_date, end_date)
-    AREA_CHG = generate_area_weekly_change(trans_type, data_version, start_date, end_date)
+    DUBAI_WIDE = generate_dubai_wide_data(trans_type, data_version, start_date, end_date)
+    WEEKLY = generate_weekly_data(trans_type, data_version, start_date, end_date)
+    AREA_CHANGES = generate_area_weekly_change(trans_type, data_version, start_date, end_date)
 
     # KPI cards for Dubai-wide price momentum
-    first_wk = WK.row(0, named=True)
-    last_wk = WK.row(-1, named=True)
+    first_wk = WEEKLY.row(0, named=True)
+    last_wk = WEEKLY.row(-1, named=True)
     total_med_chg = (last_wk["median"] - first_wk["median"]) / first_wk["median"] * 100
-    peak_med = WK["median"].max()
+    peak_med = WEEKLY["median"].max()
     from_peak = (last_wk["median"] - peak_med) / peak_med * 100
 
     st.markdown("### Dubai Market Pulse")
@@ -1448,19 +1465,19 @@ def _render_market_overview(
                  "Rising ratio = premium segment decoupling from the broader market.",
         )
 
-    st.plotly_chart(dubai_wide_median_price_chart(DW), use_container_width=True)
+    st.plotly_chart(dubai_wide_median_price_chart(DUBAI_WIDE), use_container_width=True)
 
-    st.plotly_chart(weekly_pct_change_chart(WK), use_container_width=True)
+    st.plotly_chart(weekly_pct_change_chart(WEEKLY), use_container_width=True)
 
-    st.plotly_chart(dubai_wide_transactions_chart(DW), use_container_width=True)
+    st.plotly_chart(dubai_wide_transactions_chart(DUBAI_WIDE), use_container_width=True)
 
-    st.plotly_chart(area_pct_change_chart(AREA_CHG), use_container_width=True)
+    st.plotly_chart(area_pct_change_chart(AREA_CHANGES), use_container_width=True)
 
     st.divider()
 
     # ── Tier chart ────────────────────────────────────────────────────────────────
-    TIER_DF = generate_tier_data(trans_type, data_version, start_date, end_date)
-    st.plotly_chart(tier_price_chart(TIER_DF), use_container_width=True)
+    TIER_DATA = generate_tier_data(trans_type, data_version, start_date, end_date)
+    st.plotly_chart(tier_price_chart(TIER_DATA), use_container_width=True)
 
     st.divider()
 
@@ -1671,7 +1688,7 @@ with st.sidebar:
     st.caption(f"Data covers {date_summary} ({active_api_rows:,} transactions).")
 
 # ── Load & filter data ───────────────────────────────────────────────────────
-DF = generate_dubai_data(trans_type, data_version)
+DAILY_DATA = generate_dubai_data(trans_type, data_version)
 
 if not neighborhoods:
     st.warning("Select at least one neighbourhood in the sidebar.")
@@ -1704,7 +1721,7 @@ if active_page == "🎯 Fair Value Model":
 else:
     # Only the overview consumes the filtered frame — compute it here so
     # Fair Value interactions don't pay for an unused aggregation.
-    filtered = apply_filters(DF, neighborhoods, bedroom, start_date, end_date)
+    filtered = apply_filters(DAILY_DATA, neighborhoods, bedroom, start_date, end_date)
     _render_market_overview(
         filtered,
         neighborhoods,

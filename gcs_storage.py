@@ -1,7 +1,17 @@
+"""Google Cloud Storage helpers shared by the app and the offline pipelines.
+
+Wraps credential loading, the transactions-snapshot / model-bundle object
+locations, and Parquet (de)serialization. ``secrets`` throughout is any
+mapping-like source of configuration — ``st.secrets`` in the app, the parsed
+``.streamlit/secrets.toml`` offline — with environment variables taking
+precedence.
+"""
+
 import io
 import json
 import os
 from pathlib import Path
+from typing import Any, Mapping
 
 import polars as pl
 from google.cloud import storage
@@ -12,7 +22,11 @@ DEFAULT_TRANSACTIONS_OBJECT = "dld_transactions/dld_transactions_latest.parquet"
 DEFAULT_MODEL_OBJECT = "fair_value_model/fair_value_model_latest.pkl"
 
 
-def gcs_client(secrets):
+def gcs_client(secrets: Mapping[str, Any]) -> storage.Client:
+    """Authenticated Storage client from the configured service-account JSON.
+
+    Falls back to application-default credentials when no JSON is configured.
+    """
     service_account_json = setting(
         secrets,
         "GCP_SERVICE_ACCOUNT_JSON",
@@ -29,7 +43,8 @@ def gcs_client(secrets):
     return storage.Client(credentials=credentials, project=info.get("project_id"))
 
 
-def setting(secrets, *names):
+def setting(secrets: Mapping[str, Any], *names: str) -> str:
+    """First non-empty value for any of ``names``, env vars beating secrets."""
     for name in names:
         value = os.getenv(name) or secrets.get(name)
         if value:
@@ -37,7 +52,8 @@ def setting(secrets, *names):
     return ""
 
 
-def load_local_secrets():
+def load_local_secrets() -> dict[str, Any]:
+    """Parsed ``.streamlit/secrets.toml`` for offline scripts ({} if absent)."""
     path = Path(".streamlit/secrets.toml")
     if not path.exists():
         return {}
@@ -46,19 +62,21 @@ def load_local_secrets():
     return tomllib.loads(path.read_text(encoding="utf-8-sig"))
 
 
-def configured_snapshot(secrets):
+def configured_snapshot(secrets: Mapping[str, Any]) -> tuple[str, str]:
+    """(bucket_name, object_name) of the DLD transactions snapshot."""
     bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
     object_name = setting(secrets, "GCS_TRANSACTIONS_OBJECT") or DEFAULT_TRANSACTIONS_OBJECT
     return bucket_name, object_name
 
 
-def configured_model_object(secrets):
+def configured_model_object(secrets: Mapping[str, Any]) -> tuple[str, str]:
+    """(bucket_name, object_name) of the fair-value model bundle."""
     bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
     object_name = setting(secrets, "GCS_MODEL_OBJECT") or DEFAULT_MODEL_OBJECT
     return bucket_name, object_name
 
 
-def read_model_bundle_bytes(secrets):
+def read_model_bundle_bytes(secrets: Mapping[str, Any]) -> tuple[bytes, storage.Blob]:
     """Raw bytes of the pre-trained fair-value model bundle, plus its blob."""
     bucket_name, object_name = configured_model_object(secrets)
     blob = gcs_client(secrets).bucket(bucket_name).get_blob(object_name)
@@ -67,7 +85,11 @@ def read_model_bundle_bytes(secrets):
     return blob.download_as_bytes(), blob
 
 
-def write_model_bundle_bytes(secrets, data, metadata=None):
+def write_model_bundle_bytes(
+    secrets: Mapping[str, Any],
+    data: bytes,
+    metadata: Mapping[str, Any] | None = None,
+) -> str:
     """Upload the fair-value model bundle; returns the gs:// URI."""
     bucket_name, object_name = configured_model_object(secrets)
     blob = gcs_client(secrets).bucket(bucket_name).blob(object_name)
@@ -87,14 +109,16 @@ REFERENCE_OBJECTS = {
 }
 
 
-def read_reference_frames(secrets, names):
+def read_reference_frames(
+    secrets: Mapping[str, Any], names: list[str] | tuple[str, ...]
+) -> dict[str, pl.DataFrame]:
     """{name: DataFrame} for the requested reference datasets.
 
     Published by store_reference_data_gcs.py; raises FileNotFoundError with
     that pointer when an object is missing.
     """
     bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
-    frames = {}
+    frames: dict[str, pl.DataFrame] = {}
     for name in names:
         object_name = REFERENCE_OBJECTS[name]
         blob = gcs_client(secrets).bucket(bucket_name).get_blob(object_name)
@@ -107,14 +131,18 @@ def read_reference_frames(secrets, names):
     return frames
 
 
-def read_parquet_object(secrets, bucket_name, object_name):
+def read_parquet_object(
+    secrets: Mapping[str, Any], bucket_name: str, object_name: str
+) -> tuple[pl.DataFrame, storage.Blob]:
+    """Download a Parquet object as a Polars frame, plus its blob (metadata)."""
     blob = gcs_client(secrets).bucket(bucket_name).get_blob(object_name)
     if blob is None:
         raise FileNotFoundError(f"gs://{bucket_name}/{object_name}")
     return pl.read_parquet(io.BytesIO(blob.download_as_bytes())), blob
 
 
-def dataframe_to_parquet_bytes(df):
+def dataframe_to_parquet_bytes(df: pl.DataFrame) -> bytes:
+    """Serialize a frame to Parquet bytes for a blob upload."""
     buffer = io.BytesIO()
     df.write_parquet(buffer)
     return buffer.getvalue()

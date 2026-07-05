@@ -100,6 +100,7 @@ FEATURE_LABELS = {
 
 
 def feature_label(name: str) -> str:
+    """Plain-language display name for a model feature (falls back to raw)."""
     return FEATURE_LABELS.get(name, name)
 
 
@@ -134,6 +135,7 @@ distribution and balcony size are used (~76% of sales matched).
 
 
 def _raw_transactions() -> pl.DataFrame:
+    """The session's loaded transactions frame (empty frame before load)."""
     df = st.session_state.get("api_raw_df")
     if isinstance(df, pl.DataFrame):
         return df
@@ -242,6 +244,7 @@ SCORING_WINDOWS: dict[str, int | str] = {
 
 
 def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
+    """Scatter of actual vs predicted AED/sqft, coloured by flag status."""
     normal = scored.filter(~pl.col("below_fair_value"))
     if normal.height > SCATTER_MAX_POINTS:
         normal = normal.sample(SCATTER_MAX_POINTS, seed=42)
@@ -292,6 +295,7 @@ def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
 
 
 def spread_histogram(scored: pl.DataFrame, threshold: float) -> go.Figure:
+    """Distribution of actual-vs-fair-value spreads with the threshold line."""
     spreads = (scored["spread_pct"] * 100).to_numpy()
     fig = go.Figure(
         go.Histogram(
@@ -321,6 +325,7 @@ def spread_histogram(scored: pl.DataFrame, threshold: float) -> go.Figure:
 
 
 def importance_chart(importances: pl.DataFrame) -> go.Figure:
+    """Top-15 permutation importances with plain-language feature names."""
     top = importances.head(15).sort("importance_mean")
     labels = [feature_label(f) for f in top["feature"].to_list()]
     fig = go.Figure(
@@ -349,6 +354,7 @@ def _display_filter(
     start_date: date,
     end_date: date,
 ) -> pl.DataFrame:
+    """Apply the sidebar neighbourhood/bedroom/date filters to scored rows."""
     df = scored.with_columns(
         area_display_expr().alias("area_display"),
         bedroom_type_expr().alias("bedroom_type"),
@@ -368,6 +374,7 @@ def render_fair_value_tab(
     end_date: date,
     data_version: str,
 ) -> None:
+    """Render the Fair Value page: model load, scoring, flags, charts."""
     raw = _raw_transactions()
     if raw.is_empty():
         st.info("No transaction data loaded.")
