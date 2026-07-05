@@ -514,13 +514,16 @@ def feature_engineering(
             .drop_nulls()
             .unique("_pn")
         )
+        # Area-key precision is configurable: 2dp = strict (fewer, surer
+        # matches), 1dp/0dp = looser (more matches, blurrier layouts).
+        akey_round = int(cfg.get("unit_floor_round", 2))
         units = (
             reference["units"]
             .select(
                 pl.col("project_id").cast(pl.Int64, strict=False).alias("_pid"),
                 pl.col("floor_num").cast(pl.Float64, strict=False),
                 pl.col("actual_area").cast(pl.Float64, strict=False)
-                .round(2).alias("_akey"),
+                .round(akey_round).alias("_akey"),
                 pl.col("unit_balcony_area").cast(pl.Float64, strict=False),
             )
             .drop_nulls(["_pid", "_akey"])
@@ -544,7 +547,7 @@ def feature_engineering(
         df = (
             df.with_columns(
                 pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_pn"),
-                pl.col("ACTUAL_AREA").cast(pl.Float64).round(2).alias("_akey"),
+                pl.col("ACTUAL_AREA").cast(pl.Float64).round(akey_round).alias("_akey"),
             )
             .join(bridge, on="_pn", how="left")
             .join(layouts, on=["_pid", "_akey"], how="left")
