@@ -45,6 +45,54 @@ COLOR_NORMAL = "#636efa"
 COLOR_BELOW = "#ef553b"
 COLOR_DISTRESSED = "#e377c2"
 
+# Plain-language names for model features, used in the importance chart and
+# methodology notes. Unmapped features fall back to their raw column name.
+FEATURE_LABELS = {
+    "log_sqft": "Unit size",
+    "days_since_start": "Market trend (time)",
+    "month": "Month of year (seasonality)",
+    "rooms_ord": "Bedrooms",
+    "AREA_EN": "District",
+    "IS_OFFPLAN_EN": "Off-plan vs ready",
+    "tier": "Market tier (prime/mid/affordable)",
+    "PROJECT_EN": "Project",
+    "MASTER_PROJECT_EN": "Master development",
+    "BUILDING_NAME_EN": "Building",
+    "parking_count": "Parking spaces",
+    "total_buyer": "Buyers on the deal",
+    "total_seller": "Sellers on the deal",
+    "NEAREST_METRO_EN": "Nearest metro station",
+    "NEAREST_MALL_EN": "Nearest mall",
+    "NEAREST_LANDMARK_EN": "Nearest landmark",
+    "area_comp_psf": "District price/sqft (last 30 days)",
+    "project_comp_psf": "Project price/sqft (last 60 days)",
+    "project_comp_psf_30": "Project price/sqft (last 30 days)",
+    "project_comp_psf_90": "Project price/sqft (last 90 days)",
+    "building_comp_psf": "Building price/sqft (last 90 days)",
+    "project_hist_psf": "Project long-run price level",
+    "building_hist_psf": "Building long-run price level",
+    "project_txn_90d": "Project sales activity (90 days)",
+    "area_txn_30d": "District sales activity (30 days)",
+    "area_momentum": "District price momentum",
+    "rel_log_sqft": "Unit size vs project's typical unit",
+    "project_comp_std": "Project price dispersion",
+    "prior_unit_psf": "Same unit's previous sale price",
+    "days_since_prior_sale": "Time since unit last sold",
+    "prior_unit_psf_adj": "Previous sale price (market-adjusted)",
+    "building_age_years": "Building age",
+    "project_units": "Project size (units)",
+    "project_max_floors": "Project height (floors)",
+    "developer_name": "Developer",
+    "area_rent_psf_180d": "Area rent level (Ejari, 180 days)",
+    "implied_gross_yield": "Implied gross rental yield",
+    "service_cost": "Project service charge",
+}
+
+
+def feature_label(name: str) -> str:
+    return FEATURE_LABELS.get(name, name)
+
+
 DATA_SOURCES_TABLE = """
 | # | Feature | Column / Source | Availability |
 |---|---------|-----------------|--------------|
@@ -59,11 +107,16 @@ DATA_SOURCES_TABLE = """
 | 9 | Time / market trend | `INSTANCE_DATE` → trend + month | Now |
 | 10 | Deal structure | `TOTAL_BUYER`, `TOTAL_SELLER` | Now |
 | 11 | Distress procedure signal | `PROCEDURE_EN`, `GROUP_EN` | Now |
-| 12 | Trailing area/project comparables | derived in-dataset (past-only) | Optional (loop-tested) |
-| 13 | Floor, view, developer, building age | raw DDA fields / Dubai Pulse Buildings datasets | **Phase 2** |
-| 14 | Rental yield | Dubai Pulse Rent Contracts (Ejari); DLD Smart Rental Index | **Phase 2 — planned** |
-| 15 | Live listing asking prices | Bayut / Property Finder | **Phase 2 — planned** |
-| 16 | Official sale price index | Dubai Pulse `dld_residential_sale_index` | **Phase 2** |
+| 12 | Trailing area/project comparables | derived in-dataset (past-only) | Now (in model) |
+| 13 | Same unit's previous sale (repeat-sale) | derived in-dataset (past-only) | Now (in model) |
+| 14 | Developer, building age, project size & height | DLD Projects + Buildings (project-level, in GCS) | **In testing — Campaign 2** |
+| 15 | Rental yield | DLD Rent Contracts (Ejari) → weekly area × rooms rent index | **In testing — data pull in progress** |
+| 16 | Live listing asking prices | Bayut / Property Finder | **Phase 2 — planned** |
+| 17 | Official sale price index | Dubai Pulse `dld_residential_sale_index` | **Phase 2** |
+
+Per-unit floor is not achievable from DLD data: transactions carry no unit or
+building key, so building metadata joins at *project* level via `project_number`
+(~90% of sales matched).
 """
 
 
@@ -215,10 +268,11 @@ def spread_histogram(scored: pl.DataFrame, threshold: float) -> go.Figure:
 
 def importance_chart(importances: pl.DataFrame) -> go.Figure:
     top = importances.head(15).sort("importance_mean")
+    labels = [feature_label(f) for f in top["feature"].to_list()]
     fig = go.Figure(
         go.Bar(
             x=top["importance_mean"].to_numpy(),
-            y=top["feature"].to_list(),
+            y=labels,
             orientation="h",
             error_x=dict(array=top["importance_std"].to_numpy(), color="#fafafa"),
             marker_color=COLOR_NORMAL,
@@ -226,8 +280,8 @@ def importance_chart(importances: pl.DataFrame) -> go.Figure:
         )
     )
     fig.update_layout(
-        **_layout_defaults("Feature Importance (permutation, out-of-sample on most recent 10%)"),
-        xaxis_title="Importance (increase in prediction error when shuffled)",
+        **_layout_defaults("What Drives the Fair-Value Estimate"),
+        xaxis_title="Importance (how much the prediction worsens without this input)",
         height=420,
         margin=dict(l=40, r=20, t=45, b=40),
     )
@@ -460,26 +514,45 @@ def render_fair_value_tab(
 
     with st.expander("📚 Data & methodology", expanded=False):
         st.markdown(
-            "**Model**: gradient-boosted trees (`HistGradientBoostingRegressor`) on "
-            "log(AED/sqft), validated with a 10-fold date-ordered `TimeSeriesSplit` "
-            "(train on the past, test on the future), then refit on all rows for scoring. "
-            "**Spread** = actual price / predicted fair value − 1.\n\n"
+            "**How it works.** The model estimates what each apartment *should* have "
+            "sold for (its **fair value**, in AED/sqft) from the property's "
+            "characteristics and the market around it at the time of sale, then "
+            "compares that estimate with the actual closed price. "
+            "**Spread** = actual price / predicted fair value − 1; a spread of −20% "
+            "means the deal closed 20% under the model's fair value.\n\n"
+            "**What the model looks at** (see the importance chart for what matters "
+            "most): the unit's own previous sale price and how long ago it sold; the "
+            "project's and building's recent and long-run price levels; the unit's "
+            "size and how it compares with the project's typical unit; bedrooms, "
+            "district, project, off-plan status; and the overall market trend at the "
+            "date of sale. All history-based features use only sales that closed "
+            "**before** the transaction being valued — the model never peeks at the "
+            "future or at the deal itself.\n\n"
+            "**Model & validation.** Gradient-boosted trees "
+            "(`HistGradientBoostingRegressor`) on log(AED/sqft), validated with a "
+            "10-fold date-ordered `TimeSeriesSplit` (always trained on the past, "
+            "tested on the future). The model is trained **offline** on the full "
+            "24-month history and published as a bundle; this page only loads the "
+            "bundle and predicts, and the scoring-window selector controls which "
+            "sales are scored (features always use the full history, so results are "
+            "identical either way).\n\n"
+            "**Accuracy.** Cross-validated median error ≈ 4.2%, confirmed at 4.3% on "
+            "an untouched two-month holdout that was never used for any modelling "
+            "decision. Caveat: sales in projects with no recent comparable sales "
+            "('cold starts', a few % of rows) carry roughly double the error — treat "
+            "flags on a project's first sales in a while with extra care.\n\n"
             "**Distressed candidate** = spread at/below the threshold **and** at least "
             "one corroborating signal that is independent of the model residual: "
             "forced-sale procedure keyword in `PROCEDURE_EN`, illiquid project (fewer "
             "than 8 sales in the window), or multiple sellers on the deal. A 'deep "
             "discount' (≤ −25%) is annotated in the Signals column for context but "
             "never counts as corroboration on its own — that would let a single model "
-            "miss label a normal sale as distressed.\n\n"
-            "Deep-discount outliers are excluded from **training** (0.5%/99.5% PSF trim) "
-            "but always **scored**, so genuine fire-sales stay visible. Rows whose "
-            "recorded area contradicts the official AED/sqm price by more than 10% are "
-            "dropped as data errors.\n\n"
-            "**Accuracy caveats** (independent audit on an untouched 2-month holdout): "
-            "the honest error is ≈ 6% overall — ~5.9% for the ~97% of sales whose "
-            "project has recent comparable sales, but ~12% for cold-start sales (a "
-            "project's first transactions in a 60-day window). Treat flags on "
-            "first-in-project sales with extra care.\n"
+            "mistake label a normal sale as distressed.\n\n"
+            "**Data hygiene.** Deep-discount outliers are excluded from **training** "
+            "(0.5%/99.5% PSF trim) but always **scored**, so genuine fire-sales stay "
+            "visible. Rows whose recorded area contradicts the official AED/sqm price "
+            "by more than 10% are dropped as data errors, and non-market procedures "
+            "(developer transfers, lease-to-own, payment plans) are excluded.\n"
         )
         st.markdown("**Data needed & sources**")
         st.markdown(DATA_SOURCES_TABLE)
