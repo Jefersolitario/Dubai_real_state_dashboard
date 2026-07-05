@@ -93,6 +93,8 @@ FEATURE_LABELS = {
     "rel_floor_pct": "Floor position within the tower",
     "project_rooms_comp_psf": "Project price/sqft, same unit type (90 days)",
     "area_rooms_comp_psf": "District price/sqft, same unit type (30 days)",
+    "project_rooms_comp_std": "Price dispersion, same unit type",
+    "project_rooms_txn_90d": "Sales activity, same unit type (90 days)",
     "rent_contracts_180d": "Area rental-market activity (180 days)",
     "mkt_index": "Official market price index",
 }

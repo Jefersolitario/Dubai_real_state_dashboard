@@ -66,6 +66,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "rel_floor": False,              # layout floor mean / project max floors (needs unit_floor+project_meta)
     "rent_density": False,           # trailing 180d Ejari contract count for area x rooms band
     "comps_rooms": False,            # trailing comps per project x rooms and area x rooms (strictly past)
+    "rooms_dynamics": False,         # dispersion + liquidity per project x rooms (strictly past)
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -174,6 +175,8 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric.append("rent_contracts_180d")
     if cfg["comps_rooms"]:
         numeric += ["project_rooms_comp_psf", "area_rooms_comp_psf"]
+    if cfg["rooms_dynamics"]:
+        numeric += ["project_rooms_comp_std", "project_rooms_txn_90d"]
     return numeric, categorical
 
 
@@ -312,7 +315,7 @@ def feature_engineering(
         "comps_area", "comps_project", "comps_project_windows",
         "comps_building", "te_hist", "liquidity", "momentum",
         "rel_size", "comp_dispersion", "repeat_sale", "repeat_sale_adj",
-        "comps_rooms",
+        "comps_rooms", "rooms_dynamics",
     )
     if any(cfg[g] for g in derived_groups):
         df = df.sort("date")
@@ -355,7 +358,7 @@ def feature_engineering(
             )
         if cfg["comp_dispersion"]:
             comps.append(past_stat("psf", "60d", "PROJECT_EN", "std").alias("project_comp_std"))
-        if cfg["comps_rooms"]:
+        if cfg["comps_rooms"] or cfg["rooms_dynamics"]:
             # Comps within the same unit type, not pooled across the project/
             # area: what 2BRs in this project sold for, not "units". Combined
             # keys go null if either part is null (concat_str propagates null),
@@ -370,8 +373,16 @@ def feature_engineering(
                     separator="|",
                 ).alias("_area_rooms"),
             )
-            comps.append(past_stat("psf", "90d", "_proj_rooms").alias("project_rooms_comp_psf"))
-            comps.append(past_stat("psf", "30d", "_area_rooms").alias("area_rooms_comp_psf"))
+            if cfg["comps_rooms"]:
+                pr_win = str(cfg.get("proj_rooms_window", "90d"))
+                ar_win = str(cfg.get("area_rooms_window", "30d"))
+                comps.append(past_stat("psf", pr_win, "_proj_rooms").alias("project_rooms_comp_psf"))
+                comps.append(past_stat("psf", ar_win, "_area_rooms").alias("area_rooms_comp_psf"))
+            if cfg["rooms_dynamics"]:
+                if "_one" not in df.columns:
+                    df = df.with_columns(pl.lit(1.0).alias("_one"))
+                comps.append(past_stat("psf", "90d", "_proj_rooms", "std").alias("project_rooms_comp_std"))
+                comps.append(past_stat("_one", "90d", "_proj_rooms", "sum").alias("project_rooms_txn_90d"))
         if comps:
             df = df.with_columns(comps)
         for tmp in ("_one", "_proj_rooms", "_area_rooms"):
