@@ -27,7 +27,9 @@ DEFAULT_MAX_RECORDS = 1_000_000
 DEFAULT_LOOKBACK_MONTHS = 24
 REQUEST_TIMEOUT = (10, 60)
 PAGE_RETRY_ATTEMPTS = 4
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+# 408: the gateway returns "Downtime exception: Read timed out" as HTTP 408
+# during long pulls — transient, same as the 5xx blips.
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 REQUIRED_DASHBOARD_COLUMNS = [
     "INSTANCE_DATE",

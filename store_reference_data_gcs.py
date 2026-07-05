@@ -137,17 +137,47 @@ def rooms_band_expr() -> pl.Expr:
     return expr
 
 
+def _month_starts(start: date, end: date) -> list[date]:
+    months = [start.replace(day=1)]
+    while True:
+        last = months[-1]
+        nxt = date(last.year + (last.month == 12), last.month % 12 + 1, 1)
+        if nxt > end:
+            return months + [nxt]
+        months.append(nxt)
+
+
 def pull_rents(config, secrets) -> None:
-    params = {
-        "filter": (
-            "property_usage_en='Residential' AND "
-            f"contract_start_date>='{RENTS_START.isoformat()}'"
-        ),
-        "order_by": "contract_start_date",
-        "order_dir": "asc",
-    }
-    raw = fetch_dataset(config, "dld_rent_contracts-open-api", params=params,
-                        max_records=6_000_000)
+    # Monthly chunks: a ~11M-row pull runs for hours, and one unrecoverable
+    # gateway error mid-pagination used to discard everything fetched so far.
+    # Per-chunk the page retry still applies; a failed chunk is retried once
+    # before giving up.
+    bounds = _month_starts(RENTS_START, date.today())
+    frames: list[pl.DataFrame] = []
+    for lo, hi in zip(bounds, bounds[1:]):
+        params = {
+            "filter": (
+                "property_usage_en='Residential' AND "
+                f"contract_start_date>='{lo.isoformat()}' AND "
+                f"contract_start_date<'{hi.isoformat()}'"
+            ),
+            "order_by": "contract_start_date",
+            "order_dir": "asc",
+        }
+        for attempt in (1, 2):
+            try:
+                chunk = fetch_dataset(config, "dld_rent_contracts-open-api",
+                                      params=params, max_records=1_000_000)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                print(f"chunk {lo}: retrying after {type(exc).__name__}: {exc}",
+                      flush=True)
+                time.sleep(30)
+        if chunk.height:
+            frames.append(chunk)
+    raw = pl.concat(frames, how="diagonal_relaxed")
 
     n0 = raw.height
     rents = raw.select(
