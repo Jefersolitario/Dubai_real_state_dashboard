@@ -630,6 +630,21 @@ def _extract_records(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def project_dashboard_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Restrict a normalized frame to the canonical dashboard schema.
+
+    The snapshot and every merge participant must share this exact column
+    set: mixed schemas make identical transactions look distinct to the
+    full-row dedupe and corrupt the snapshot with near-duplicates.
+    """
+    needed = [
+        column
+        for column in REQUIRED_DASHBOARD_COLUMNS + OPTIONAL_DASHBOARD_COLUMNS
+        if column in df.columns
+    ]
+    return df.select(needed)
+
+
 def _add_missing_optional_columns(df: pl.DataFrame) -> pl.DataFrame:
     expressions = []
     for column in OPTIONAL_DASHBOARD_COLUMNS:

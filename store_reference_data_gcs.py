@@ -46,7 +46,10 @@ def fetch_dataset(config, dataset: str, params: dict | None = None,
     t0 = time.time()
     records = fetch_dataset_records(cfg, params=params or {}, max_records=max_records)
     print(f"{dataset}: {len(records):,} records in {time.time() - t0:.0f}s", flush=True)
-    return pl.DataFrame(records, infer_schema_length=10_000)
+    # infer_schema_length=None scans every row: gateway pages mix numeric and
+    # string representations for the same field (seen in dld_buildings), and a
+    # partial scan crashes the build after an hours-long fetch.
+    return pl.DataFrame(records, infer_schema_length=None)
 
 
 def upload(secrets, name: str, df: pl.DataFrame) -> None:

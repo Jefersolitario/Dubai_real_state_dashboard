@@ -14,6 +14,7 @@ from dda_api import (
     last_months_date_range,
     load_dda_config,
     normalize_dld_transactions,
+    project_dashboard_columns,
     validate_normalized_columns,
 )
 from gcs_storage import (
@@ -99,7 +100,10 @@ def load_existing_snapshot(secrets, bucket_name: str, object_name: str) -> pl.Da
         print(f"No existing snapshot at gs://{bucket_name}/{object_name}; creating one.")
         return None
 
-    df = validate_snapshot("Existing GCS snapshot", normalize_dld_transactions(df))
+    df = validate_snapshot(
+        "Existing GCS snapshot",
+        project_dashboard_columns(normalize_dld_transactions(df)),
+    )
     print(
         "Existing GCS snapshot: "
         f"{df.height:,} rows, "
@@ -141,7 +145,7 @@ def fetch_api_snapshot(
     if df.is_empty():
         print("API returned no records for the incremental window.")
         return df
-    return validate_snapshot("Fetched API snapshot", df)
+    return validate_snapshot("Fetched API snapshot", project_dashboard_columns(df))
 
 
 def merge_snapshots(
@@ -209,7 +213,7 @@ def write_snapshot(secrets, bucket_name: str, object_name: str, df: pl.DataFrame
 
     print("Reading object back for verification")
     readback, _ = read_parquet_object(secrets, bucket_name, object_name)
-    readback = normalize_dld_transactions(readback)
+    readback = project_dashboard_columns(normalize_dld_transactions(readback))
     verify_readback(df, readback)
     print(
         "Verified GCS snapshot: "

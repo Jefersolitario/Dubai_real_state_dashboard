@@ -29,11 +29,10 @@ from dda_api import (
     DEFAULT_MAX_RECORDS,
     DEFAULT_PAGE_SIZE,
     DEFAULT_LOOKBACK_MONTHS,
-    OPTIONAL_DASHBOARD_COLUMNS,
-    REQUIRED_DASHBOARD_COLUMNS,
     build_dld_transactions_params,
     fetch_dataset_records,
     infer_column_mapping,
+    project_dashboard_columns,
     last_months_date_range,
     load_dda_config,
     normalize_dld_transactions,
@@ -585,12 +584,7 @@ def _load_gcs_transactions(
     raw_columns = raw_df.columns
     mapping = infer_column_mapping(raw_columns)
     del raw_df
-    needed = [
-        column
-        for column in REQUIRED_DASHBOARD_COLUMNS + OPTIONAL_DASHBOARD_COLUMNS
-        if column in normalized.columns
-    ]
-    normalized = normalized.select(needed)
+    normalized = project_dashboard_columns(normalized)
 
     bounds = _date_bounds_from_transactions(normalized)
     object_metadata = blob.metadata or {}
@@ -776,8 +770,14 @@ def _ensure_transactions_cover_range(
             "written": False,
         }
 
-    incoming_df = pl.concat(incoming_frames, how="diagonal_relaxed")
-    existing_deduped = dedupe_snapshot(df)
+    # Both merge sides must share the canonical schema: the loaded snapshot
+    # is projected, so project the fresh API rows too — otherwise identical
+    # transactions differ in raw-only columns, survive dedupe, and the
+    # written snapshot fails the duplicate verification after projection.
+    incoming_df = project_dashboard_columns(
+        pl.concat(incoming_frames, how="diagonal_relaxed")
+    )
+    existing_deduped = dedupe_snapshot(project_dashboard_columns(df))
     incoming_deduped = dedupe_snapshot(incoming_df)
     combined = pl.concat([existing_deduped, incoming_deduped], how="diagonal_relaxed")
     final_df = stable_sort(dedupe_snapshot(combined))
