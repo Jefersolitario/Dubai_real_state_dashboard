@@ -63,6 +63,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "service_charge": False,         # latest per-project service cost
     "unit_floor": False,             # floor via project+exact-area layout match (units table)
     "sale_index": False,             # official DLD monthly flat price index, 40d avail lag
+    "rel_floor": False,              # layout floor mean / project max floors (needs unit_floor+project_meta)
+    "rent_density": False,           # trailing 180d Ejari contract count for area x rooms band
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -165,6 +167,10 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric += ["unit_floor", "layout_floor_mean", "layout_units", "unit_balcony_sqm"]
     if cfg["sale_index"]:
         numeric.append("mkt_index")
+    if cfg["rel_floor"]:
+        numeric.append("rel_floor_pct")
+    if cfg["rent_density"]:
+        numeric.append("rent_contracts_180d")
     return numeric, categorical
 
 
@@ -175,6 +181,8 @@ REFERENCE_REQUIREMENTS = {
     "service_charge": ("projects", "service_charges"),
     "unit_floor": ("projects", "units"),
     "sale_index": ("sale_index",),
+    "rel_floor": ("projects", "units", "buildings_agg"),
+    "rent_density": ("rent_index",),
 }
 
 
@@ -442,7 +450,7 @@ def feature_engineering(
             )
         df = df.drop("_completion")
 
-    if cfg["rent_yield"]:
+    if cfg["rent_yield"] or cfg["rent_density"]:
         rooms = pl.col("ROOMS_EN").cast(pl.Utf8)
         band = (
             pl.when(rooms.str.to_lowercase().str.contains("studio"))
@@ -457,14 +465,19 @@ def feature_engineering(
             .then(pl.lit("4BR+"))
             .otherwise(pl.lit(None, dtype=pl.Utf8))
         )
+        grid_cols = [
+            pl.col("AREA_EN").cast(pl.Utf8),
+            pl.col("rooms_band").cast(pl.Utf8).alias("_band"),
+            pl.col("week").cast(pl.Date),
+            pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
+        ]
+        if cfg["rent_density"]:
+            grid_cols.append(
+                pl.col("rent_contracts_180d").cast(pl.Float64, strict=False)
+            )
         grid = (
             reference["rent_index"]
-            .select(
-                pl.col("AREA_EN").cast(pl.Utf8),
-                pl.col("rooms_band").cast(pl.Utf8).alias("_band"),
-                pl.col("week").cast(pl.Date),
-                pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
-            )
+            .select(grid_cols)
             .drop_nulls(["AREA_EN", "_band", "week"])
             .sort("week")
         )
@@ -476,14 +489,15 @@ def feature_engineering(
             by=["AREA_EN", "_band"],
             strategy="backward",
         ).drop("_band", "week")
-        denom_cols = [c for c in ("project_comp_psf", "area_comp_psf") if c in df.columns]
-        if denom_cols:
-            df = df.with_columns(
-                (pl.col("area_rent_psf_180d") / pl.coalesce([pl.col(c) for c in denom_cols]))
-                .alias("implied_gross_yield")
-            )
-        else:
-            df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
+        if cfg["rent_yield"]:
+            denom_cols = [c for c in ("project_comp_psf", "area_comp_psf") if c in df.columns]
+            if denom_cols:
+                df = df.with_columns(
+                    (pl.col("area_rent_psf_180d") / pl.coalesce([pl.col(c) for c in denom_cols]))
+                    .alias("implied_gross_yield")
+                )
+            else:
+                df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
 
     if cfg["unit_floor"]:
         # Static unit facts from the DLD units registry. Transactions carry no
@@ -535,6 +549,18 @@ def feature_engineering(
             .join(bridge, on="_pn", how="left")
             .join(layouts, on=["_pid", "_akey"], how="left")
             .drop("_pn", "_pid", "_akey")
+        )
+
+    if cfg["rel_floor"]:
+        # Where the layout sits in the tower: floor mean over the building's
+        # max floors. Both inputs are static registry facts.
+        if not (cfg["unit_floor"] and cfg["project_meta"]):
+            raise ValueError("rel_floor requires unit_floor and project_meta enabled")
+        df = df.with_columns(
+            pl.when(pl.col("project_max_floors") > 0)
+            .then(pl.col("layout_floor_mean") / pl.col("project_max_floors"))
+            .otherwise(None)
+            .alias("rel_floor_pct")
         )
 
     if cfg["sale_index"]:

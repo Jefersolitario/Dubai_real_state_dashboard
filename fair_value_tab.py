@@ -86,6 +86,13 @@ FEATURE_LABELS = {
     "area_rent_psf_180d": "Area rent level (Ejari, 180 days)",
     "implied_gross_yield": "Implied gross rental yield",
     "service_cost": "Project service charge",
+    "unit_floor": "Unit's floor (exact registry match)",
+    "layout_floor_mean": "Typical floor of this layout",
+    "layout_units": "Identical units in the project",
+    "unit_balcony_sqm": "Balcony size",
+    "rel_floor_pct": "Floor position within the tower",
+    "rent_contracts_180d": "Area rental-market activity (180 days)",
+    "mkt_index": "Official market price index",
 }
 
 
