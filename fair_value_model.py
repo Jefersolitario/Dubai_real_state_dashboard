@@ -65,6 +65,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "sale_index": False,             # official DLD monthly flat price index, 40d avail lag
     "rel_floor": False,              # layout floor mean / project max floors (needs unit_floor+project_meta)
     "rent_density": False,           # trailing 180d Ejari contract count for area x rooms band
+    "comps_rooms": False,            # trailing comps per project x rooms and area x rooms (strictly past)
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -171,6 +172,8 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric.append("rel_floor_pct")
     if cfg["rent_density"]:
         numeric.append("rent_contracts_180d")
+    if cfg["comps_rooms"]:
+        numeric += ["project_rooms_comp_psf", "area_rooms_comp_psf"]
     return numeric, categorical
 
 
@@ -309,6 +312,7 @@ def feature_engineering(
         "comps_area", "comps_project", "comps_project_windows",
         "comps_building", "te_hist", "liquidity", "momentum",
         "rel_size", "comp_dispersion", "repeat_sale", "repeat_sale_adj",
+        "comps_rooms",
     )
     if any(cfg[g] for g in derived_groups):
         df = df.sort("date")
@@ -351,10 +355,28 @@ def feature_engineering(
             )
         if cfg["comp_dispersion"]:
             comps.append(past_stat("psf", "60d", "PROJECT_EN", "std").alias("project_comp_std"))
+        if cfg["comps_rooms"]:
+            # Comps within the same unit type, not pooled across the project/
+            # area: what 2BRs in this project sold for, not "units". Combined
+            # keys go null if either part is null (concat_str propagates null),
+            # so past_stat's mask applies as usual.
+            df = df.with_columns(
+                pl.concat_str(
+                    [pl.col("PROJECT_EN"), pl.col("ROOMS_EN").cast(pl.Utf8)],
+                    separator="|",
+                ).alias("_proj_rooms"),
+                pl.concat_str(
+                    [pl.col("AREA_EN"), pl.col("ROOMS_EN").cast(pl.Utf8)],
+                    separator="|",
+                ).alias("_area_rooms"),
+            )
+            comps.append(past_stat("psf", "90d", "_proj_rooms").alias("project_rooms_comp_psf"))
+            comps.append(past_stat("psf", "30d", "_area_rooms").alias("area_rooms_comp_psf"))
         if comps:
             df = df.with_columns(comps)
-        if "_one" in df.columns:
-            df = df.drop("_one")
+        for tmp in ("_one", "_proj_rooms", "_area_rooms"):
+            if tmp in df.columns:
+                df = df.drop(tmp)
 
         if cfg["repeat_sale"] or cfg["repeat_sale_adj"]:
             # Pseudo-unit: same building + same room label + same area to
