@@ -11,7 +11,7 @@ snapshot; the sidebar filters only narrow what is displayed.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import plotly.graph_objects as go
 import polars as pl
@@ -113,14 +113,25 @@ def train_local_model(data_version: str) -> tuple[FairValueResult, dict]:
 
 
 @st.cache_resource(show_spinner="Scoring transactions against fair value...")
-def get_scored(data_version: str, _result: FairValueResult) -> pl.DataFrame:
-    """Fair-value predictions for every scoreable row (threshold-independent).
+def get_scored(
+    data_version: str,
+    score_start: date,
+    score_end: date,
+    _result: FairValueResult,
+) -> pl.DataFrame:
+    """Fair-value predictions for scoreable rows in the window (threshold-independent).
 
-    The threshold slider only re-runs the cheap flag_distress expressions,
-    never this predict pass. ``_result`` is underscore-prefixed so Streamlit
-    keys the cache on data_version only (the bundle is stable per version).
+    Features are built over the full history (trailing comparables need the
+    past), but the predict pass only runs on rows inside the scoring window —
+    that is what keeps the default "last month" view fast. The threshold
+    slider only re-runs the cheap flag_distress expressions, never this
+    predict pass. ``_result`` is underscore-prefixed so Streamlit keys the
+    cache on the other arguments only (the bundle is stable per version).
     """
-    return score_transactions(_result, get_features(data_version))
+    feats = get_features(data_version).filter(
+        pl.col("date").is_between(score_start, score_end)
+    )
+    return score_transactions(_result, feats)
 
 
 def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
@@ -276,9 +287,13 @@ def render_fair_value_tab(
         st.error(f"Could not load the fair-value model bundle: {exc}")
         return
 
-    if get_features(data_version).is_empty():
+    feats = get_features(data_version)
+    if feats.is_empty():
         st.warning("No scoreable apartment sales in the loaded data.")
         return
+    data_min, data_max = feats.select(
+        pl.col("date").min().alias("lo"), pl.col("date").max().alias("hi")
+    ).row(0)
 
     st.markdown("### Fair Value Model — Below-Market & Distressed-Asset Scanner")
     st.caption(
@@ -306,22 +321,53 @@ def render_fair_value_tab(
                 "`python train_fair_value.py` (offline)."
             )
 
-    threshold_pct = st.slider(
-        "Below-fair-value threshold",
-        min_value=5,
-        max_value=30,
-        value=15,
-        step=1,
-        format="-%d%%",
-        help=(
-            "A sale is flagged 'below fair value' when its price is at least this far "
-            "under the model's predicted fair value. 'Distressed candidate' additionally "
-            "requires a signal independent of the model residual: a forced-sale "
-            "procedure, an illiquid project, or multiple sellers on the deal."
-        ),
-    )
+    col_window, col_threshold = st.columns([1, 2])
+    with col_window:
+        window = st.selectbox(
+            "Scoring window",
+            ["Last month", "Last 3 months", "Sidebar date range", "All history"],
+            index=0,
+            help=(
+                "Only sales in this window are scored against fair value — the "
+                "default keeps the tab fast. Features still use the full history, "
+                "so predictions are identical to scoring everything."
+            ),
+        )
+    with col_threshold:
+        threshold_pct = st.slider(
+            "Below-fair-value threshold",
+            min_value=5,
+            max_value=30,
+            value=15,
+            step=1,
+            format="-%d%%",
+            help=(
+                "A sale is flagged 'below fair value' when its price is at least this far "
+                "under the model's predicted fair value. 'Distressed candidate' additionally "
+                "requires a signal independent of the model residual: a forced-sale "
+                "procedure, an illiquid project, or multiple sellers on the deal."
+            ),
+        )
+
+    if window == "Last month":
+        score_start, score_end = data_max - timedelta(days=30), data_max
+    elif window == "Last 3 months":
+        score_start, score_end = data_max - timedelta(days=90), data_max
+    elif window == "Sidebar date range":
+        score_start, score_end = start_date, end_date
+    else:
+        score_start, score_end = data_min, data_max
+
     scored = flag_distress(
-        get_scored(data_version, result), spread_threshold=-threshold_pct / 100
+        get_scored(data_version, score_start, score_end, result),
+        spread_threshold=-threshold_pct / 100,
+    )
+    if scored.is_empty():
+        st.warning(f"No apartment sales between {score_start} and {score_end}.")
+        return
+    st.caption(
+        f"Scoring **{scored.height:,} sales** from **{score_start}** to "
+        f"**{score_end}**; the sidebar filters narrow this further."
     )
     view = _display_filter(scored, neighborhoods, bedroom, start_date, end_date)
 

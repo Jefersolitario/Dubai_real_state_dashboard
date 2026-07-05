@@ -50,7 +50,7 @@ Single-file Streamlit app with this flow:
 3. **Data normalization** - maps DDA API columns into the dashboard schema.
 4. **Aggregation helpers** - daily, weekly, Dubai-wide, tier, and area-level metrics using Polars.
 5. **Chart builders** - Plotly figures for price trends, volume, momentum, tiers, and scatter views.
-6. **Streamlit UI** - two tabs via `st.tabs`: "Market Overview" (`_render_market_overview`, the original page) and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`); shared sidebar filters.
+6. **Streamlit UI** - two pages via `st.segmented_control` (not `st.tabs`, which executes every tab body on each rerun): "Market Overview" (`_render_market_overview`, the original page) and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`, lazy — model bundle load and scoring only run when this page is selected); shared sidebar filters.
 
 ### dashboard_constants.py
 
@@ -62,7 +62,7 @@ Pure Polars + scikit-learn fair-value model: `feature_engineering` (Sales-only a
 
 ### fair_value_tab.py
 
-Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version), `get_model` (trains on `trim_psf(features)`), `get_scored` (threshold-independent predictions); the threshold slider only re-runs `flag_distress`.
+Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version, full history — trailing comps need the past), `get_model` (loads the pre-trained GCS bundle), `get_scored(data_version, score_start, score_end, _result)` (threshold-independent predictions for the selected scoring window only; default "Last month" keeps the tab fast); the threshold slider only re-runs `flag_distress`.
 
 ### train_fair_value.py
 

@@ -1682,9 +1682,20 @@ if not neighborhoods:
 
 filtered = apply_filters(DF, neighborhoods, bedroom, start_date, end_date)
 
-tab_overview, tab_fair_value = st.tabs(["📊 Market Overview", "🎯 Fair Value Model"])
+# Segmented control instead of st.tabs: st.tabs executes every tab body on
+# each rerun, which would load the model bundle and score transactions even
+# when the user never opens the Fair Value view. Only the active page runs.
+active_page = st.segmented_control(
+    "Page",
+    ["📊 Market Overview", "🎯 Fair Value Model"],
+    default="📊 Market Overview",
+    key="active_page",
+    label_visibility="collapsed",
+)
 
-with tab_overview:
+if active_page == "🎯 Fair Value Model":
+    render_fair_value_tab(neighborhoods, bedroom, start_date, end_date, data_version)
+else:
     _render_market_overview(
         filtered,
         neighborhoods,
@@ -1696,6 +1707,3 @@ with tab_overview:
         date_min,
         date_max,
     )
-
-with tab_fair_value:
-    render_fair_value_tab(neighborhoods, bedroom, start_date, end_date, data_version)
