@@ -941,12 +941,12 @@ def score_transactions(result: FairValueResult, df: pl.DataFrame) -> pl.DataFram
 
 
 # Expected model error by comparable-data segment, used to standardize the
-# spread into a signal strength. Sales in projects with recent comparable
-# sales carry ~4% typical error; cold-start sales (no trailing project comp)
-# carry roughly 2-3x that, so the same raw discount is much weaker evidence.
-# Overridden by bundle metrics when the shipped model records segment errors.
-EXPECTED_ERR_ESTABLISHED = 0.042
-EXPECTED_ERR_COLD_START = 0.11
+# spread into a signal strength. Measured on the floor-champion's last four
+# out-of-time CV folds (2026-07-05): established MedAPE 3.5%, cold-start
+# (no trailing project comp) 6.4% with a 2.2x false-flag rate. Slightly
+# rounded up for conservatism.
+EXPECTED_ERR_ESTABLISHED = 0.04
+EXPECTED_ERR_COLD_START = 0.065
 
 
 def flag_distress(
