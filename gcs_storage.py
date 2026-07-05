@@ -82,6 +82,8 @@ REFERENCE_OBJECTS = {
     "buildings_agg": "dld_reference/project_buildings_agg.parquet",
     "service_charges": "dld_reference/service_charges.parquet",
     "rent_index": "dld_reference/rent_index.parquet",
+    "units": "dld_reference/units_slim.parquet",
+    "sale_index": "dld_reference/sale_index.parquet",
 }
 
 

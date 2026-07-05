@@ -61,6 +61,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "project_meta": False,           # developer, building age, project size/height
     "rent_yield": False,             # trailing 180d area x rooms rent PSF + implied yield
     "service_charge": False,         # latest per-project service cost
+    "unit_floor": False,             # floor via project+exact-area layout match (units table)
+    "sale_index": False,             # official DLD monthly flat price index, 40d avail lag
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -159,6 +161,10 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric += ["area_rent_psf_180d", "implied_gross_yield"]
     if cfg["service_charge"]:
         numeric.append("service_cost")
+    if cfg["unit_floor"]:
+        numeric += ["unit_floor", "layout_floor_mean", "layout_units", "unit_balcony_sqm"]
+    if cfg["sale_index"]:
+        numeric.append("mkt_index")
     return numeric, categorical
 
 
@@ -167,6 +173,8 @@ REFERENCE_REQUIREMENTS = {
     "project_meta": ("projects", "buildings_agg"),
     "rent_yield": ("rent_index",),
     "service_charge": ("projects", "service_charges"),
+    "unit_floor": ("projects", "units"),
+    "sale_index": ("sale_index",),
 }
 
 
@@ -476,6 +484,81 @@ def feature_engineering(
             )
         else:
             df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
+
+    if cfg["unit_floor"]:
+        # Static unit facts from the DLD units registry. Transactions carry no
+        # unit key, so we match project (via project_number -> project_id) +
+        # exact registered area: where that layout is unique in the project,
+        # unit_floor is the true floor; where layouts stack, only the layout's
+        # floor distribution and balcony area are attached.
+        bridge = (
+            reference["projects"]
+            .select(
+                pl.col("project_number").cast(pl.Int64, strict=False).alias("_pn"),
+                pl.col("project_id").cast(pl.Int64, strict=False).alias("_pid"),
+            )
+            .drop_nulls()
+            .unique("_pn")
+        )
+        units = (
+            reference["units"]
+            .select(
+                pl.col("project_id").cast(pl.Int64, strict=False).alias("_pid"),
+                pl.col("floor_num").cast(pl.Float64, strict=False),
+                pl.col("actual_area").cast(pl.Float64, strict=False)
+                .round(2).alias("_akey"),
+                pl.col("unit_balcony_area").cast(pl.Float64, strict=False),
+            )
+            .drop_nulls(["_pid", "_akey"])
+        )
+        layouts = (
+            units.group_by("_pid", "_akey")
+            .agg(
+                pl.len().cast(pl.Float64).alias("layout_units"),
+                pl.col("floor_num").mean().alias("layout_floor_mean"),
+                pl.col("floor_num").first().alias("_floor_single"),
+                pl.col("unit_balcony_area").mean().alias("unit_balcony_sqm"),
+            )
+            .with_columns(
+                pl.when(pl.col("layout_units") == 1)
+                .then(pl.col("_floor_single"))
+                .otherwise(None)
+                .alias("unit_floor")
+            )
+            .drop("_floor_single")
+        )
+        df = (
+            df.with_columns(
+                pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_pn"),
+                pl.col("ACTUAL_AREA").cast(pl.Float64).round(2).alias("_akey"),
+            )
+            .join(bridge, on="_pn", how="left")
+            .join(layouts, on=["_pid", "_akey"], how="left")
+            .drop("_pn", "_pid", "_akey")
+        )
+
+    if cfg["sale_index"]:
+        # Official monthly flat index; the value for month m (dated the 1st)
+        # is treated as available 40 days later (~10th of the next month), so
+        # the as-of join can never use an index covering the sale's own month.
+        idx = (
+            reference["sale_index"]
+            .select(
+                pl.col("month").cast(pl.Date),
+                pl.coalesce(pl.col("flat_price_index"), pl.col("flat_index"))
+                .cast(pl.Float64, strict=False)
+                .alias("mkt_index"),
+            )
+            .drop_nulls()
+            .sort("month")
+            .with_columns(pl.col("month").dt.offset_by("40d").alias("_avail"))
+        )
+        df = df.sort("date").join_asof(
+            idx.select("_avail", "mkt_index"),
+            left_on="date",
+            right_on="_avail",
+            strategy="backward",
+        ).drop("_avail")
 
     _, categorical = feature_columns(cfg)
     missing = [c for c in categorical if c not in df.columns]

@@ -120,6 +120,62 @@ def pull_service_charges(config, secrets) -> None:
     upload(secrets, "service_charges.parquet", latest)
 
 
+# Flats-only units pull, chunked by rooms so a gateway failure costs one
+# chunk. Units without a rooms label are skipped (they cannot be matched to
+# transactions meaningfully anyway).
+UNITS_ROOMS_CHUNKS = [
+    "Studio", "1 B/R", "2 B/R", "3 B/R", "4 B/R", "5 B/R", "6 B/R", "PENTHOUSE",
+]
+
+
+def pull_units(config, secrets) -> None:
+    frames: list[pl.DataFrame] = []
+    for rooms in UNITS_ROOMS_CHUNKS:
+        params = {"filter": f"property_sub_type_en='Flat' AND rooms_en='{rooms}'"}
+        for attempt in (1, 2):
+            try:
+                chunk = fetch_dataset(config, "dld_units-open-api", params=params,
+                                      max_records=2_000_000)
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                print(f"units chunk {rooms}: retrying after {type(exc).__name__}: {exc}",
+                      flush=True)
+                time.sleep(30)
+        if chunk.height:
+            frames.append(chunk)
+    u = pl.concat(frames, how="diagonal_relaxed")
+    slim = u.select(
+        pl.col("project_id").cast(pl.Int64, strict=False),
+        pl.col("building_number").cast(pl.Utf8),
+        pl.col("floor").cast(pl.Utf8).str.extract(r"(-?\d+)")
+        .cast(pl.Float64, strict=False).alias("floor_num"),
+        pl.col("actual_area").cast(pl.Float64, strict=False),
+        pl.col("rooms_en").cast(pl.Utf8),
+        pl.col("unit_balcony_area").cast(pl.Float64, strict=False),
+    ).drop_nulls(["project_id", "actual_area"])
+    upload(secrets, "units_slim.parquet", slim)
+
+
+def pull_sale_index(config, secrets) -> None:
+    s = fetch_dataset(config, "dld_residential_sale_index-open-api", max_records=10_000)
+    idx = (
+        s.select(
+            pl.col("first_date_of_month").cast(pl.Utf8).str.slice(0, 10)
+            .str.to_date("%Y-%m-%d", strict=False).alias("month"),
+            pl.col("flat_monthly_price_index").cast(pl.Float64, strict=False)
+            .alias("flat_price_index"),
+            pl.col("flat_monthly_index").cast(pl.Float64, strict=False)
+            .alias("flat_index"),
+        )
+        .drop_nulls("month")
+        .unique("month")
+        .sort("month")
+    )
+    upload(secrets, "sale_index.parquet", idx)
+
+
 ROOMS_BAND_MAP = {
     "studio": "Studio",
     "1 bed": "1BR", "one bed": "1BR",
@@ -229,8 +285,11 @@ def pull_rents(config, secrets) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--only", nargs="*", default=["projects", "buildings", "service", "rents"],
-                        choices=["projects", "buildings", "service", "rents"])
+    parser.add_argument(
+        "--only", nargs="*",
+        default=["projects", "buildings", "service", "rents", "units", "saleindex"],
+        choices=["projects", "buildings", "service", "rents", "units", "saleindex"],
+    )
     args = parser.parse_args()
 
     secrets = load_local_secrets()
@@ -247,6 +306,10 @@ def main() -> int:
         pull_service_charges(config, secrets)
     if "rents" in args.only:
         pull_rents(config, secrets)
+    if "units" in args.only:
+        pull_units(config, secrets)
+    if "saleindex" in args.only:
+        pull_sale_index(config, secrets)
     return 0
 
 
