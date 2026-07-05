@@ -50,7 +50,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     # --- campaign feature groups (all strictly past-only) ---
     "comps_project_windows": False,  # 30d + 90d project median PSF variants
     "comps_building": False,         # trailing 90-day building median PSF
-    "te_hist": False,                # expanding all-past project & building median PSF
+    "price_history": False,          # expanding all-past project & building median PSF
     "liquidity": False,              # trailing txn counts (project 90d, area 30d)
     "momentum": False,               # area short/long comp ratio (30d vs 180d)
     "rel_size": False,               # log_sqft minus past project median log_sqft
@@ -62,7 +62,6 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "rent_yield": False,             # trailing 180d area x rooms rent PSF + implied yield
     "service_charge": False,         # latest per-project service cost
     "unit_floor": False,             # floor via project+exact-area layout match (units table)
-    "sale_index": False,             # official DLD monthly flat price index, 40d avail lag
     "rel_floor": False,              # layout floor mean / project max floors (needs unit_floor+project_meta)
     "rent_density": False,           # trailing 180d Ejari contract count for area x rooms band
     "comps_rooms": False,            # trailing comps per project x rooms and area x rooms (strictly past)
@@ -144,7 +143,7 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric += ["project_comp_psf_30", "project_comp_psf_90"]
     if cfg["comps_building"]:
         numeric.append("building_comp_psf")
-    if cfg["te_hist"]:
+    if cfg["price_history"]:
         numeric += ["project_hist_psf", "building_hist_psf"]
     if cfg["liquidity"]:
         numeric += ["project_txn_90d", "area_txn_30d"]
@@ -167,8 +166,6 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric.append("service_cost")
     if cfg["unit_floor"]:
         numeric += ["unit_floor", "layout_floor_mean", "layout_units", "unit_balcony_sqm"]
-    if cfg["sale_index"]:
-        numeric.append("mkt_index")
     if cfg["rel_floor"]:
         numeric.append("rel_floor_pct")
     if cfg["rent_density"]:
@@ -186,7 +183,6 @@ REFERENCE_REQUIREMENTS = {
     "rent_yield": ("rent_index",),
     "service_charge": ("projects", "service_charges"),
     "unit_floor": ("projects", "units"),
-    "sale_index": ("sale_index",),
     "rel_floor": ("projects", "units", "buildings_agg"),
     "rent_density": ("rent_index",),
 }
@@ -313,7 +309,7 @@ def feature_engineering(
     # implicit null group (HGB treats NaN natively).
     derived_groups = (
         "comps_area", "comps_project", "comps_project_windows",
-        "comps_building", "te_hist", "liquidity", "momentum",
+        "comps_building", "price_history", "liquidity", "momentum",
         "rel_size", "comp_dispersion", "repeat_sale", "repeat_sale_adj",
         "comps_rooms", "rooms_dynamics",
     )
@@ -336,7 +332,7 @@ def feature_engineering(
             comps.append(past_stat("psf", "90d", "PROJECT_EN").alias("project_comp_psf_90"))
         if cfg["comps_building"]:
             comps.append(past_stat("psf", "90d", "BUILDING_NAME_EN").alias("building_comp_psf"))
-        if cfg["te_hist"]:
+        if cfg["price_history"]:
             # Expanding all-past medians (window far longer than the data span).
             comps.append(past_stat("psf", "3650d", "PROJECT_EN").alias("project_hist_psf"))
             comps.append(past_stat("psf", "3650d", "BUILDING_NAME_EN").alias("building_hist_psf"))
@@ -598,29 +594,6 @@ def feature_engineering(
             .otherwise(None)
             .alias("rel_floor_pct")
         )
-
-    if cfg["sale_index"]:
-        # Official monthly flat index; the value for month m (dated the 1st)
-        # is treated as available 40 days later (~10th of the next month), so
-        # the as-of join can never use an index covering the sale's own month.
-        idx = (
-            reference["sale_index"]
-            .select(
-                pl.col("month").cast(pl.Date),
-                pl.coalesce(pl.col("flat_price_index"), pl.col("flat_index"))
-                .cast(pl.Float64, strict=False)
-                .alias("mkt_index"),
-            )
-            .drop_nulls()
-            .sort("month")
-            .with_columns(pl.col("month").dt.offset_by("40d").alias("_avail"))
-        )
-        df = df.sort("date").join_asof(
-            idx.select("_avail", "mkt_index"),
-            left_on="date",
-            right_on="_avail",
-            strategy="backward",
-        ).drop("_avail")
 
     _, categorical = feature_columns(cfg)
     missing = [c for c in categorical if c not in df.columns]

@@ -196,9 +196,7 @@ def main() -> int:
 
 
 def check_reference_groups(raw: pl.DataFrame) -> bool:
-    """unit_floor + sale_index joins against tiny synthetic reference frames."""
-    from datetime import date as _date
-
+    """unit_floor join against tiny synthetic reference frames."""
     projects = pl.DataFrame({"project_number": [101, 102], "project_id": [9001, 9002]})
     units = pl.DataFrame({
         "project_id": [9001, 9001, 9001, 9002, 9002],
@@ -208,19 +206,14 @@ def check_reference_groups(raw: pl.DataFrame) -> bool:
         "rooms_en": ["1 B/R", "2 B/R", "2 B/R", "Studio", "Studio"],
         "unit_balcony_area": [10.0, 20.0, 22.0, 5.0, 6.0],
     })
-    sale_index = pl.DataFrame({
-        "month": [_date(2023, 1, 1), _date(2023, 2, 1)],
-        "flat_price_index": [100.0, 110.0],
-        "flat_index": [None, None],
-    })
     sub = raw.head(2000).with_columns(
         pl.Series("PROJECT_NUMBER", [101, 102] * 1000),
         pl.Series("ACTUAL_AREA", [88.55, 60.25] * 1000),
     )
     feats = feature_engineering(
         sub,
-        {"project": True, "amenity": True, "unit_floor": True, "sale_index": True},
-        reference={"projects": projects, "units": units, "sale_index": sale_index},
+        {"project": True, "amenity": True, "unit_floor": True},
+        reference={"projects": projects, "units": units},
     )
     uniq = feats.filter(pl.col("layout_units") == 1)
     stacked = feats.filter(pl.col("layout_units") == 2)
@@ -230,11 +223,8 @@ def check_reference_groups(raw: pl.DataFrame) -> bool:
         and uniq["unit_floor"].drop_nulls().unique().to_list() == [7.0]
         and stacked["unit_floor"].is_null().all()
         and abs(stacked["layout_floor_mean"][0] - 7.0) < 1e-9
-        # all synthetic dates are after Feb 2023 + 40d, so the backward as-of
-        # join must pick the latest (Feb) index everywhere
-        and feats["mkt_index"].drop_nulls().unique().to_list() == [110.0]
     )
-    return check(good, "unit_floor + sale_index reference joins behave as designed")
+    return check(good, "unit_floor reference join behaves as designed")
 
 
 if __name__ == "__main__":

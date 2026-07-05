@@ -96,7 +96,6 @@ FEATURE_LABELS = {
     "project_rooms_comp_std": "Price dispersion, same unit type",
     "project_rooms_txn_90d": "Sales activity, same unit type (90 days)",
     "rent_contracts_180d": "Area rental-market activity (180 days)",
-    "mkt_index": "Official market price index",
 }
 
 
@@ -120,14 +119,17 @@ DATA_SOURCES_TABLE = """
 | 11 | Distress procedure signal | `PROCEDURE_EN`, `GROUP_EN` | Now |
 | 12 | Trailing area/project comparables | derived in-dataset (past-only) | Now (in model) |
 | 13 | Same unit's previous sale (repeat-sale) | derived in-dataset (past-only) | Now (in model) |
-| 14 | Developer, building age, project size & height | DLD Projects + Buildings (project-level, in GCS) | **In testing — Campaign 2** |
-| 15 | Rental yield | DLD Rent Contracts (Ejari) → weekly area × rooms rent index | **In testing — data pull in progress** |
-| 16 | Live listing asking prices | Bayut / Property Finder | **Phase 2 — planned** |
-| 17 | Official sale price index | Dubai Pulse `dld_residential_sale_index` | **Phase 2** |
+| 14 | Floor, balcony, layout (units registry) | DLD Units via project + exact-area match | Now (in model) |
+| 15 | Developer, building age, project size & height | DLD Projects + Buildings (project-level, in GCS) | Now (in model) |
+| 16 | Rental yield | DLD Rent Contracts (Ejari) → weekly area × rooms rent index | Tested — no prediction gain; kept for display |
+| 17 | Building reviews & comfort sentiment | Google Places / DLD building stars | **Phase 3 — planned** |
+| 18 | Live listing asking prices | Bayut / Property Finder | **Phase 3 — planned** |
+| 19 | Official sale price index | Dubai Pulse `dld_residential_sale_index` | Dead end — dataset frozen at 2024-05 |
 
-Per-unit floor is not achievable from DLD data: transactions carry no unit or
-building key, so building metadata joins at *project* level via `project_number`
-(~90% of sales matched).
+Transactions carry no unit key, so units-registry data joins by project +
+exact registered area: the true floor is known where a layout's area is
+unique in its project (~5% of sales); elsewhere the layout's floor
+distribution and balcony size are used (~76% of sales matched).
 """
 
 

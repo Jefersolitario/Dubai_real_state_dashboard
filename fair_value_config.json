@@ -16,7 +16,7 @@
   "comps_area": false,
   "comps_project": true,
   "repeat_sale": true,
-  "te_hist": true,
+  "price_history": true,
   "rel_size": true,
   "unit_floor": true,
   "project_meta": true,

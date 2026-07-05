@@ -27,6 +27,11 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 # Force a full snapshot rebuild for the default 24-month window
 .\.venv\Scripts\python.exe store_dld_transactions_gcs.py --full-refresh --last-months 24
 
+# Pull DLD reference datasets into GCS dld_reference/ (projects, buildings,
+# service charges, units registry, Ejari rent grid; --only to pick subsets)
+.\.venv\Scripts\python.exe store_reference_data_gcs.py --only projects buildings units
+.\.venv\Scripts\python.exe store_reference_data_gcs.py --only rents   # long pull (~2-4h, chunked)
+
 # Offline fair-value model checks and optimization
 .\.venv\Scripts\python.exe smoke_test_fair_value.py
 .\.venv\Scripts\python.exe optimize_fair_value.py
@@ -58,11 +63,11 @@ Shared constants and pure Polars/layout helpers (`AREA_DISPLAY`, `NEIGHBORHOODS`
 
 ### fair_value_model.py
 
-Pure Polars + scikit-learn fair-value model: `feature_engineering` (Sales-only apartments, METER_SALE_PRICE area-mismatch guard, no PSF trim — apply `trim_psf` before TRAINING only), 10-fold date-ordered `TimeSeriesSplit` `cross_validate`, `train_fair_value_model` (HistGradientBoostingRegressor on log AED/sqft, out-of-sample permutation importances), `score_transactions` (`spread_pct = actual/fair value − 1`), and `flag_distress` (distressed = below threshold AND ≥1 residual-independent signal: forced-sale procedure, illiquid project, multiple sellers — a deep discount alone never qualifies). Reads `fair_value_config.json` (written by the optimizer) via `load_shipping_config()` so the app trains the winning configuration.
+Pure Polars + scikit-learn fair-value model: `feature_engineering` (Sales-only apartments, METER_SALE_PRICE area-mismatch guard, non-market-procedure exclusion, no PSF trim — apply `trim_psf` before TRAINING only; strictly past-only derived features via `closed="left"` rolling windows and `shift(1)`; optional `reference` frames for the units-registry/projects/rent-grid joins), 10-fold date-ordered `TimeSeriesSplit` `cross_validate` (fold metrics include MedAPE plus the tail pair `p90_ape` and `flag_prop` — the share of ordinary sales pushed below −15% spread by model error; campaign acceptance requires a MedAPE win AND no tail worsening), `train_fair_value_model` (HistGradientBoostingRegressor on log AED/sqft, out-of-sample permutation importances), `score_transactions` (`spread_pct = actual/fair value − 1`), and `flag_distress` (distressed = below threshold AND ≥1 residual-independent signal: forced-sale procedure, illiquid project, multiple sellers — a deep discount alone never qualifies; also emits `signal_strength` = −spread ÷ segment expected error, established ~4% vs cold-start ~6.5%). The shipped configuration (`fair_value_config.json`, via `load_shipping_config()`) uses floor/balcony features from the units registry (`unit_floor` + `project_meta` + `rel_floor`) and per-unit-type comps (`comps_rooms`) on top of repeat-sale, price-history, and relative-size groups — CV 4.08%, holdout 4.15%. The units join needs `PROJECT_NUMBER` populated in the snapshot (a normalized snapshot cannot back-fill it; rebuild from a raw pull if coverage drops).
 
 ### fair_value_tab.py
 
-Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version, full history — trailing comps need the past), `get_model` (loads the pre-trained GCS bundle), `get_scored(data_version, score_start, score_end, _result)` (threshold-independent predictions for the selected scoring window only; default "Last month" keeps the tab fast); the threshold slider only re-runs `flag_distress`.
+Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version, full history — trailing comps need the past; loads GCS reference frames when the shipped config requires them), `get_model` (loads the pre-trained GCS bundle), `get_scored(data_version, score_start, score_end, _result)` (threshold-independent predictions for the selected scoring window only; default "Last month" keeps the tab fast); the threshold slider only re-runs `flag_distress`. The flagged table ranks distressed-first then by `signal_strength`; `FEATURE_LABELS` maps model feature names to plain language for the importance chart.
 
 ### train_fair_value.py
 
@@ -72,8 +77,22 @@ and publishes a pickled inference bundle to
 (`GCS_MODEL_OBJECT`). The Streamlit tab only loads this bundle (6h cache TTL)
 and predicts — training is too heavy for Streamlit Cloud (the in-app CV was
 profiled at ~2-4 minutes and caused watchdog kills). Ops flow: refresh
-snapshot (`store_dld_transactions_gcs.py`) → `train_fair_value.py` → the
-deployed app picks the new bundle up automatically.
+snapshot (`store_dld_transactions_gcs.py`) → refresh reference data when
+stale (`store_reference_data_gcs.py`, monthly is plenty) →
+`train_fair_value.py` → the deployed app picks the new bundle up
+automatically.
+
+### store_reference_data_gcs.py
+
+Pulls DLD reference datasets to GCS under `dld_reference/`: `projects.parquet`
+(+developer names), `project_buildings_agg.parquet` (floors/flats per
+project), `service_charges.parquet` (latest budget year), `units_slim.parquet`
+(flats registry: floor, exact area, balcony — chunked by rooms), and
+`rent_index.parquet` (weekly AREA_EN × rooms-band trailing-180d median rent
+PSF, strictly past, built from a monthly-chunked Ejari pull with
+sanitization). `sale_index.parquet` is also pulled but the gateway dataset is
+frozen at 2024-05, so no model feature uses it. Long pulls are chunked so a
+gateway blip costs one chunk (HTTP 408 is retryable in `dda_api`).
 
 ### optimize_fair_value.py
 
