@@ -202,30 +202,32 @@ def reference_needed(feature_config: dict | None = None) -> list[str]:
 # Feature engineering
 # ---------------------------------------------------------------------------
 
-def feature_engineering(
-    raw: pl.DataFrame,
-    feature_config: dict[str, bool] | None = None,
-    date_origin: date | None = None,
-    reference: dict[str, pl.DataFrame] | None = None,
-) -> pl.DataFrame:
-    """Filter to scoreable sales and derive model features + target.
+# Feature groups whose derivations need the date-sorted frame (all built on
+# strictly-past rolling windows or shifts).
+DERIVED_FEATURE_GROUPS = (
+    "comps_area", "comps_project", "comps_project_windows",
+    "comps_building", "price_history", "liquidity", "momentum",
+    "rel_size", "comp_dispersion", "repeat_sale", "repeat_sale_adj",
+    "comps_rooms", "rooms_dynamics",
+)
 
-    Keeps only apartment Sales rows with positive price and area, drops rows
-    whose ACTUAL_AREA contradicts the DLD-reported METER_SALE_PRICE (plot
-    area recorded instead of unit area), and returns one row per transaction
-    with the ``log_psf`` target, model features, and passthrough columns.
 
-    Deliberately does NOT trim PSF outliers: the deepest discounts are the
-    distressed assets this model exists to surface. Apply :func:`trim_psf`
-    to the result before TRAINING so the target stays robust.
+def _past_stat(value: str, window: str, group: str, stat: str = "median") -> pl.Expr:
+    """Strictly-past rolling ``stat`` of ``value`` per ``group`` (closed left).
 
-    ``date_origin`` anchors ``days_since_start``; pass the training origin
-    when scoring new data so the trend feature stays aligned.
+    ``closed="left"`` excludes the current day and, together with the date
+    sort, the row itself — the expression can never see its own price or
+    any future information. Rows whose ``group`` is null are masked to null
+    rather than pooled into one implicit null group.
     """
-    cfg = {**DEFAULT_FEATURE_CONFIG, **(feature_config or {})}
+    rolled = getattr(pl.col(value), f"rolling_{stat}_by")(
+        "date", window_size=window, closed="left"
+    ).over(group)
+    return pl.when(pl.col(group).is_not_null()).then(rolled)
 
-    # Frames that bypassed normalize_dld_transactions may lack optional
-    # columns; backfill them as nulls so derivations below never crash.
+
+def _backfill_optional_columns(raw: pl.DataFrame) -> pl.DataFrame:
+    """Null-backfill optional columns for frames that bypassed normalization."""
     optional_sources = [
         "PARKING", "TOTAL_BUYER", "TOTAL_SELLER", "METER_SALE_PRICE",
         "PROCEDURE_EN", "PROJECT_EN", "MASTER_PROJECT_EN", "BUILDING_NAME_EN",
@@ -234,8 +236,17 @@ def feature_engineering(
     ]
     missing_sources = [c for c in optional_sources if c not in raw.columns]
     if missing_sources:
-        raw = raw.with_columns(pl.lit(None).alias(c) for c in missing_sources)
+        return raw.with_columns(pl.lit(None).alias(c) for c in missing_sources)
+    return raw
 
+
+def _filter_scoreable_sales(raw: pl.DataFrame) -> pl.DataFrame:
+    """Apartment Sales rows with positive price/area, market procedures only.
+
+    Also merges case variants of project/building names (e.g. "Imperial
+    Residence" vs "IMPERIAL RESIDENCE") so the encoder sees one category
+    per real-world name.
+    """
     df = raw.filter(
         (pl.col("GROUP_EN").cast(pl.Utf8).str.to_lowercase().str.contains("sale"))
         & (pl.col("PROP_SB_TYPE_EN").cast(pl.Utf8).str.to_lowercase() == "flat")
@@ -248,16 +259,16 @@ def feature_engineering(
     )
     if df.is_empty():
         return df
-
-    # Merge case variants (e.g. "Imperial Residence" vs "IMPERIAL RESIDENCE")
-    # so the encoder sees one category per real-world name.
-    df = df.with_columns(
+    return df.with_columns(
         pl.col(c).cast(pl.Utf8).str.to_uppercase().alias(c)
         for c in ("PROJECT_EN", "MASTER_PROJECT_EN", "BUILDING_NAME_EN")
         if c in df.columns
     )
 
-    df = df.with_columns(
+
+def _parse_date_and_price(df: pl.DataFrame) -> pl.DataFrame:
+    """Add ``date`` and AED/sqft ``psf``; drop rows where either is unparseable."""
+    return df.with_columns(
         pl.col("INSTANCE_DATE")
         .cast(pl.Utf8)
         .str.slice(0, 10)
@@ -266,22 +277,26 @@ def feature_engineering(
         (pl.col("TRANS_VALUE") / (pl.col("ACTUAL_AREA") * SQM_TO_SQFT)).alias("psf"),
     ).drop_nulls(["date", "psf"])
 
-    # Units guard: DLD publishes METER_SALE_PRICE (AED per sqm). When present,
-    # TRANS_VALUE / ACTUAL_AREA must agree with it — a large mismatch means
-    # ACTUAL_AREA holds a plot/common area, which would fabricate an extreme
-    # fake discount. Rows without METER_SALE_PRICE are kept.
+
+def _drop_area_mismatch_rows(df: pl.DataFrame) -> pl.DataFrame:
+    """Units guard: keep rows whose price/area agrees with METER_SALE_PRICE.
+
+    DLD publishes METER_SALE_PRICE (AED per sqm). When present,
+    TRANS_VALUE / ACTUAL_AREA must agree with it — a large mismatch means
+    ACTUAL_AREA holds a plot/common area, which would fabricate an extreme
+    fake discount. Rows without METER_SALE_PRICE are kept.
+    """
     msp = pl.col("METER_SALE_PRICE").cast(pl.Float64, strict=False)
     psf_sqm = pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")
-    df = df.filter(
+    return df.filter(
         msp.is_null()
         | (msp <= 0)
         | (((psf_sqm - msp) / msp).abs() <= AREA_MISMATCH_TOLERANCE)
     )
-    if df.is_empty():
-        return df
 
-    origin = date_origin or df.select(pl.col("date").min()).item()
 
+def _add_core_columns(df: pl.DataFrame, origin: date, cfg: dict) -> pl.DataFrame:
+    """Target, size/time/rooms/tier core features, and amenity columns."""
     rooms = pl.col("ROOMS_EN").cast(pl.Utf8)
     df = df.with_columns(
         pl.col("psf").log().alias("log_psf"),
@@ -294,246 +309,261 @@ def feature_engineering(
         .alias("rooms_ord"),
         pl.col("AREA_EN").cast(pl.Utf8).replace_strict(DISTRICT_TIER, default="UNKNOWN").alias("tier"),
     )
-
     if cfg["amenity"]:
         df = df.with_columns(
             pl.col("PARKING").cast(pl.Utf8).str.extract(r"(\d+)").cast(pl.Float64, strict=False).alias("parking_count"),
             pl.col("TOTAL_BUYER").cast(pl.Float64, strict=False).alias("total_buyer"),
             pl.col("TOTAL_SELLER").cast(pl.Float64, strict=False).alias("total_seller"),
         )
+    return df
 
-    # Trailing statistics: strictly past-only (closed="left" excludes the
-    # current day; shift(1) excludes the current row) so they never leak the
-    # transaction's own price or any future information. Rows without a
-    # project/building are masked to null rather than pooled into one
-    # implicit null group (HGB treats NaN natively).
-    derived_groups = (
-        "comps_area", "comps_project", "comps_project_windows",
-        "comps_building", "price_history", "liquidity", "momentum",
-        "rel_size", "comp_dispersion", "repeat_sale", "repeat_sale_adj",
-        "comps_rooms", "rooms_dynamics",
-    )
-    if any(cfg[g] for g in derived_groups):
-        df = df.sort("date")
 
-        def past_stat(value: str, window: str, group: str, stat: str = "median") -> pl.Expr:
-            """Strictly-past rolling ``stat`` of ``value`` per ``group`` (closed left)."""
-            rolled = getattr(pl.col(value), f"rolling_{stat}_by")(
-                "date", window_size=window, closed="left"
-            ).over(group)
-            return pl.when(pl.col(group).is_not_null()).then(rolled)
+def _add_trailing_comps(df: pl.DataFrame, cfg: dict) -> pl.DataFrame:
+    """Strictly-past trailing comparables, liquidity, momentum, dispersion.
 
-        comps = []
-        if cfg["comps_area"]:
-            comps.append(past_stat("psf", "30d", "AREA_EN").alias("area_comp_psf"))
-        if cfg["comps_project"]:
-            comps.append(past_stat("psf", "60d", "PROJECT_EN").alias("project_comp_psf"))
-        if cfg["comps_project_windows"]:
-            comps.append(past_stat("psf", "30d", "PROJECT_EN").alias("project_comp_psf_30"))
-            comps.append(past_stat("psf", "90d", "PROJECT_EN").alias("project_comp_psf_90"))
-        if cfg["comps_building"]:
-            comps.append(past_stat("psf", "90d", "BUILDING_NAME_EN").alias("building_comp_psf"))
-        if cfg["price_history"]:
-            # Expanding all-past medians (window far longer than the data span).
-            comps.append(past_stat("psf", "3650d", "PROJECT_EN").alias("project_hist_psf"))
-            comps.append(past_stat("psf", "3650d", "BUILDING_NAME_EN").alias("building_hist_psf"))
-        if cfg["liquidity"] or cfg["rooms_dynamics"]:
-            df = df.with_columns(pl.lit(1.0).alias("_one"))
-        if cfg["liquidity"]:
-            comps.append(past_stat("_one", "90d", "PROJECT_EN", "sum").alias("project_txn_90d"))
-            comps.append(past_stat("_one", "30d", "AREA_EN", "sum").alias("area_txn_30d"))
-        if cfg["momentum"]:
-            comps.append(
-                (
-                    past_stat("psf", "30d", "AREA_EN")
-                    / past_stat("psf", "180d", "AREA_EN")
-                ).alias("area_momentum")
-            )
-        if cfg["rel_size"]:
-            comps.append(
-                (pl.col("ACTUAL_AREA").log() - past_stat("ACTUAL_AREA", "3650d", "PROJECT_EN").log())
-                .alias("rel_log_sqft")
-            )
-        if cfg["comp_dispersion"]:
-            comps.append(past_stat("psf", "60d", "PROJECT_EN", "std").alias("project_comp_std"))
-        if cfg["comps_rooms"] or cfg["rooms_dynamics"]:
-            # Comps within the same unit type, not pooled across the project/
-            # area: what 2BRs in this project sold for, not "units". Combined
-            # keys go null if either part is null (concat_str propagates null),
-            # so past_stat's mask applies as usual.
-            df = df.with_columns(
-                pl.concat_str(
-                    [pl.col("PROJECT_EN"), pl.col("ROOMS_EN").cast(pl.Utf8)],
-                    separator="|",
-                ).alias("_proj_rooms"),
-                pl.concat_str(
-                    [pl.col("AREA_EN"), pl.col("ROOMS_EN").cast(pl.Utf8)],
-                    separator="|",
-                ).alias("_area_rooms"),
-            )
-            if cfg["comps_rooms"]:
-                pr_win = str(cfg.get("proj_rooms_window", "90d"))
-                ar_win = str(cfg.get("area_rooms_window", "30d"))
-                comps.append(past_stat("psf", pr_win, "_proj_rooms").alias("project_rooms_comp_psf"))
-                comps.append(past_stat("psf", ar_win, "_area_rooms").alias("area_rooms_comp_psf"))
-            if cfg["rooms_dynamics"]:
-                comps.append(past_stat("psf", "90d", "_proj_rooms", "std").alias("project_rooms_comp_std"))
-                comps.append(past_stat("_one", "90d", "_proj_rooms", "sum").alias("project_rooms_txn_90d"))
-        if comps:
-            df = df.with_columns(comps)
-        for tmp in ("_one", "_proj_rooms", "_area_rooms"):
-            if tmp in df.columns:
-                df = df.drop(tmp)
-
-        if cfg["repeat_sale"] or cfg["repeat_sale_adj"]:
-            # Pseudo-unit: same building + same room label + same area to
-            # 0.1 sqm. shift(1) over the date-sorted frame = the unit's most
-            # recent PRIOR sale only.
-            unit_key = pl.concat_str(
-                pl.col("BUILDING_NAME_EN").fill_null("?"),
-                pl.col("ROOMS_EN").cast(pl.Utf8).fill_null("?"),
-                (pl.col("ACTUAL_AREA") * 10).round(0).cast(pl.Int64).cast(pl.Utf8),
+    Expects the frame date-sorted. Temporary key/counter columns are dropped
+    before returning.
+    """
+    comps: list[pl.Expr] = []
+    if cfg["comps_area"]:
+        comps.append(_past_stat("psf", "30d", "AREA_EN").alias("area_comp_psf"))
+    if cfg["comps_project"]:
+        comps.append(_past_stat("psf", "60d", "PROJECT_EN").alias("project_comp_psf"))
+    if cfg["comps_project_windows"]:
+        comps.append(_past_stat("psf", "30d", "PROJECT_EN").alias("project_comp_psf_30"))
+        comps.append(_past_stat("psf", "90d", "PROJECT_EN").alias("project_comp_psf_90"))
+    if cfg["comps_building"]:
+        comps.append(_past_stat("psf", "90d", "BUILDING_NAME_EN").alias("building_comp_psf"))
+    if cfg["price_history"]:
+        # Expanding all-past medians (window far longer than the data span).
+        comps.append(_past_stat("psf", "3650d", "PROJECT_EN").alias("project_hist_psf"))
+        comps.append(_past_stat("psf", "3650d", "BUILDING_NAME_EN").alias("building_hist_psf"))
+    if cfg["liquidity"] or cfg["rooms_dynamics"]:
+        df = df.with_columns(pl.lit(1.0).alias("_one"))
+    if cfg["liquidity"]:
+        comps.append(_past_stat("_one", "90d", "PROJECT_EN", "sum").alias("project_txn_90d"))
+        comps.append(_past_stat("_one", "30d", "AREA_EN", "sum").alias("area_txn_30d"))
+    if cfg["momentum"]:
+        comps.append(
+            (
+                _past_stat("psf", "30d", "AREA_EN")
+                / _past_stat("psf", "180d", "AREA_EN")
+            ).alias("area_momentum")
+        )
+    if cfg["rel_size"]:
+        comps.append(
+            (pl.col("ACTUAL_AREA").log() - _past_stat("ACTUAL_AREA", "3650d", "PROJECT_EN").log())
+            .alias("rel_log_sqft")
+        )
+    if cfg["comp_dispersion"]:
+        comps.append(_past_stat("psf", "60d", "PROJECT_EN", "std").alias("project_comp_std"))
+    if cfg["comps_rooms"] or cfg["rooms_dynamics"]:
+        # Comps within the same unit type, not pooled across the project/
+        # area: what 2BRs in this project sold for, not "units". Combined
+        # keys go null if either part is null (concat_str propagates null),
+        # so _past_stat's mask applies as usual.
+        df = df.with_columns(
+            pl.concat_str(
+                [pl.col("PROJECT_EN"), pl.col("ROOMS_EN").cast(pl.Utf8)],
                 separator="|",
-            )
-            df = df.with_columns(unit_key.alias("_unit"))
+            ).alias("_proj_rooms"),
+            pl.concat_str(
+                [pl.col("AREA_EN"), pl.col("ROOMS_EN").cast(pl.Utf8)],
+                separator="|",
+            ).alias("_area_rooms"),
+        )
+        if cfg["comps_rooms"]:
+            pr_win = str(cfg.get("proj_rooms_window", "90d"))
+            ar_win = str(cfg.get("area_rooms_window", "30d"))
+            comps.append(_past_stat("psf", pr_win, "_proj_rooms").alias("project_rooms_comp_psf"))
+            comps.append(_past_stat("psf", ar_win, "_area_rooms").alias("area_rooms_comp_psf"))
+        if cfg["rooms_dynamics"]:
+            comps.append(_past_stat("psf", "90d", "_proj_rooms", "std").alias("project_rooms_comp_std"))
+            comps.append(_past_stat("_one", "90d", "_proj_rooms", "sum").alias("project_rooms_txn_90d"))
+    if comps:
+        df = df.with_columns(comps)
+    for tmp in ("_one", "_proj_rooms", "_area_rooms"):
+        if tmp in df.columns:
+            df = df.drop(tmp)
+    return df
+
+
+def _add_repeat_sale_features(df: pl.DataFrame, cfg: dict) -> pl.DataFrame:
+    """Prior sale of the same pseudo-unit (building + rooms + area to 0.1 sqm).
+
+    ``shift(1)`` over the date-sorted frame yields the unit's most recent
+    PRIOR sale only — never its own row, never the future.
+    """
+    if not (cfg["repeat_sale"] or cfg["repeat_sale_adj"]):
+        return df
+    unit_key = pl.concat_str(
+        pl.col("BUILDING_NAME_EN").fill_null("?"),
+        pl.col("ROOMS_EN").cast(pl.Utf8).fill_null("?"),
+        (pl.col("ACTUAL_AREA") * 10).round(0).cast(pl.Int64).cast(pl.Utf8),
+        separator="|",
+    )
+    df = df.with_columns(unit_key.alias("_unit"))
+    df = df.with_columns(
+        pl.when(pl.col("BUILDING_NAME_EN").is_not_null())
+        .then(pl.col("psf").shift(1).over("_unit"))
+        .alias("prior_unit_psf"),
+        pl.when(pl.col("BUILDING_NAME_EN").is_not_null())
+        .then(
+            (pl.col("date") - pl.col("date").shift(1).over("_unit"))
+            .dt.total_days()
+            .cast(pl.Float64)
+        )
+        .alias("days_since_prior_sale"),
+    )
+    if cfg["repeat_sale_adj"]:
+        # Index the prior price by area-market movement since the
+        # prior sale: both comp values are strictly past their rows.
+        df = df.with_columns(
+            _past_stat("psf", "30d", "AREA_EN").alias("_area_now")
+        ).with_columns(
+            pl.col("_area_now").shift(1).over("_unit").alias("_area_then")
+        ).with_columns(
+            (
+                pl.col("prior_unit_psf")
+                * pl.col("_area_now")
+                / pl.col("_area_then")
+            ).alias("prior_unit_psf_adj")
+        ).drop("_area_now", "_area_then")
+    return df.drop("_unit")
+
+
+def _require_reference_frames(cfg: dict, reference: dict[str, pl.DataFrame] | None) -> None:
+    """Fail fast with a pointer when a needed reference frame was not passed."""
+    needed = reference_needed(cfg)
+    if not needed:
+        return
+    missing_ref = [n for n in needed if reference is None or n not in reference]
+    if missing_ref:
+        raise ValueError(
+            f"feature_config requires reference frames {missing_ref}; "
+            "load them via gcs_storage.read_reference_frames "
+            "(published by store_reference_data_gcs.py)"
+        )
+
+
+def _join_project_reference(
+    df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
+) -> pl.DataFrame:
+    """Join static project facts: developer, age, size, height, service cost."""
+    if not (cfg["project_meta"] or cfg["service_charge"]):
+        return df
+    lookup = (
+        reference["projects"]
+        .select(
+            pl.col("project_number").cast(pl.Int64, strict=False),
+            pl.col("project_id").cast(pl.Int64, strict=False),
+            pl.col("developer_name").cast(pl.Utf8),
+            pl.coalesce(pl.col("completion_date"), pl.col("project_end_date"))
+            .cast(pl.Utf8)
+            .str.slice(0, 10)
+            .str.to_date("%Y-%m-%d", strict=False)
+            .alias("_completion"),
+            pl.col("no_of_units").cast(pl.Float64, strict=False).alias("project_units"),
+        )
+        .drop_nulls("project_number")
+        .unique("project_number", keep="first")
+    )
+    if cfg["project_meta"]:
+        buildings_per_project = reference["buildings_agg"].select(
+            pl.col("project_id").cast(pl.Int64, strict=False),
+            pl.col("project_max_floors").cast(pl.Float64, strict=False),
+        ).unique("project_id")
+        lookup = lookup.join(buildings_per_project, on="project_id", how="left")
+    if cfg["service_charge"]:
+        service_charge_lookup = reference["service_charges"].select(
+            pl.col("project_id").cast(pl.Int64, strict=False),
+            pl.col("service_cost").cast(pl.Float64, strict=False),
+        ).unique("project_id")
+        lookup = lookup.join(service_charge_lookup, on="project_id", how="left")
+    df = (
+        df.with_columns(pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_project_number"))
+        .join(lookup.rename({"project_number": "_project_number"}).drop("project_id"), on="_project_number", how="left")
+        .drop("_project_number")
+    )
+    if cfg["project_meta"]:
+        df = df.with_columns(
+            ((pl.col("date") - pl.col("_completion")).dt.total_days() / 365.25)
+            .alias("building_age_years")
+        )
+    return df.drop("_completion")
+
+
+def _join_rent_grid(
+    df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
+) -> pl.DataFrame:
+    """As-of join the weekly Ejari rent grid (strictly past by construction).
+
+    The grid's week-w value covers only contracts starting before w, and the
+    backward as-of join attaches week <= transaction date.
+    """
+    if not (cfg["rent_yield"] or cfg["rent_density"]):
+        return df
+    rooms = pl.col("ROOMS_EN").cast(pl.Utf8)
+    band = (
+        pl.when(rooms.str.to_lowercase().str.contains("studio"))
+        .then(pl.lit("Studio"))
+        .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 1)
+        .then(pl.lit("1BR"))
+        .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 2)
+        .then(pl.lit("2BR"))
+        .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 3)
+        .then(pl.lit("3BR"))
+        .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) >= 4)
+        .then(pl.lit("4BR+"))
+        .otherwise(pl.lit(None, dtype=pl.Utf8))
+    )
+    grid_cols = [
+        pl.col("AREA_EN").cast(pl.Utf8),
+        pl.col("rooms_band").cast(pl.Utf8).alias("_rooms_band"),
+        pl.col("week").cast(pl.Date),
+        pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
+    ]
+    if cfg["rent_density"]:
+        grid_cols.append(
+            pl.col("rent_contracts_180d").cast(pl.Float64, strict=False)
+        )
+    grid = (
+        reference["rent_index"]
+        .select(grid_cols)
+        .drop_nulls(["AREA_EN", "_rooms_band", "week"])
+        .sort("week")
+    )
+    df = df.with_columns(band.alias("_rooms_band")).sort("date")
+    df = df.join_asof(
+        grid,
+        left_on="date",
+        right_on="week",
+        by=["AREA_EN", "_rooms_band"],
+        strategy="backward",
+    ).drop("_rooms_band", "week")
+    if cfg["rent_yield"]:
+        denom_cols = [c for c in ("project_comp_psf", "area_comp_psf") if c in df.columns]
+        if denom_cols:
             df = df.with_columns(
-                pl.when(pl.col("BUILDING_NAME_EN").is_not_null())
-                .then(pl.col("psf").shift(1).over("_unit"))
-                .alias("prior_unit_psf"),
-                pl.when(pl.col("BUILDING_NAME_EN").is_not_null())
-                .then(
-                    (pl.col("date") - pl.col("date").shift(1).over("_unit"))
-                    .dt.total_days()
-                    .cast(pl.Float64)
-                )
-                .alias("days_since_prior_sale"),
+                (pl.col("area_rent_psf_180d") / pl.coalesce([pl.col(c) for c in denom_cols]))
+                .alias("implied_gross_yield")
             )
-            if cfg["repeat_sale_adj"]:
-                # Index the prior price by area-market movement since the
-                # prior sale: both comp values are strictly past their rows.
-                df = df.with_columns(
-                    past_stat("psf", "30d", "AREA_EN").alias("_area_now")
-                ).with_columns(
-                    pl.col("_area_now").shift(1).over("_unit").alias("_area_then")
-                ).with_columns(
-                    (
-                        pl.col("prior_unit_psf")
-                        * pl.col("_area_now")
-                        / pl.col("_area_then")
-                    ).alias("prior_unit_psf_adj")
-                ).drop("_area_now", "_area_then")
-            df = df.drop("_unit")
+        else:
+            df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
+    return df
 
-    # Reference-data joins (projects / rents / service charges). All values
-    # are static facts or strictly-past aggregates; the rent grid's week-w
-    # value covers only contracts starting before w, and a backward as-of
-    # join attaches week <= transaction date, so it is strictly past.
-    ref_needed = reference_needed(cfg)
-    if ref_needed:
-        missing_ref = [n for n in ref_needed if reference is None or n not in reference]
-        if missing_ref:
-            raise ValueError(
-                f"feature_config requires reference frames {missing_ref}; "
-                "load them via gcs_storage.read_reference_frames "
-                "(published by store_reference_data_gcs.py)"
-            )
 
-    if cfg["project_meta"] or cfg["service_charge"]:
-        lookup = (
-            reference["projects"]
-            .select(
-                pl.col("project_number").cast(pl.Int64, strict=False),
-                pl.col("project_id").cast(pl.Int64, strict=False),
-                pl.col("developer_name").cast(pl.Utf8),
-                pl.coalesce(pl.col("completion_date"), pl.col("project_end_date"))
-                .cast(pl.Utf8)
-                .str.slice(0, 10)
-                .str.to_date("%Y-%m-%d", strict=False)
-                .alias("_completion"),
-                pl.col("no_of_units").cast(pl.Float64, strict=False).alias("project_units"),
-            )
-            .drop_nulls("project_number")
-            .unique("project_number", keep="first")
-        )
-        if cfg["project_meta"]:
-            buildings_per_project = reference["buildings_agg"].select(
-                pl.col("project_id").cast(pl.Int64, strict=False),
-                pl.col("project_max_floors").cast(pl.Float64, strict=False),
-            ).unique("project_id")
-            lookup = lookup.join(buildings_per_project, on="project_id", how="left")
-        if cfg["service_charge"]:
-            service_charge_lookup = reference["service_charges"].select(
-                pl.col("project_id").cast(pl.Int64, strict=False),
-                pl.col("service_cost").cast(pl.Float64, strict=False),
-            ).unique("project_id")
-            lookup = lookup.join(service_charge_lookup, on="project_id", how="left")
-        df = (
-            df.with_columns(pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_project_number"))
-            .join(lookup.rename({"project_number": "_project_number"}).drop("project_id"), on="_project_number", how="left")
-            .drop("_project_number")
-        )
-        if cfg["project_meta"]:
-            df = df.with_columns(
-                ((pl.col("date") - pl.col("_completion")).dt.total_days() / 365.25)
-                .alias("building_age_years")
-            )
-        df = df.drop("_completion")
+def _join_units_registry(
+    df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
+) -> pl.DataFrame:
+    """Match the DLD units registry for floor/balcony facts, plus rel_floor.
 
-    if cfg["rent_yield"] or cfg["rent_density"]:
-        rooms = pl.col("ROOMS_EN").cast(pl.Utf8)
-        band = (
-            pl.when(rooms.str.to_lowercase().str.contains("studio"))
-            .then(pl.lit("Studio"))
-            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 1)
-            .then(pl.lit("1BR"))
-            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 2)
-            .then(pl.lit("2BR"))
-            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 3)
-            .then(pl.lit("3BR"))
-            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) >= 4)
-            .then(pl.lit("4BR+"))
-            .otherwise(pl.lit(None, dtype=pl.Utf8))
-        )
-        grid_cols = [
-            pl.col("AREA_EN").cast(pl.Utf8),
-            pl.col("rooms_band").cast(pl.Utf8).alias("_rooms_band"),
-            pl.col("week").cast(pl.Date),
-            pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
-        ]
-        if cfg["rent_density"]:
-            grid_cols.append(
-                pl.col("rent_contracts_180d").cast(pl.Float64, strict=False)
-            )
-        grid = (
-            reference["rent_index"]
-            .select(grid_cols)
-            .drop_nulls(["AREA_EN", "_rooms_band", "week"])
-            .sort("week")
-        )
-        df = df.with_columns(band.alias("_rooms_band")).sort("date")
-        df = df.join_asof(
-            grid,
-            left_on="date",
-            right_on="week",
-            by=["AREA_EN", "_rooms_band"],
-            strategy="backward",
-        ).drop("_rooms_band", "week")
-        if cfg["rent_yield"]:
-            denom_cols = [c for c in ("project_comp_psf", "area_comp_psf") if c in df.columns]
-            if denom_cols:
-                df = df.with_columns(
-                    (pl.col("area_rent_psf_180d") / pl.coalesce([pl.col(c) for c in denom_cols]))
-                    .alias("implied_gross_yield")
-                )
-            else:
-                df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
-
+    Transactions carry no unit key, so we match project (via
+    project_number -> project_id) + exact registered area: where that layout
+    is unique in the project, unit_floor is the true floor; where layouts
+    stack, only the layout's floor distribution and balcony area attach.
+    """
     if cfg["unit_floor"]:
-        # Static unit facts from the DLD units registry. Transactions carry no
-        # unit key, so we match project (via project_number -> project_id) +
-        # exact registered area: where that layout is unique in the project,
-        # unit_floor is the true floor; where layouts stack, only the layout's
-        # floor distribution and balcony area are attached.
         bridge = (
             reference["projects"]
             .select(
@@ -594,7 +624,11 @@ def feature_engineering(
             .otherwise(None)
             .alias("rel_floor_pct")
         )
+    return df
 
+
+def _select_output_columns(df: pl.DataFrame, cfg: dict) -> pl.DataFrame:
+    """Fill categoricals, add project_txn_total, project to the output columns."""
     _, categorical = feature_columns(cfg)
     missing = [c for c in categorical if c not in df.columns]
     if missing:
@@ -612,6 +646,54 @@ def feature_engineering(
     keep += numeric + categorical
     keep += [c for c in PASSTHROUGH_COLUMNS if c in df.columns and c not in keep]
     return df.select(keep).sort("date")
+
+
+def feature_engineering(
+    raw: pl.DataFrame,
+    feature_config: dict[str, bool] | None = None,
+    date_origin: date | None = None,
+    reference: dict[str, pl.DataFrame] | None = None,
+) -> pl.DataFrame:
+    """Filter to scoreable sales and derive model features + target.
+
+    Keeps only apartment Sales rows with positive price and area, drops rows
+    whose ACTUAL_AREA contradicts the DLD-reported METER_SALE_PRICE (plot
+    area recorded instead of unit area), and returns one row per transaction
+    with the ``log_psf`` target, model features, and passthrough columns.
+
+    Deliberately does NOT trim PSF outliers: the deepest discounts are the
+    distressed assets this model exists to surface. Apply :func:`trim_psf`
+    to the result before TRAINING so the target stays robust.
+
+    ``date_origin`` anchors ``days_since_start``; pass the training origin
+    when scoring new data so the trend feature stays aligned.
+
+    Each stage lives in its own helper; this function only sequences them.
+    """
+    cfg = {**DEFAULT_FEATURE_CONFIG, **(feature_config or {})}
+
+    raw = _backfill_optional_columns(raw)
+    df = _filter_scoreable_sales(raw)
+    if df.is_empty():
+        return df
+    df = _parse_date_and_price(df)
+    df = _drop_area_mismatch_rows(df)
+    if df.is_empty():
+        return df
+
+    origin = date_origin or df.select(pl.col("date").min()).item()
+    df = _add_core_columns(df, origin, cfg)
+
+    if any(cfg[g] for g in DERIVED_FEATURE_GROUPS):
+        df = df.sort("date")
+        df = _add_trailing_comps(df, cfg)
+        df = _add_repeat_sale_features(df, cfg)
+
+    _require_reference_frames(cfg, reference)
+    df = _join_project_reference(df, cfg, reference)
+    df = _join_rent_grid(df, cfg, reference)
+    df = _join_units_registry(df, cfg, reference)
+    return _select_output_columns(df, cfg)
 
 
 def trim_psf(df: pl.DataFrame) -> pl.DataFrame:

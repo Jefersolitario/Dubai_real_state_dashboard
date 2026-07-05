@@ -367,19 +367,13 @@ def _display_filter(
     return df.filter(mask)
 
 
-def render_fair_value_tab(
-    neighborhoods: list[str],
-    bedroom: str,
-    start_date: date,
-    end_date: date,
+def _load_model_or_render_fallback(
     data_version: str,
-) -> None:
-    """Render the Fair Value page: model load, scoring, flags, charts."""
-    raw = _raw_transactions()
-    if raw.is_empty():
-        st.info("No transaction data loaded.")
-        return
+) -> tuple[FairValueResult, dict] | None:
+    """Load the GCS bundle; on failure render guidance (or the local-train path).
 
+    Returns None when the page should stop rendering.
+    """
     try:
         result, meta = get_model(data_version)
     except FileNotFoundError:
@@ -388,29 +382,11 @@ def render_fair_value_tab(
             "`python train_fair_value.py` (run offline — training is too heavy "
             "for this deployment)."
         )
-        feats = _features_or_error(data_version)
-        if feats is None or feats.height < MIN_TRAINING_ROWS:
-            if feats is not None:
-                st.info(
-                    f"Local training also unavailable: only {feats.height:,} apartment "
-                    f"sales loaded (need at least {MIN_TRAINING_ROWS:,})."
-                )
-            return
-        if not st.button("Train in this session (heavy — local use only)"):
-            return
-        result, meta = train_local_model(data_version)
-    except Exception as exc:  # unreadable bundle, GCS outage, version break
-        st.error(f"Could not load the fair-value model bundle: {exc}")
-        return
+    return result, meta
 
-    feats = _features_or_error(data_version)
-    if feats is None:
-        return
-    if feats.is_empty():
-        st.warning("No scoreable apartment sales in the loaded data.")
-        return
-    data_min, data_max = get_feature_bounds(data_version)
 
+def _render_page_header(result: FairValueResult, meta: dict) -> None:
+    """Title, model provenance captions, and the staleness warning."""
     st.markdown("### Fair Value Model — Below-Market & Distressed-Asset Scanner")
     st.caption(
         "The model predicts each apartment sale's **fair value** (AED/sqft) from size, "
@@ -437,6 +413,14 @@ def render_fair_value_tab(
                 "`python train_fair_value.py` (offline)."
             )
 
+
+def _resolve_scoring_controls(
+    data_min: date,
+    data_max: date,
+    start_date: date,
+    end_date: date,
+) -> tuple[int, date, date]:
+    """Render the window/threshold widgets; return (threshold_pct, start, end)."""
     # Seed the widget state once, then pass key= only: with the lazy page
     # dispatch these widgets unmount while Market Overview is shown, and the
     # keep-alive re-assignment in dubai_dashboard.py preserves the values.
@@ -478,21 +462,14 @@ def render_fair_value_tab(
     else:
         score_start, score_end = data_max - timedelta(days=window_spec), data_max
 
-    scored = flag_distress(
-        get_scored(data_version, score_start, score_end, str(trained_at), result),
-        spread_threshold=-threshold_pct / 100,
-    )
-    if scored.is_empty():
-        st.warning(f"No apartment sales between {score_start} and {score_end}.")
-        return
-    st.caption(
-        f"Scoring **{scored.height:,} sales** from **{score_start}** to "
-        f"**{score_end}**; the sidebar filters narrow this further."
-    )
-    view = _display_filter(scored, neighborhoods, bedroom, start_date, end_date)
+    return threshold_pct, score_start, score_end
 
+
+def _render_metric_row(
+    result: FairValueResult, view: pl.DataFrame, flagged: pl.DataFrame, threshold_pct: int
+) -> None:
+    """The four headline metrics: model error, R², flag counts."""
     metrics = result.metrics or {}
-    flagged = view.filter(pl.col("below_fair_value"))
     n_below = flagged.height
     n_distressed = view.filter(pl.col("distressed")).height
     medape = metrics.get("medape_mean")
@@ -532,18 +509,24 @@ def render_fair_value_tab(
             ),
         )
 
-    if view.is_empty():
-        if score_end < start_date or score_start > end_date:
-            st.warning(
-                f"The scoring window ({score_start} to {score_end}) does not "
-                f"overlap the sidebar date range ({start_date} to {end_date}). "
-                "Pick 'Sidebar date range' as the scoring window, or widen "
-                "the sidebar dates."
-            )
-        else:
-            st.warning("No scored transactions for the selected filters/date range.")
-        return
 
+def _render_empty_view_warning(
+    score_start: date, score_end: date, start_date: date, end_date: date
+) -> None:
+    """Explain WHY the view is empty (disjoint windows get a specific hint)."""
+    if score_end < start_date or score_start > end_date:
+        st.warning(
+            f"The scoring window ({score_start} to {score_end}) does not "
+            f"overlap the sidebar date range ({start_date} to {end_date}). "
+            "Pick 'Sidebar date range' as the scoring window, or widen "
+            "the sidebar dates."
+        )
+    else:
+        st.warning("No scored transactions for the selected filters/date range.")
+
+
+def _render_flagged_table(flagged: pl.DataFrame, view: pl.DataFrame) -> None:
+    """The ranked flagged-deals table plus its CSV download button."""
     st.markdown("#### Flagged transactions")
     st.caption(
         "Sorted distressed-first, strongest signal on top. **Spread** = actual price vs "
@@ -586,6 +569,11 @@ def render_fair_value_tab(
         mime="text/csv",
     )
 
+
+def _render_result_charts(
+    view: pl.DataFrame, result: FairValueResult, threshold_pct: int
+) -> None:
+    """Actual-vs-fair scatter, spread histogram, and importance chart."""
     st.plotly_chart(pred_vs_actual_chart(view), use_container_width=True)
 
     col_a, col_b = st.columns(2)
@@ -594,6 +582,9 @@ def render_fair_value_tab(
     with col_b:
         st.plotly_chart(importance_chart(result.importances), use_container_width=True)
 
+
+def _render_methodology(scored: pl.DataFrame) -> None:
+    """The Data & methodology expander (model, caveats, sources, procedures)."""
     with st.expander("📚 Data & methodology", expanded=False):
         st.markdown(
             "**How it works.** The model estimates what each apartment *should* have "
@@ -647,3 +638,58 @@ def render_fair_value_tab(
             scored.group_by("PROCEDURE_EN").len().sort("len", descending=True)
         )
         st.dataframe(proc_counts, use_container_width=True, height=200)
+
+
+def render_fair_value_tab(
+    neighborhoods: list[str],
+    bedroom: str,
+    start_date: date,
+    end_date: date,
+    data_version: str,
+) -> None:
+    """Render the Fair Value page: load model, score the window, delegate UI."""
+    raw = _raw_transactions()
+    if raw.is_empty():
+        st.info("No transaction data loaded.")
+        return
+
+    loaded = _load_model_or_render_fallback(data_version)
+    if loaded is None:
+        return
+    result, meta = loaded
+
+    feats = _features_or_error(data_version)
+    if feats is None:
+        return
+    if feats.is_empty():
+        st.warning("No scoreable apartment sales in the loaded data.")
+        return
+    data_min, data_max = get_feature_bounds(data_version)
+
+    _render_page_header(result, meta)
+    threshold_pct, score_start, score_end = _resolve_scoring_controls(
+        data_min, data_max, start_date, end_date
+    )
+
+    scored = flag_distress(
+        get_scored(data_version, score_start, score_end, str(meta.get("trained_at")), result),
+        spread_threshold=-threshold_pct / 100,
+    )
+    if scored.is_empty():
+        st.warning(f"No apartment sales between {score_start} and {score_end}.")
+        return
+    st.caption(
+        f"Scoring **{scored.height:,} sales** from **{score_start}** to "
+        f"**{score_end}**; the sidebar filters narrow this further."
+    )
+    view = _display_filter(scored, neighborhoods, bedroom, start_date, end_date)
+    flagged = view.filter(pl.col("below_fair_value"))
+
+    _render_metric_row(result, view, flagged, threshold_pct)
+    if view.is_empty():
+        _render_empty_view_warning(score_start, score_end, start_date, end_date)
+        return
+
+    _render_flagged_table(flagged, view)
+    _render_result_charts(view, result, threshold_pct)
+    _render_methodology(scored)

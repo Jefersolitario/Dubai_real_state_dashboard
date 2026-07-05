@@ -435,99 +435,8 @@ _API_TO_CSV = {
 }
 
 
-def fetch_dld_live_data(
-    api_key: str,
-    api_secret: str,
-    start: str = "2026-01-17",
-    end: str   = "2026-05-17",
-    security_application_identifier: str = "",
-) -> pl.DataFrame:
-    """Fetch real apartment transactions from the Dubai Data / DLD API.
-
-    Registration
-    ------------
-    1. Go to https://data.dubai/en/
-    2. Create a free account
-    3. Find the DLD Transactions dataset and click "Request API Access Key"
-    4. You will receive an API Key and API Secret in two separate emails
-    5. Free tier: limited monthly calls
-
-    Parameters
-    ----------
-    api_key    : client_id from Dubai Data email
-    api_secret : client_secret from Dubai Data email
-    start / end: ISO date strings for the transaction date range
-    """
-    import requests
-
-    token = _get_dld_token(api_key, api_secret, security_application_identifier)
-
-    API_URL = "https://apis.data.dubai/open/dld/dld_transactions-open-api"
-    all_records: list[dict] = []
-    offset = 0
-    page_size = 500
-
-    while True:
-        resp = requests.get(
-            API_URL,
-            headers={"Authorization": f"Bearer {token}"},
-            params={
-                "filter": (
-                    f"property_sub_type_en='Flat' AND trans_group_en='Sales'"
-                    f" AND instance_date>='{start}' AND instance_date<='{end}'"
-                ),
-                "order_by": "instance_date",
-                "limit":  page_size,
-                "offset": offset,
-            },
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        records = data if isinstance(data, list) else data.get("records", data.get("result", []))
-        if not records:
-            break
-        all_records.extend(records)
-        if len(records) < page_size:
-            break
-        offset += page_size
-
-    if not all_records:
-        return pl.DataFrame()
-
-    # Rename API columns to match the CSV column names the dashboard expects
-    df = pl.DataFrame(all_records)
-    rename_map = {k: v for k, v in _API_TO_CSV.items() if k in df.columns}
-    return df.rename(rename_map)
 
 
-def fetch_bayut_transactions(
-    api_key: str,
-    neighborhood: str = "Dubai Marina",
-    bedrooms: int = 1,
-) -> pl.DataFrame:
-    """Fetch listings/transactions from the Bayut API (750 free calls/month).
-
-    Registration
-    ------------
-    1. Go to https://bayutapi.com/ → sign up (no credit card required)
-    2. API key sent by email
-    3. Docs: https://docs.bayutapi.com/
-    """
-    import requests
-
-    resp = requests.get(
-        "https://api.bayutapi.com/v1/transactions",
-        headers={"X-API-Key": api_key},
-        params={
-            "location": neighborhood,
-            "bedrooms": bedrooms,
-            "purpose":  "for-sale",
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return pl.DataFrame(resp.json().get("transactions", []))
 
 
 # Production secrets are read server-side only; no credentials are exposed in
@@ -630,21 +539,6 @@ def _load_gcs_transactions(
     }
 
 
-def _probe_api_columns(config: DDAConfig, limit: int = 10) -> tuple[pl.DataFrame, dict]:
-    """Small raw fetch to report the API's current column vocabulary."""
-    records = fetch_dataset_records(
-        config,
-        params={"order_by": "instance_date", "order_dir": "desc"},
-        page_size=limit,
-        max_records=limit,
-    )
-    raw_df = records_to_dataframe(records)
-    normalized = normalize_dld_transactions(raw_df)
-    return normalized, {
-        "raw_columns": raw_df.columns,
-        "mapping": infer_column_mapping(raw_df.columns),
-        "validation": validate_normalized_columns(normalized),
-    }
 
 
 def _date_bounds_from_transactions(df: pl.DataFrame) -> tuple[date, date] | None:
@@ -724,6 +618,61 @@ def _write_gcs_snapshot(
     return refreshed_df, refreshed_meta
 
 
+def _fetch_missing_windows(
+    config: DDAConfig, windows: list[tuple[date, date]]
+) -> tuple[list[pl.DataFrame], int]:
+    """Fetch each uncovered date window from the API; returns (frames, row count).
+
+    Raises DDAApiError when a response is missing required schema columns.
+    """
+    incoming_frames: list[pl.DataFrame] = []
+    fetched_rows = 0
+    for start, end in windows:
+        incoming, incoming_meta = _load_api_transactions(
+            config,
+            start,
+            end,
+            DEFAULT_PAGE_SIZE,
+            DEFAULT_MAX_RECORDS,
+        )
+        validation = incoming_meta["validation"]
+        if validation["missing_required"]:
+            raise DDAApiError(
+                "Incremental DDA response schema is incomplete: "
+                + ", ".join(validation["missing_required"])
+            )
+        if not incoming.is_empty():
+            incoming_frames.append(incoming)
+            fetched_rows += incoming.height
+    return incoming_frames, fetched_rows
+
+
+def _merge_incoming_rows(
+    df: pl.DataFrame, incoming_frames: list[pl.DataFrame]
+) -> tuple[pl.DataFrame, dict]:
+    """Dedupe and combine existing + fetched rows; returns (final frame, stats).
+
+    Both merge sides already share the canonical schema:
+    normalize_dld_transactions projects every frame at the source.
+    """
+    incoming_df = pl.concat(incoming_frames, how="diagonal_relaxed")
+    existing_deduped = dedupe_snapshot(df)
+    incoming_deduped = dedupe_snapshot(incoming_df)
+    combined = pl.concat([existing_deduped, incoming_deduped], how="diagonal_relaxed")
+    final_df = stable_sort(dedupe_snapshot(combined))
+    stats = {
+        "mode": "incremental_dashboard",
+        "existing_rows": df.height,
+        "added_rows": count_new_rows(existing_deduped, final_df),
+        "existing_duplicate_rows_removed": df.height - existing_deduped.height,
+        "incoming_duplicate_rows_removed": incoming_df.height - incoming_deduped.height,
+        "overlap_duplicate_rows": (
+            existing_deduped.height + incoming_deduped.height - final_df.height
+        ),
+    }
+    return final_df, stats
+
+
 def _ensure_transactions_cover_range(
     df: pl.DataFrame,
     meta: dict,
@@ -748,26 +697,7 @@ def _ensure_transactions_cover_range(
             + ", ".join(missing)
         )
 
-    incoming_frames = []
-    fetched_rows = 0
-    for start, end in windows:
-        incoming, incoming_meta = _load_api_transactions(
-            config,
-            start,
-            end,
-            DEFAULT_PAGE_SIZE,
-            DEFAULT_MAX_RECORDS,
-        )
-        validation = incoming_meta["validation"]
-        if validation["missing_required"]:
-            raise DDAApiError(
-                "Incremental DDA response schema is incomplete: "
-                + ", ".join(validation["missing_required"])
-            )
-        if not incoming.is_empty():
-            incoming_frames.append(incoming)
-            fetched_rows += incoming.height
-
+    incoming_frames, fetched_rows = _fetch_missing_windows(config, windows)
     st.session_state["gcs_refresh_checked"] = refresh_key
     if not incoming_frames:
         return df, meta, {
@@ -779,29 +709,9 @@ def _ensure_transactions_cover_range(
             "written": False,
         }
 
-    # Both merge sides already share the canonical schema:
-    # normalize_dld_transactions projects every frame at the source.
-    incoming_df = pl.concat(incoming_frames, how="diagonal_relaxed")
-    existing_deduped = dedupe_snapshot(df)
-    incoming_deduped = dedupe_snapshot(incoming_df)
-    combined = pl.concat([existing_deduped, incoming_deduped], how="diagonal_relaxed")
-    final_df = stable_sort(dedupe_snapshot(combined))
-    added_rows = count_new_rows(existing_deduped, final_df)
-    existing_duplicate_rows_removed = df.height - existing_deduped.height
-    incoming_duplicate_rows_removed = incoming_df.height - incoming_deduped.height
-    overlap_duplicate_rows = existing_deduped.height + incoming_deduped.height - final_df.height
-
-    stats = {
-        "mode": "incremental_dashboard",
-        "existing_rows": df.height,
-        "fetched_rows": fetched_rows,
-        "added_rows": added_rows,
-        "existing_duplicate_rows_removed": existing_duplicate_rows_removed,
-        "incoming_duplicate_rows_removed": incoming_duplicate_rows_removed,
-        "overlap_duplicate_rows": overlap_duplicate_rows,
-        "windows": windows,
-    }
-    if added_rows == 0 and existing_duplicate_rows_removed == 0:
+    final_df, stats = _merge_incoming_rows(df, incoming_frames)
+    stats = {**stats, "fetched_rows": fetched_rows, "windows": windows}
+    if stats["added_rows"] == 0 and stats["existing_duplicate_rows_removed"] == 0:
         return df, meta, {**stats, "written": False}
 
     bucket_name, object_name = configured_snapshot(secrets)
@@ -1363,25 +1273,15 @@ def area_psf_chart(
     return fig
 
 
-def _render_market_overview(
+def _render_headline_kpis(
     filtered: pl.DataFrame,
     neighborhoods: list[str],
     bedroom: str,
     trans_type: str,
-    data_version: str,
     start_date: date,
     end_date: date,
-    date_min: date,
-    date_max: date,
-) -> None:
-    """Render the original dashboard page as the Market Overview tab."""
-    if filtered.is_empty():
-        st.warning(
-            "No data for the selected filters/date range. "
-            f"The loaded data covers {date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}."
-        )
-        return
-
+) -> date:
+    """Page title, filter caption, and latest-month KPI cards; returns latest date."""
     # ── KPI cards ────────────────────────────────────────────────────────────────
     latest_date = filtered["date"].max()
     latest_df   = filtered.filter(pl.col("date") == latest_date)
@@ -1420,7 +1320,13 @@ def _render_market_overview(
         st.metric("Transactions",  f"{avg_txn:,}",            help="Total monthly transactions across selected neighbourhoods")
 
     st.divider()
+    return latest_date
 
+
+def _render_market_pulse(
+    trans_type: str, data_version: str, start_date: date, end_date: date
+) -> None:
+    """Dubai-wide momentum KPIs and the four unfiltered market charts."""
     # ── Dubai-wide charts (unfiltered) ────────────────────────────────────────────
     DUBAI_WIDE = generate_dubai_wide_data(trans_type, data_version, start_date, end_date)
     WEEKLY = generate_weekly_data(trans_type, data_version, start_date, end_date)
@@ -1475,12 +1381,27 @@ def _render_market_overview(
 
     st.divider()
 
+
+def _render_tier_section(
+    trans_type: str, data_version: str, start_date: date, end_date: date
+) -> None:
+    """Prime/mid/affordable tier price chart."""
     # ── Tier chart ────────────────────────────────────────────────────────────────
     TIER_DATA = generate_tier_data(trans_type, data_version, start_date, end_date)
     st.plotly_chart(tier_price_chart(TIER_DATA), use_container_width=True)
 
     st.divider()
 
+
+def _render_opportunity_scanner(
+    trans_type: str,
+    bedroom: str,
+    data_version: str,
+    start_date: date,
+    end_date: date,
+    neighborhoods: list[str],
+) -> None:
+    """Per-transaction AED/sqft vs each area's rolling median (buy signal)."""
     # ── Buyer Opportunity Scanner (Metric #3) ────────────────────────────────────
     st.markdown("### Buyer Opportunity Scanner — Price / sqft vs Area Median")
     st.caption(
@@ -1530,6 +1451,9 @@ def _render_market_overview(
 
     st.divider()
 
+
+def _render_filtered_charts(filtered: pl.DataFrame, bedroom: str, latest_date: date) -> None:
+    """Neighbourhood-filtered charts and the raw-data expander."""
     # ── Filtered charts ───────────────────────────────────────────────────────────
     st.plotly_chart(line_chart(filtered, bedroom), use_container_width=True)
 
@@ -1551,6 +1475,35 @@ def _render_market_overview(
         ).encode()
         st.download_button("Download CSV", data=csv_bytes, file_name="dubai_re_data.csv", mime="text/csv")
 
+
+def _render_market_overview(
+    filtered: pl.DataFrame,
+    neighborhoods: list[str],
+    bedroom: str,
+    trans_type: str,
+    data_version: str,
+    start_date: date,
+    end_date: date,
+    date_min: date,
+    date_max: date,
+) -> None:
+    """Render the Market Overview page by sequencing its sections."""
+    if filtered.is_empty():
+        st.warning(
+            "No data for the selected filters/date range. "
+            f"The loaded data covers {date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}."
+        )
+        return
+
+    latest_date = _render_headline_kpis(
+        filtered, neighborhoods, bedroom, trans_type, start_date, end_date
+    )
+    _render_market_pulse(trans_type, data_version, start_date, end_date)
+    _render_tier_section(trans_type, data_version, start_date, end_date)
+    _render_opportunity_scanner(
+        trans_type, bedroom, data_version, start_date, end_date, neighborhoods
+    )
+    _render_filtered_charts(filtered, bedroom, latest_date)
 
 # ---------------------------------------------------------------------------
 # Streamlit app
