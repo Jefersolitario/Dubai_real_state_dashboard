@@ -34,6 +34,7 @@ from fair_value_model import (
     feature_engineering,
     load_bundle,
     load_shipping_config,
+    reference_needed,
     score_transactions,
     train_fair_value_model,
     trim_psf,
@@ -97,7 +98,15 @@ def main() -> int:
     print(f"Snapshot: {raw.height:,} rows from {source}")
     print(f"Config: {feature_config} | {model_params}")
 
-    feats = feature_engineering(raw, feature_config)
+    reference = None
+    ref_names = reference_needed(feature_config)
+    if ref_names:
+        from gcs_storage import load_local_secrets, read_reference_frames
+
+        reference = read_reference_frames(load_local_secrets(), ref_names)
+        print(f"Reference frames loaded: {ref_names}")
+
+    feats = feature_engineering(raw, feature_config, reference=reference)
     train_feats = trim_psf(feats)
     print(f"Training on {train_feats.height:,} apartment sales (of {feats.height:,} scoreable)")
 

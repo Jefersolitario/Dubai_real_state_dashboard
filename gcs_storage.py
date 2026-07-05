@@ -77,6 +77,34 @@ def write_model_bundle_bytes(secrets, data, metadata=None):
     return f"gs://{bucket_name}/{object_name}"
 
 
+REFERENCE_OBJECTS = {
+    "projects": "dld_reference/projects.parquet",
+    "buildings_agg": "dld_reference/project_buildings_agg.parquet",
+    "service_charges": "dld_reference/service_charges.parquet",
+    "rent_index": "dld_reference/rent_index.parquet",
+}
+
+
+def read_reference_frames(secrets, names):
+    """{name: DataFrame} for the requested reference datasets.
+
+    Published by store_reference_data_gcs.py; raises FileNotFoundError with
+    that pointer when an object is missing.
+    """
+    bucket_name = setting(secrets, "GCS_BUCKET", "GOOGLE_CLOUD_STORAGE_BUCKET")
+    frames = {}
+    for name in names:
+        object_name = REFERENCE_OBJECTS[name]
+        blob = gcs_client(secrets).bucket(bucket_name).get_blob(object_name)
+        if blob is None:
+            raise FileNotFoundError(
+                f"gs://{bucket_name}/{object_name} — publish it with "
+                "store_reference_data_gcs.py"
+            )
+        frames[name] = pl.read_parquet(io.BytesIO(blob.download_as_bytes()))
+    return frames
+
+
 def read_parquet_object(secrets, bucket_name, object_name):
     blob = gcs_client(secrets).bucket(bucket_name).get_blob(object_name)
     if blob is None:

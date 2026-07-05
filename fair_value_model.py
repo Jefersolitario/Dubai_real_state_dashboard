@@ -57,6 +57,10 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "comp_dispersion": False,        # trailing 60d project PSF std (uncertainty)
     "repeat_sale": False,            # prior sale PSF of the same pseudo-unit
     "repeat_sale_adj": False,        # prior unit PSF indexed by area market movement since
+    # --- reference-data feature groups (require the `reference` frames) ---
+    "project_meta": False,           # developer, building age, project size/height
+    "rent_yield": False,             # trailing 180d area x rooms rent PSF + implied yield
+    "service_charge": False,         # latest per-project service cost
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -148,7 +152,32 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric += ["prior_unit_psf", "days_since_prior_sale"]
     if cfg["repeat_sale_adj"]:
         numeric.append("prior_unit_psf_adj")
+    if cfg["project_meta"]:
+        numeric += ["building_age_years", "project_units", "project_max_floors"]
+        categorical.append("developer_name")
+    if cfg["rent_yield"]:
+        numeric += ["area_rent_psf_180d", "implied_gross_yield"]
+    if cfg["service_charge"]:
+        numeric.append("service_cost")
     return numeric, categorical
+
+
+# reference frame names required per feature group (see store_reference_data_gcs.py)
+REFERENCE_REQUIREMENTS = {
+    "project_meta": ("projects", "buildings_agg"),
+    "rent_yield": ("rent_index",),
+    "service_charge": ("projects", "service_charges"),
+}
+
+
+def reference_needed(feature_config: dict | None = None) -> list[str]:
+    """Reference frame names a feature config requires."""
+    cfg = {**DEFAULT_FEATURE_CONFIG, **(feature_config or {})}
+    names: list[str] = []
+    for group, frames in REFERENCE_REQUIREMENTS.items():
+        if cfg.get(group):
+            names.extend(f for f in frames if f not in names)
+    return names
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +188,7 @@ def feature_engineering(
     raw: pl.DataFrame,
     feature_config: dict[str, bool] | None = None,
     date_origin: date | None = None,
+    reference: dict[str, pl.DataFrame] | None = None,
 ) -> pl.DataFrame:
     """Filter to scoreable sales and derive model features + target.
 
@@ -348,6 +378,104 @@ def feature_engineering(
                     ).alias("prior_unit_psf_adj")
                 ).drop("_area_now", "_area_then")
             df = df.drop("_unit")
+
+    # Reference-data joins (projects / rents / service charges). All values
+    # are static facts or strictly-past aggregates; the rent grid's week-w
+    # value covers only contracts starting before w, and a backward as-of
+    # join attaches week <= transaction date, so it is strictly past.
+    ref_needed = reference_needed(cfg)
+    if ref_needed:
+        missing_ref = [n for n in ref_needed if reference is None or n not in reference]
+        if missing_ref:
+            raise ValueError(
+                f"feature_config requires reference frames {missing_ref}; "
+                "load them via gcs_storage.read_reference_frames "
+                "(published by store_reference_data_gcs.py)"
+            )
+
+    if cfg["project_meta"] or cfg["service_charge"]:
+        lookup = (
+            reference["projects"]
+            .select(
+                pl.col("project_number").cast(pl.Int64, strict=False),
+                pl.col("project_id").cast(pl.Int64, strict=False),
+                pl.col("developer_name").cast(pl.Utf8),
+                pl.coalesce(pl.col("completion_date"), pl.col("project_end_date"))
+                .cast(pl.Utf8)
+                .str.slice(0, 10)
+                .str.to_date("%Y-%m-%d", strict=False)
+                .alias("_completion"),
+                pl.col("no_of_units").cast(pl.Float64, strict=False).alias("project_units"),
+            )
+            .drop_nulls("project_number")
+            .unique("project_number", keep="first")
+        )
+        if cfg["project_meta"]:
+            bagg = reference["buildings_agg"].select(
+                pl.col("project_id").cast(pl.Int64, strict=False),
+                pl.col("project_max_floors").cast(pl.Float64, strict=False),
+            ).unique("project_id")
+            lookup = lookup.join(bagg, on="project_id", how="left")
+        if cfg["service_charge"]:
+            sc = reference["service_charges"].select(
+                pl.col("project_id").cast(pl.Int64, strict=False),
+                pl.col("service_cost").cast(pl.Float64, strict=False),
+            ).unique("project_id")
+            lookup = lookup.join(sc, on="project_id", how="left")
+        df = (
+            df.with_columns(pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_pn"))
+            .join(lookup.rename({"project_number": "_pn"}).drop("project_id"), on="_pn", how="left")
+            .drop("_pn")
+        )
+        if cfg["project_meta"]:
+            df = df.with_columns(
+                ((pl.col("date") - pl.col("_completion")).dt.total_days() / 365.25)
+                .alias("building_age_years")
+            )
+        df = df.drop("_completion")
+
+    if cfg["rent_yield"]:
+        rooms = pl.col("ROOMS_EN").cast(pl.Utf8)
+        band = (
+            pl.when(rooms.str.to_lowercase().str.contains("studio"))
+            .then(pl.lit("Studio"))
+            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 1)
+            .then(pl.lit("1BR"))
+            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 2)
+            .then(pl.lit("2BR"))
+            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) == 3)
+            .then(pl.lit("3BR"))
+            .when(rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False) >= 4)
+            .then(pl.lit("4BR+"))
+            .otherwise(pl.lit(None, dtype=pl.Utf8))
+        )
+        grid = (
+            reference["rent_index"]
+            .select(
+                pl.col("AREA_EN").cast(pl.Utf8),
+                pl.col("rooms_band").cast(pl.Utf8).alias("_band"),
+                pl.col("week").cast(pl.Date),
+                pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
+            )
+            .drop_nulls(["AREA_EN", "_band", "week"])
+            .sort("week")
+        )
+        df = df.with_columns(band.alias("_band")).sort("date")
+        df = df.join_asof(
+            grid,
+            left_on="date",
+            right_on="week",
+            by=["AREA_EN", "_band"],
+            strategy="backward",
+        ).drop("_band", "week")
+        denom_cols = [c for c in ("project_comp_psf", "area_comp_psf") if c in df.columns]
+        if denom_cols:
+            df = df.with_columns(
+                (pl.col("area_rent_psf_180d") / pl.coalesce([pl.col(c) for c in denom_cols]))
+                .alias("implied_gross_yield")
+            )
+        else:
+            df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
 
     _, categorical = feature_columns(cfg)
     missing = [c for c in categorical if c not in df.columns]

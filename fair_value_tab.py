@@ -29,11 +29,12 @@ from fair_value_model import (
     flag_distress,
     load_bundle,
     load_shipping_config,
+    reference_needed,
     score_transactions,
     train_fair_value_model,
     trim_psf,
 )
-from gcs_storage import read_model_bundle_bytes
+from gcs_storage import read_model_bundle_bytes, read_reference_frames
 
 MODEL_STALE_DAYS = 7
 
@@ -81,7 +82,11 @@ def get_features(data_version: str) -> pl.DataFrame:
     training path applies trim_psf separately.
     """
     feature_config, _ = load_shipping_config()
-    return feature_engineering(_raw_transactions(), feature_config)
+    reference = None
+    ref_names = reference_needed(feature_config)
+    if ref_names:
+        reference = read_reference_frames(st.secrets, ref_names)
+    return feature_engineering(_raw_transactions(), feature_config, reference=reference)
 
 
 @st.cache_resource(
