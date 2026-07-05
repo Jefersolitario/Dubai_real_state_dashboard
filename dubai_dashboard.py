@@ -17,7 +17,7 @@ Configure DDA credentials through Streamlit secrets or environment variables.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 import plotly.colors
@@ -1607,7 +1607,9 @@ with st.sidebar:
     )
 
     date_min, date_max, default_end = _date_picker_bounds()
-    default_start = date_min
+    # Show the last 12 months by default; the snapshot keeps 24 months for
+    # model training, and the picker still allows selecting the full range.
+    default_start = max(date_min, default_end - timedelta(days=365))
 
     date_range = st.date_input(
         "Date Range",
