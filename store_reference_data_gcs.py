@@ -128,33 +128,74 @@ UNITS_ROOMS_CHUNKS = [
 ]
 
 
-def pull_units(config, secrets) -> None:
+def fetch_chunked(config, dataset: str, param_chunks: list[tuple[str, dict]],
+                  max_records: int, transform=None) -> pl.DataFrame:
+    """Fetch a long pull as labelled chunks with a chunk-level retry.
+
+    ``transform`` (chunk DataFrame -> DataFrame) is applied per chunk before
+    accumulation so hours-long pulls hold slim frames in memory instead of
+    every raw column. Empty pulls return an empty frame instead of crashing
+    at the final concat.
+    """
     frames: list[pl.DataFrame] = []
-    for rooms in UNITS_ROOMS_CHUNKS:
-        params = {"filter": f"property_sub_type_en='Flat' AND rooms_en='{rooms}'"}
+    for label, params in param_chunks:
         for attempt in (1, 2):
             try:
-                chunk = fetch_dataset(config, "dld_units-open-api", params=params,
-                                      max_records=2_000_000)
+                chunk = fetch_dataset(config, dataset, params=params,
+                                      max_records=max_records)
                 break
             except Exception as exc:
                 if attempt == 2:
                     raise
-                print(f"units chunk {rooms}: retrying after {type(exc).__name__}: {exc}",
-                      flush=True)
+                print(f"{dataset} chunk {label}: retrying after "
+                      f"{type(exc).__name__}: {exc}", flush=True)
                 time.sleep(30)
         if chunk.height:
-            frames.append(chunk)
-    u = pl.concat(frames, how="diagonal_relaxed")
-    slim = u.select(
+            frames.append(transform(chunk) if transform else chunk)
+    if not frames:
+        print(f"{dataset}: no records in any chunk", flush=True)
+        return pl.DataFrame()
+    return pl.concat(frames, how="diagonal_relaxed")
+
+
+def _floor_number_expr() -> pl.Expr:
+    """Numeric floor from DLD labels: '12'→12, 'B2'→-2 (basement), 'G'→0.
+
+    Anything else (mezzanine, podium, penthouse labels) becomes null rather
+    than a wrong positive number — 'B2' must not look like the 2nd floor.
+    """
+    floor = pl.col("floor").cast(pl.Utf8).str.strip_chars()
+    return (
+        pl.when(floor.str.contains(r"^\d+$"))
+        .then(floor.cast(pl.Float64, strict=False))
+        .when(floor.str.contains(r"(?i)^B\s*\d+$"))
+        .then(-floor.str.extract(r"(\d+)").cast(pl.Float64, strict=False))
+        .when(floor.str.contains(r"(?i)^GF?$|^G\s*F$"))
+        .then(pl.lit(0.0))
+        .otherwise(pl.lit(None, dtype=pl.Float64))
+    )
+
+
+def _slim_units(chunk: pl.DataFrame) -> pl.DataFrame:
+    return chunk.select(
         pl.col("project_id").cast(pl.Int64, strict=False),
         pl.col("building_number").cast(pl.Utf8),
-        pl.col("floor").cast(pl.Utf8).str.extract(r"(-?\d+)")
-        .cast(pl.Float64, strict=False).alias("floor_num"),
+        _floor_number_expr().alias("floor_num"),
         pl.col("actual_area").cast(pl.Float64, strict=False),
         pl.col("rooms_en").cast(pl.Utf8),
         pl.col("unit_balcony_area").cast(pl.Float64, strict=False),
     ).drop_nulls(["project_id", "actual_area"])
+
+
+def pull_units(config, secrets) -> None:
+    chunks = [
+        (rooms, {"filter": f"property_sub_type_en='Flat' AND rooms_en='{rooms}'"})
+        for rooms in UNITS_ROOMS_CHUNKS
+    ]
+    slim = fetch_chunked(config, "dld_units-open-api", chunks,
+                         max_records=2_000_000, transform=_slim_units)
+    if slim.is_empty():
+        raise RuntimeError("units pull returned no records; not overwriting GCS")
     upload(secrets, "units_slim.parquet", slim)
 
 
@@ -194,49 +235,21 @@ def rooms_band_expr() -> pl.Expr:
 
 
 def _month_starts(start: date, end: date) -> list[date]:
-    months = [start.replace(day=1)]
-    while True:
-        last = months[-1]
-        nxt = date(last.year + (last.month == 12), last.month % 12 + 1, 1)
-        if nxt > end:
-            return months + [nxt]
-        months.append(nxt)
+    """Ascending first-of-month bounds covering [start, end], plus one past end."""
+    from calendar import monthrange
+    from datetime import timedelta
+
+    from dda_api import months_before
+
+    anchor = end.replace(day=1)
+    n_back = (anchor.year - start.year) * 12 + (anchor.month - start.month)
+    months = [months_before(anchor, k) for k in range(n_back, -1, -1)]
+    # first of the month after `end`: add the anchor month's exact length
+    return months + [anchor + timedelta(days=monthrange(anchor.year, anchor.month)[1])]
 
 
-def pull_rents(config, secrets) -> None:
-    # Monthly chunks: a ~11M-row pull runs for hours, and one unrecoverable
-    # gateway error mid-pagination used to discard everything fetched so far.
-    # Per-chunk the page retry still applies; a failed chunk is retried once
-    # before giving up.
-    bounds = _month_starts(RENTS_START, date.today())
-    frames: list[pl.DataFrame] = []
-    for lo, hi in zip(bounds, bounds[1:]):
-        params = {
-            "filter": (
-                "property_usage_en='Residential' AND "
-                f"contract_start_date>='{lo.isoformat()}' AND "
-                f"contract_start_date<'{hi.isoformat()}'"
-            ),
-            "order_by": "contract_start_date",
-            "order_dir": "asc",
-        }
-        for attempt in (1, 2):
-            try:
-                chunk = fetch_dataset(config, "dld_rent_contracts-open-api",
-                                      params=params, max_records=1_000_000)
-                break
-            except Exception as exc:
-                if attempt == 2:
-                    raise
-                print(f"chunk {lo}: retrying after {type(exc).__name__}: {exc}",
-                      flush=True)
-                time.sleep(30)
-        if chunk.height:
-            frames.append(chunk)
-    raw = pl.concat(frames, how="diagonal_relaxed")
-
-    n0 = raw.height
-    rents = raw.select(
+def _slim_rents(chunk: pl.DataFrame) -> pl.DataFrame:
+    return chunk.select(
         pl.col("contract_start_date").cast(pl.Utf8).str.slice(0, 10)
         .str.to_date("%Y-%m-%d", strict=False).alias("start"),
         pl.col("annual_amount").cast(pl.Float64, strict=False),
@@ -244,7 +257,39 @@ def pull_rents(config, secrets) -> None:
         pl.col("area_name_en").cast(pl.Utf8).str.to_uppercase().alias("AREA_EN"),
         rooms_band_expr().alias("rooms_band"),
         pl.col("ejari_property_type_en").cast(pl.Utf8).alias("ptype"),
-    ).drop_nulls(["start", "annual_amount", "AREA_EN"])
+        pl.lit(1).alias("_raw_row"),
+    )
+
+
+def pull_rents(config, secrets) -> None:
+    # Monthly chunks: a ~11M-row pull runs for hours, and one unrecoverable
+    # gateway error mid-pagination used to discard everything fetched so far.
+    # Per-chunk the page retry still applies; a failed chunk is retried once
+    # before giving up, and each chunk is slimmed to 7 columns before it is
+    # kept in memory.
+    bounds = _month_starts(RENTS_START, date.today())
+    chunks = [
+        (
+            lo.isoformat(),
+            {
+                "filter": (
+                    "property_usage_en='Residential' AND "
+                    f"contract_start_date>='{lo.isoformat()}' AND "
+                    f"contract_start_date<'{hi.isoformat()}'"
+                ),
+                "order_by": "contract_start_date",
+                "order_dir": "asc",
+            },
+        )
+        for lo, hi in zip(bounds, bounds[1:])
+    ]
+    raw = fetch_chunked(config, "dld_rent_contracts-open-api", chunks,
+                        max_records=1_000_000, transform=_slim_rents)
+    if raw.is_empty():
+        raise RuntimeError("rents pull returned no records; not overwriting GCS")
+
+    n0 = raw.height
+    rents = raw.drop("_raw_row").drop_nulls(["start", "annual_amount", "AREA_EN"])
     rents = rents.filter(
         (pl.col("start").dt.year() >= RENT_YEAR_MIN)
         & (pl.col("start").dt.year() <= RENT_YEAR_MAX)
@@ -285,9 +330,11 @@ def pull_rents(config, secrets) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    # saleindex is opt-in only: the gateway dataset is frozen at 2024-05 and
+    # no model feature consumes it — no point spending a pull on it by default.
     parser.add_argument(
         "--only", nargs="*",
-        default=["projects", "buildings", "service", "rents", "units", "saleindex"],
+        default=["projects", "buildings", "service", "rents", "units"],
         choices=["projects", "buildings", "service", "rents", "units", "saleindex"],
     )
     args = parser.parse_args()

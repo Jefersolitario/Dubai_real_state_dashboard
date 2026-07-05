@@ -470,7 +470,21 @@ def main() -> int:
 
     # Ship the winning configuration to the app (fair_value_model reads this
     # at train time), unless the winner is not an HGB config the app can run.
-    if best["kind"] in ("hgb", "baseline"):
+    # Never overwrite a better champion: this ladder cannot evaluate the
+    # reference-backed feature groups (it loads no reference frames), so a
+    # campaign-shipped config with e.g. unit_floor/comps_rooms would otherwise
+    # be silently regressed by a re-run of this script.
+    current_cv = None
+    try:
+        current_cv = json.loads(SHIPPING_CONFIG_PATH.read_text()).get("cv_medape_mean")
+    except (FileNotFoundError, ValueError):
+        pass
+    if current_cv is not None and best["metrics"]["medape_mean"] >= current_cv:
+        print(
+            f"Winner ({best['metrics']['medape_mean']:.2%}) does not beat the "
+            f"current shipping config ({current_cv:.2%}); config NOT updated."
+        )
+    elif best["kind"] in ("hgb", "baseline"):
         SHIPPING_CONFIG_PATH.write_text(
             json.dumps(
                 {

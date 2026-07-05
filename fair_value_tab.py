@@ -178,11 +178,12 @@ def train_local_model(data_version: str) -> tuple[FairValueResult, dict]:
     return result, {"trained_at": None, "source": "trained in this session"}
 
 
-@st.cache_resource(show_spinner="Scoring transactions against fair value...")
+@st.cache_resource(show_spinner="Scoring transactions against fair value...", max_entries=4)
 def get_scored(
     data_version: str,
     score_start: date,
     score_end: date,
+    trained_at: str,
     _result: FairValueResult,
 ) -> pl.DataFrame:
     """Fair-value predictions for scoreable rows in the window (threshold-independent).
@@ -191,13 +192,53 @@ def get_scored(
     past), but the predict pass only runs on rows inside the scoring window —
     that is what keeps the default "last month" view fast. The threshold
     slider only re-runs the cheap flag_distress expressions, never this
-    predict pass. ``_result`` is underscore-prefixed so Streamlit keys the
-    cache on the other arguments only (the bundle is stable per version).
+    predict pass. ``_result`` is underscore-prefixed (unhashable);
+    ``trained_at`` stands in for it in the cache key so a refreshed bundle
+    invalidates stale predictions. ``max_entries`` bounds the cache — in
+    sidebar-range mode every distinct date pair is a new key, and unbounded
+    scored frames are exactly the memory profile that kills the cloud host.
     """
     feats = get_features(data_version).filter(
         pl.col("date").is_between(score_start, score_end)
     )
+    if feats.is_empty():
+        # model.predict rejects 0-row input; return the empty frame with the
+        # scoring columns so downstream flagging/filtering degrade gracefully.
+        return feats.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias(c)
+            for c in ("pred_psf", "fair_value_aed", "spread_pct")
+        )
     return score_transactions(_result, feats)
+
+
+def _features_or_error(data_version: str) -> pl.DataFrame | None:
+    """get_features with the missing-reference case rendered, not raised."""
+    try:
+        return get_features(data_version)
+    except FileNotFoundError as exc:
+        st.error(
+            f"A reference dataset the model needs is missing: {exc}. "
+            "Publish it with `python store_reference_data_gcs.py` (offline)."
+        )
+        return None
+
+
+@st.cache_resource
+def get_feature_bounds(data_version: str) -> tuple[date, date]:
+    """(min, max) feature dates — cached so reruns skip the full-column scan."""
+    feats = get_features(data_version)
+    return feats["date"].min(), feats["date"].max()
+
+
+# Scoring-window choices: one mapping drives both the widget and the window
+# math, so an option can't silently fall through to the all-history path.
+# Values: days back from the newest sale; "sidebar" and "all" are sentinels.
+SCORING_WINDOWS: dict[str, int | str] = {
+    "Last month": 30,
+    "Last 3 months": 90,
+    "Sidebar date range": "sidebar",
+    "All history": "all",
+}
 
 
 def pred_vs_actual_chart(scored: pl.DataFrame) -> go.Figure:
@@ -340,12 +381,13 @@ def render_fair_value_tab(
             "`python train_fair_value.py` (run offline — training is too heavy "
             "for this deployment)."
         )
-        feats_rows = get_features(data_version).height
-        if feats_rows < MIN_TRAINING_ROWS:
-            st.info(
-                f"Local training also unavailable: only {feats_rows:,} apartment "
-                f"sales loaded (need at least {MIN_TRAINING_ROWS:,})."
-            )
+        feats = _features_or_error(data_version)
+        if feats is None or feats.height < MIN_TRAINING_ROWS:
+            if feats is not None:
+                st.info(
+                    f"Local training also unavailable: only {feats.height:,} apartment "
+                    f"sales loaded (need at least {MIN_TRAINING_ROWS:,})."
+                )
             return
         if not st.button("Train in this session (heavy — local use only)"):
             return
@@ -354,13 +396,13 @@ def render_fair_value_tab(
         st.error(f"Could not load the fair-value model bundle: {exc}")
         return
 
-    feats = get_features(data_version)
+    feats = _features_or_error(data_version)
+    if feats is None:
+        return
     if feats.is_empty():
         st.warning("No scoreable apartment sales in the loaded data.")
         return
-    data_min, data_max = feats.select(
-        pl.col("date").min().alias("lo"), pl.col("date").max().alias("hi")
-    ).row(0)
+    data_min, data_max = get_feature_bounds(data_version)
 
     st.markdown("### Fair Value Model — Below-Market & Distressed-Asset Scanner")
     st.caption(
@@ -388,12 +430,17 @@ def render_fair_value_tab(
                 "`python train_fair_value.py` (offline)."
             )
 
+    # Seed the widget state once, then pass key= only: with the lazy page
+    # dispatch these widgets unmount while Market Overview is shown, and the
+    # keep-alive re-assignment in dubai_dashboard.py preserves the values.
+    st.session_state.setdefault("fv_window", next(iter(SCORING_WINDOWS)))
+    st.session_state.setdefault("fv_threshold", 15)
     col_window, col_threshold = st.columns([1, 2])
     with col_window:
         window = st.selectbox(
             "Scoring window",
-            ["Last month", "Last 3 months", "Sidebar date range", "All history"],
-            index=0,
+            list(SCORING_WINDOWS),
+            key="fv_window",
             help=(
                 "Only sales in this window are scored against fair value — the "
                 "default keeps the tab fast. Features still use the full history, "
@@ -405,9 +452,9 @@ def render_fair_value_tab(
             "Below-fair-value threshold",
             min_value=5,
             max_value=30,
-            value=15,
             step=1,
             format="-%d%%",
+            key="fv_threshold",
             help=(
                 "A sale is flagged 'below fair value' when its price is at least this far "
                 "under the model's predicted fair value. 'Distressed candidate' additionally "
@@ -416,17 +463,16 @@ def render_fair_value_tab(
             ),
         )
 
-    if window == "Last month":
-        score_start, score_end = data_max - timedelta(days=30), data_max
-    elif window == "Last 3 months":
-        score_start, score_end = data_max - timedelta(days=90), data_max
-    elif window == "Sidebar date range":
+    window_spec = SCORING_WINDOWS[window]
+    if window_spec == "sidebar":
         score_start, score_end = start_date, end_date
-    else:
+    elif window_spec == "all":
         score_start, score_end = data_min, data_max
+    else:
+        score_start, score_end = data_max - timedelta(days=window_spec), data_max
 
     scored = flag_distress(
-        get_scored(data_version, score_start, score_end, result),
+        get_scored(data_version, score_start, score_end, str(trained_at), result),
         spread_threshold=-threshold_pct / 100,
     )
     if scored.is_empty():
@@ -439,7 +485,8 @@ def render_fair_value_tab(
     view = _display_filter(scored, neighborhoods, bedroom, start_date, end_date)
 
     metrics = result.metrics or {}
-    n_below = view.filter(pl.col("below_fair_value")).height
+    flagged = view.filter(pl.col("below_fair_value"))
+    n_below = flagged.height
     n_distressed = view.filter(pl.col("distressed")).height
     medape = metrics.get("medape_mean")
     medape_std = metrics.get("medape_std")
@@ -479,7 +526,15 @@ def render_fair_value_tab(
         )
 
     if view.is_empty():
-        st.warning("No scored transactions for the selected filters/date range.")
+        if score_end < start_date or score_start > end_date:
+            st.warning(
+                f"The scoring window ({score_start} to {score_end}) does not "
+                f"overlap the sidebar date range ({start_date} to {end_date}). "
+                "Pick 'Sidebar date range' as the scoring window, or widen "
+                "the sidebar dates."
+            )
+        else:
+            st.warning("No scored transactions for the selected filters/date range.")
         return
 
     st.markdown("#### Flagged transactions")
@@ -498,7 +553,7 @@ def render_fair_value_tab(
         else []
     )
     table = (
-        view.filter(pl.col("below_fair_value"))
+        flagged
         .sort(["distressed", "signal_strength"], descending=[True, True])
         .select(
             pl.col("date").cast(pl.Utf8).alias("Date"),

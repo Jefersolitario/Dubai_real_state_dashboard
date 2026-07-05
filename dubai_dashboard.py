@@ -17,7 +17,7 @@ Configure DDA credentials through Streamlit secrets or environment variables.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 
 import polars as pl
 import plotly.colors
@@ -32,8 +32,8 @@ from dda_api import (
     build_dld_transactions_params,
     fetch_dataset_records,
     infer_column_mapping,
-    project_dashboard_columns,
     last_months_date_range,
+    months_before,
     load_dda_config,
     normalize_dld_transactions,
     records_to_dataframe,
@@ -584,7 +584,6 @@ def _load_gcs_transactions(
     raw_columns = raw_df.columns
     mapping = infer_column_mapping(raw_columns)
     del raw_df
-    normalized = project_dashboard_columns(normalized)
 
     bounds = _date_bounds_from_transactions(normalized)
     object_metadata = blob.metadata or {}
@@ -770,14 +769,10 @@ def _ensure_transactions_cover_range(
             "written": False,
         }
 
-    # Both merge sides must share the canonical schema: the loaded snapshot
-    # is projected, so project the fresh API rows too — otherwise identical
-    # transactions differ in raw-only columns, survive dedupe, and the
-    # written snapshot fails the duplicate verification after projection.
-    incoming_df = project_dashboard_columns(
-        pl.concat(incoming_frames, how="diagonal_relaxed")
-    )
-    existing_deduped = dedupe_snapshot(project_dashboard_columns(df))
+    # Both merge sides already share the canonical schema:
+    # normalize_dld_transactions projects every frame at the source.
+    incoming_df = pl.concat(incoming_frames, how="diagonal_relaxed")
+    existing_deduped = dedupe_snapshot(df)
     incoming_deduped = dedupe_snapshot(incoming_df)
     combined = pl.concat([existing_deduped, incoming_deduped], how="diagonal_relaxed")
     final_df = stable_sort(dedupe_snapshot(combined))
@@ -1609,7 +1604,7 @@ with st.sidebar:
     date_min, date_max, default_end = _date_picker_bounds()
     # Show the last 12 months by default; the snapshot keeps 24 months for
     # model training, and the picker still allows selecting the full range.
-    default_start = max(date_min, default_end - timedelta(days=365))
+    default_start = max(date_min, months_before(default_end, 12))
 
     date_range = st.date_input(
         "Date Range",
@@ -1682,8 +1677,6 @@ if not neighborhoods:
     st.warning("Select at least one neighbourhood in the sidebar.")
     st.stop()
 
-filtered = apply_filters(DF, neighborhoods, bedroom, start_date, end_date)
-
 # Segmented control instead of st.tabs: st.tabs executes every tab body on
 # each rerun, which would load the model bundle and score transactions even
 # when the user never opens the Fair Value view. Only the active page runs.
@@ -1694,10 +1687,24 @@ active_page = st.segmented_control(
     key="active_page",
     label_visibility="collapsed",
 )
+# Clicking the highlighted segment deselects it (returns None); treat that
+# as the default page rather than rendering an unselected state.
+if active_page is None:
+    active_page = "📊 Market Overview"
+
+# Streamlit drops the state of widgets that are not rendered in a run; the
+# Fair Value page's widgets disappear while Market Overview is shown, so
+# re-assign their keys every run to keep the user's selections alive.
+for _fv_key in ("fv_window", "fv_threshold"):
+    if _fv_key in st.session_state:
+        st.session_state[_fv_key] = st.session_state[_fv_key]
 
 if active_page == "🎯 Fair Value Model":
     render_fair_value_tab(neighborhoods, bedroom, start_date, end_date, data_version)
 else:
+    # Only the overview consumes the filtered frame — compute it here so
+    # Fair Value interactions don't pay for an unused aggregation.
+    filtered = apply_filters(DF, neighborhoods, bedroom, start_date, end_date)
     _render_market_overview(
         filtered,
         neighborhoods,

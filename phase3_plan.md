@@ -120,6 +120,22 @@ than 0.1pp of MedAPE.
 | Dashboard quality panel | A | 0.5 day | High (product value, model-independent) |
 | D. Live listings | partnership | external | High, blocked |
 
+## Engineering debt (queued from the 2026-07-05 code review; do alongside Phase 3)
+
+- **Table-driven feature-group registry** in `fair_value_model.py`: one
+  `FEATURE_GROUPS` map (columns, reference requirements, dependencies, display
+  labels) instead of 5–6 parallel edits per new group across two files.
+- **Bundle-carried signal-strength calibration**: compute per-segment expected
+  error at train time and store it in the bundle's `metrics`, replacing the
+  hard-coded `EXPECTED_ERR_*` constants so weekly retrains can't silently
+  miscalibrate the ranking.
+- **Teach `optimize_fair_value.py` the reference-backed groups** (load reference
+  frames, add ladder proposals); today a champion-protection guard merely stops
+  it from regressing the shipping config.
+- **`UNITS_ROOMS_CHUNKS` completeness**: derive the rooms partition from a
+  distinct-values probe (or add a catch-all chunk) so a new upstream label
+  cannot silently drop units from the registry.
+
 **Out of scope for Phase 3** (documented dead ends, do not revisit without new data):
 official sale index (frozen at 2024-05 on the gateway), rent level/yield/density as
 *prediction* features (rejected in Campaign 2 Batches B/C), service charges and project

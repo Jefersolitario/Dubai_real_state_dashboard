@@ -500,7 +500,12 @@ def normalize_dld_transactions(data: list[dict[str, Any]] | pl.DataFrame) -> pl.
 
     df = _add_missing_optional_columns(df)
     df = _normalize_types(df)
-    return df
+    # Project to the canonical schema HERE, not at call sites: every merge
+    # participant must share the exact column set or full-row dedupe treats
+    # identical transactions as distinct and corrupts the snapshot (the
+    # 2026-07-05 near-duplicate incident). Raw-column consumers should use
+    # records_to_dataframe / infer_column_mapping directly.
+    return project_dashboard_columns(df)
 
 
 def infer_column_mapping(columns: list[str]) -> dict[str, list[str]]:

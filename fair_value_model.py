@@ -229,7 +229,7 @@ def feature_engineering(
     optional_sources = [
         "PARKING", "TOTAL_BUYER", "TOTAL_SELLER", "METER_SALE_PRICE",
         "PROCEDURE_EN", "PROJECT_EN", "MASTER_PROJECT_EN", "BUILDING_NAME_EN",
-        "TRANSACTION_NUMBER", "USAGE_EN", "PROP_TYPE_EN",
+        "TRANSACTION_NUMBER", "USAGE_EN", "PROP_TYPE_EN", "PROJECT_NUMBER",
         "NEAREST_METRO_EN", "NEAREST_MALL_EN", "NEAREST_LANDMARK_EN",
     ]
     missing_sources = [c for c in optional_sources if c not in raw.columns]
@@ -336,8 +336,9 @@ def feature_engineering(
             # Expanding all-past medians (window far longer than the data span).
             comps.append(past_stat("psf", "3650d", "PROJECT_EN").alias("project_hist_psf"))
             comps.append(past_stat("psf", "3650d", "BUILDING_NAME_EN").alias("building_hist_psf"))
-        if cfg["liquidity"]:
+        if cfg["liquidity"] or cfg["rooms_dynamics"]:
             df = df.with_columns(pl.lit(1.0).alias("_one"))
+        if cfg["liquidity"]:
             comps.append(past_stat("_one", "90d", "PROJECT_EN", "sum").alias("project_txn_90d"))
             comps.append(past_stat("_one", "30d", "AREA_EN", "sum").alias("area_txn_30d"))
         if cfg["momentum"]:
@@ -375,8 +376,6 @@ def feature_engineering(
                 comps.append(past_stat("psf", pr_win, "_proj_rooms").alias("project_rooms_comp_psf"))
                 comps.append(past_stat("psf", ar_win, "_area_rooms").alias("area_rooms_comp_psf"))
             if cfg["rooms_dynamics"]:
-                if "_one" not in df.columns:
-                    df = df.with_columns(pl.lit(1.0).alias("_one"))
                 comps.append(past_stat("psf", "90d", "_proj_rooms", "std").alias("project_rooms_comp_std"))
                 comps.append(past_stat("_one", "90d", "_proj_rooms", "sum").alias("project_rooms_txn_90d"))
         if comps:
@@ -602,7 +601,12 @@ def feature_engineering(
     df = df.with_columns(
         pl.col(c).cast(pl.Utf8).fill_null("UNKNOWN").alias(c) for c in categorical
     )
-    keep = ["date", "psf", "log_psf"]
+    # Full-history project size, carried through for flag_distress: the
+    # illiquidity distress signal must count a project's sales over the
+    # whole snapshot, not over whatever scoring window is later selected.
+    df = df.with_columns(pl.len().over("PROJECT_EN").alias("project_txn_total"))
+
+    keep = ["date", "psf", "log_psf", "project_txn_total"]
     numeric, _ = feature_columns(cfg)
     keep += numeric + categorical
     keep += [c for c in PASSTHROUGH_COLUMNS if c in df.columns and c not in keep]
@@ -762,10 +766,9 @@ def summarize_folds(folds: list[dict[str, float]], n_rows: int, n_splits: int) -
         "folds": folds,
     }
     for key in ("medape", "mae_log", "r2", "p90_ape", "flag_prop"):
-        values = [f[key] for f in folds if key in f]
-        if values:
-            summary[f"{key}_mean"] = float(np.mean(values))
-            summary[f"{key}_std"] = float(np.std(values))
+        values = [f[key] for f in folds]
+        summary[f"{key}_mean"] = float(np.mean(values))
+        summary[f"{key}_std"] = float(np.std(values))
     return summary
 
 
@@ -861,7 +864,13 @@ def train_fair_value_model(
 # Model bundle (offline training -> light inference artifact)
 # ---------------------------------------------------------------------------
 
-BUNDLE_VERSION = 1
+BUNDLE_VERSION = 2  # v2: feature-config key "te_hist" renamed to "price_history"
+
+# Old bundles store feature configs under retired key names. Migrate on load
+# so a rollback or stale cached bundle keeps working instead of silently
+# dropping a feature group (which changes the matrix width and crashes
+# predict — or worse, mispredicts if the column count happens to match).
+CONFIG_KEY_MIGRATIONS = {"te_hist": "price_history"}
 
 
 def export_bundle(result: FairValueResult, extra: dict | None = None) -> bytes:
@@ -907,12 +916,16 @@ def load_bundle(data: bytes) -> tuple[FairValueResult, dict]:
             "installed; retrain with train_fair_value.py if predictions look off.",
             stacklevel=2,
         )
+    feature_config = {
+        CONFIG_KEY_MIGRATIONS.get(key, key): value
+        for key, value in (payload["feature_config"] or {}).items()
+    }
     result = FairValueResult(
         model=payload["model"],
         encoders=payload["encoders"],
         feature_names=payload["feature_names"],
         categorical_idx=payload["categorical_idx"],
-        feature_config=payload["feature_config"],
+        feature_config=feature_config,
         metrics=payload["metrics"],
         importances=pl.DataFrame(payload["importances"]),
         date_origin=payload["date_origin"],
@@ -935,7 +948,14 @@ def score_transactions(result: FairValueResult, df: pl.DataFrame) -> pl.DataFram
     feature_config (pass ``date_origin=result.date_origin`` when scoring
     data outside the training frame).
     """
-    X, _, _, _ = to_matrix(df, result.encoders, result.feature_config)
+    X, _, built_names, _ = to_matrix(df, result.encoders, result.feature_config)
+    if result.feature_names and built_names != result.feature_names:
+        raise ValueError(
+            "Feature mismatch between this code and the model bundle: built "
+            f"{built_names} but the bundle was trained on {result.feature_names}. "
+            "Re-publish the bundle with train_fair_value.py (or update "
+            "CONFIG_KEY_MIGRATIONS if a feature-group key was renamed)."
+        )
     pred_log_psf = result.model.predict(X)
     return df.with_columns(
         pl.Series("pred_psf", np.exp(pred_log_psf)),
@@ -957,7 +977,7 @@ EXPECTED_ERR_COLD_START = 0.065
 
 def flag_distress(
     scored: pl.DataFrame,
-    spread_threshold: float = -0.15,
+    spread_threshold: float = FLAG_SPREAD_THRESHOLD,
     deep_discount: float = -0.25,
     min_project_txns: int = 8,
     expected_err_established: float = EXPECTED_ERR_ESTABLISHED,
@@ -1001,7 +1021,16 @@ def flag_distress(
         (pl.col("spread_pct") <= spread_threshold).alias("below_fair_value"),
         procedure.alias("sig_procedure"),
         (pl.col("spread_pct") <= deep_discount).alias("sig_deep_discount"),
-        (pl.len().over("PROJECT_EN") < min_project_txns).alias("sig_illiquid_project"),
+        # Illiquidity must be judged over the FULL history: feature_engineering
+        # carries project_txn_total for exactly this. Counting rows of `scored`
+        # would make the signal depend on the user's scoring window (a liquid
+        # project looks illiquid in a 30-day slice). The fallback only exists
+        # for frames that predate the passthrough column.
+        (
+            (pl.col("project_txn_total") < min_project_txns)
+            if "project_txn_total" in scored.columns
+            else (pl.len().over("PROJECT_EN") < min_project_txns)
+        ).alias("sig_illiquid_project"),
         multi_seller.alias("sig_multi_seller"),
         (-pl.col("spread_pct") / expected_err).alias("signal_strength"),
         cold.alias("cold_start"),

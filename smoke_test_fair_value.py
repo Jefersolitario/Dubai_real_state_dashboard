@@ -209,6 +209,11 @@ def check_reference_groups(raw: pl.DataFrame) -> bool:
     sub = raw.head(2000).with_columns(
         pl.Series("PROJECT_NUMBER", [101, 102] * 1000),
         pl.Series("ACTUAL_AREA", [88.55, 60.25] * 1000),
+    ).with_columns(
+        # Keep METER_SALE_PRICE consistent with the overwritten areas, or the
+        # area-mismatch guard drops ~90% of rows and the assertions below run
+        # on an RNG-dependent remnant.
+        (pl.col("TRANS_VALUE") / pl.col("ACTUAL_AREA")).alias("METER_SALE_PRICE"),
     )
     feats = feature_engineering(
         sub,
