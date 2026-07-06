@@ -9,6 +9,7 @@
  "cv_flag_prop": 0.049029,
  "holdout_medape": 0.041536,
  "holdout_note": "one-shot holdout 2026-05-01+ (17,953 sales): MedAPE 4.15% vs 4.32% shipped, P90 15.67% vs 16.01%, false-flag 6.25% vs 6.53%; forced-sale lift unmeasurable (0 forced-sale procedures in window)",
+ "data_cleaning_note": "enabled 2026-07-06 after CV A/B on the full 24m frame (see data_cleaning_report.md): MedAPE 3.452% vs 3.503%, flag_prop 4.155% vs 4.326%, holdout deep tail (<-35%) 137 vs 181; A/B protocol differs from the campaign metrics above (full frame vs selection window) so deltas, not levels, are comparable",
  "feature_config": {
   "project": true,
   "building": false,
@@ -21,7 +22,8 @@
   "unit_floor": true,
   "project_meta": true,
   "rel_floor": true,
-  "comps_rooms": true
+  "comps_rooms": true,
+  "data_cleaning": true
  },
  "model_params": {
   "learning_rate": 0.04,
