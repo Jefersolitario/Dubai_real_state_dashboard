@@ -1522,7 +1522,9 @@ st.markdown(
     <style>
         [data-testid="stMetricValue"] { font-size: 1.3rem; }
         [data-testid="stMetricLabel"] { font-size: 0.78rem; text-transform: uppercase; letter-spacing: .05em; }
-        .block-container { padding-top: 1.2rem; }
+        /* Must clear the ~3.75rem sticky stAppHeader or the first element
+           (the page selector) renders underneath it, clipped and unclickable. */
+        .block-container { padding-top: 4.5rem; }
         h1 { font-size: 1.5rem !important; }
     </style>
     """,
