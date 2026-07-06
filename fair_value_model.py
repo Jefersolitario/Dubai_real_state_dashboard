@@ -31,6 +31,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.model_selection import TimeSeriesSplit
 
+import data_cleaning
 from dashboard_constants import DISTRICT_TIER, SQM_TO_SQFT
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,8 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "rent_density": False,           # trailing 180d Ejari contract count for area x rooms band
     "comps_rooms": False,            # trailing comps per project x rooms and area x rooms (strictly past)
     "rooms_dynamics": False,         # dispersion + liquidity per project x rooms (strictly past)
+    # --- data quality (see data_cleaning.py) ---
+    "data_cleaning": False,          # repair digit-shift typos; exclude review_only/quarantine rows
 }
 
 DEFAULT_MODEL_PARAMS: dict = {
@@ -120,6 +123,9 @@ PASSTHROUGH_COLUMNS = [
     "IS_OFFPLAN_EN",
     "TRANS_VALUE",
     "ACTUAL_AREA",
+    # present only when the data_cleaning feature group is enabled
+    "dq_rule",
+    "dq_action",
 ]
 
 
@@ -661,6 +667,13 @@ def feature_engineering(
     area recorded instead of unit area), and returns one row per transaction
     with the ``log_psf`` target, model features, and passthrough columns.
 
+    With ``"data_cleaning": True`` in the config, :mod:`data_cleaning`
+    replaces the METER_SALE_PRICE guard: digit-shift typos are repaired in
+    place, and non-market rows (bulk allocations, suspected token
+    transfers, partial-ownership shares) are excluded here and surfaced
+    separately in the UI. ``dq_rule``/``dq_action`` ride along as
+    passthrough columns.
+
     Deliberately does NOT trim PSF outliers: the deepest discounts are the
     distressed assets this model exists to surface. Apply :func:`trim_psf`
     to the result before TRAINING so the target stays robust.
@@ -676,8 +689,18 @@ def feature_engineering(
     df = _filter_scoreable_sales(raw)
     if df.is_empty():
         return df
-    df = _parse_date_and_price(df)
-    df = _drop_area_mismatch_rows(df)
+    if cfg.get("data_cleaning"):
+        # Repair digit-shift typos and keep only market-price rows. The
+        # METER_SALE_PRICE guard below must be skipped: repairs re-derive
+        # that field, and the cleaner already quarantines basis mismatches.
+        cleaned, _ = data_cleaning.clean_transactions(df, reference=reference)
+        df = data_cleaning.kept_rows(cleaned)
+        if df.is_empty():
+            return df
+        df = _parse_date_and_price(df)
+    else:
+        df = _parse_date_and_price(df)
+        df = _drop_area_mismatch_rows(df)
     if df.is_empty():
         return df
 
@@ -694,6 +717,24 @@ def feature_engineering(
     df = _join_rent_grid(df, cfg, reference)
     df = _join_units_registry(df, cfg, reference)
     return _select_output_columns(df, cfg)
+
+
+def excluded_suspicious_sales(
+    raw: pl.DataFrame, reference: dict[str, pl.DataFrame] | None = None
+) -> pl.DataFrame:
+    """Sales the cleaning step routes to human review instead of the model.
+
+    Runs the same scoreable-sales filter + :mod:`data_cleaning` pass as
+    ``feature_engineering`` with ``"data_cleaning": True`` and returns the
+    ``review_only`` rows (bulk allocations, suspected token transfers,
+    partial-ownership shares) with their ``dq_rule`` labels — real
+    transfers whose registered price is not a standalone market price.
+    """
+    df = _filter_scoreable_sales(_backfill_optional_columns(raw))
+    if df.is_empty():
+        return df
+    cleaned, _ = data_cleaning.clean_transactions(df, reference=reference)
+    return data_cleaning.review_rows(cleaned)
 
 
 def trim_psf(df: pl.DataFrame) -> pl.DataFrame:

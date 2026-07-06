@@ -65,6 +65,26 @@ Shared constants and pure Polars/layout helpers (`AREA_DISPLAY`, `NEIGHBORHOODS`
 
 Pure Polars + scikit-learn fair-value model: `feature_engineering` (Sales-only apartments, METER_SALE_PRICE area-mismatch guard, non-market-procedure exclusion, no PSF trim — apply `trim_psf` before TRAINING only; strictly past-only derived features via `closed="left"` rolling windows and `shift(1)`; optional `reference` frames for the units-registry/projects/rent-grid joins), 10-fold date-ordered `TimeSeriesSplit` `cross_validate` (fold metrics include MedAPE plus the tail pair `p90_ape` and `flag_prop` — the share of ordinary sales pushed below −15% spread by model error; campaign acceptance requires a MedAPE win AND no tail worsening), `train_fair_value_model` (HistGradientBoostingRegressor on log AED/sqft, out-of-sample permutation importances), `score_transactions` (`spread_pct = actual/fair value − 1`), and `flag_distress` (distressed = below threshold AND ≥1 residual-independent signal: forced-sale procedure, illiquid project, multiple sellers — a deep discount alone never qualifies; also emits `signal_strength` = −spread ÷ segment expected error, established ~4% vs cold-start ~6.5%). The shipped configuration (`fair_value_config.json`, via `load_shipping_config()`) uses floor/balcony features from the units registry (`unit_floor` + `project_meta` + `rel_floor`) and per-unit-type comps (`comps_rooms`) on top of repeat-sale, price-history, and relative-size groups — CV 4.08%, holdout 4.15%. The units join needs `PROJECT_NUMBER` populated in the snapshot (a normalized snapshot cannot back-fill it; rebuild from a raw pull if coverage drops).
 
+### data_cleaning.py
+
+Pure-Polars data-quality module: `clean_transactions(df, reference=None) ->
+(df, CleaningReport)` labels every row `clean` / `repaired` / `review_only` /
+`quarantine` (`dq_rule` + `dq_action` columns) instead of silently dropping.
+Digit-shift typos (missing/extra zeros) are repaired in place when the
+corrected price lands near the project comp AND the recorded area is credible
+for the layout (project×rooms median area, optionally the units registry);
+bulk-deal allocations (≥3 same-project same-day identical prices ≥25% below
+comp — at-market developer launch batches stay clean), suspected
+related-party/token prices (<40% of comp), and partial-ownership shares are
+routed `review_only`: excluded from training and the flag list, shown in the
+tab's "Excluded suspicious records" expander. Key feed facts:
+METER_SALE_PRICE is mechanically derived from TRANS_VALUE/ACTUAL_AREA
+(agrees to ~1e-7), so comps — not MSP — are the repair instrument;
+PROCEDURE_AREA currently equals ACTUAL_AREA on every row, so the
+partial-transfer rule is future-proofing. Enabled via the `"data_cleaning"`
+feature-config flag (see `fair_value_config.json` for the shipped state;
+measured before enabling per `data_cleaning_report.md`).
+
 ### fair_value_tab.py
 
 Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version, full history — trailing comps need the past; loads GCS reference frames when the shipped config requires them), `get_model` (loads the pre-trained GCS bundle), `get_scored(data_version, score_start, score_end, _result)` (threshold-independent predictions for the selected scoring window only; default "Last month" keeps the tab fast); the threshold slider only re-runs `flag_distress`. The flagged table ranks distressed-first then by `signal_strength`; `FEATURE_LABELS` maps model feature names to plain language for the importance chart.

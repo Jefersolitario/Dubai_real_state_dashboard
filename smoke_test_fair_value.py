@@ -190,6 +190,7 @@ def main() -> int:
     print(f"       top importances: {top}")
 
     ok &= check_reference_groups(raw)
+    ok &= check_data_cleaning()
 
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
@@ -230,6 +231,88 @@ def check_reference_groups(raw: pl.DataFrame) -> bool:
         and abs(stacked["layout_floor_mean"][0] - 7.0) < 1e-9
     )
     return check(good, "unit_floor reference join behaves as designed")
+
+
+def _cleaning_frame() -> pl.DataFrame:
+    """One project at 20,000 AED/sqm with one planted row per cleaning rule.
+
+    METER_SALE_PRICE is derived from the (possibly corrupt) fields, exactly
+    as in the live DDA feed, so it can never arbitrate the repairs.
+    """
+    start = date(2025, 1, 1)
+
+    def row(tx: str, day: int, tv: float, aa: float, pa: float | None = None) -> dict:
+        return {
+            "TRANSACTION_NUMBER": tx,
+            "INSTANCE_DATE": (start + timedelta(days=day)).isoformat(),
+            "GROUP_EN": "Sales",
+            "PROCEDURE_EN": "Sell",
+            "IS_OFFPLAN_EN": "Ready",
+            "AREA_EN": "MARSA DUBAI",
+            "PROP_SB_TYPE_EN": "Flat",
+            "ROOMS_EN": "1 B/R",
+            "PROJECT_EN": "CLEAN TEST TOWER",
+            "TRANS_VALUE": tv,
+            "ACTUAL_AREA": aa,
+            "PROCEDURE_AREA": pa if pa is not None else aa,
+            "METER_SALE_PRICE": tv / aa,
+        }
+
+    rows = [row(f"OK-{i:03d}", i, 2_000_000.0, 100.0) for i in range(60)]
+    rows.append(row("TYPO-PRICE", 61, 200_000.0, 100.0))        # missing zero in price
+    rows.append(row("TYPO-AREA", 62, 2_000_000.0, 1000.0))      # extra zero in area
+    rows.append(row("PARTIAL", 63, 1_000_000.0, 100.0, pa=50.0))  # half-share transfer
+    rows += [row(f"BULK-{i}", 64, 1_000_000.0, 100.0) for i in range(3)]   # 50% below comp
+    rows += [row(f"LAUNCH-{i}", 65, 2_000_000.0, 100.0) for i in range(3)]  # at market
+    rows.append(row("TOKEN", 66, 500_000.0, 100.0))             # 25% of comp
+    return pl.DataFrame(rows)
+
+
+def check_data_cleaning() -> bool:
+    """Each cleaning rule fires on its planted row and nothing else."""
+    from data_cleaning import clean_transactions, kept_rows, review_rows
+
+    frame = _cleaning_frame()
+    out, report = clean_transactions(frame)
+    by_tx = {tx: (rule, action) for tx, rule, action in
+             out.select("TRANSACTION_NUMBER", "dq_rule", "dq_action").iter_rows()}
+
+    def repaired_value(tx: str, column: str) -> float:
+        return out.filter(pl.col("TRANSACTION_NUMBER") == tx)[column][0]
+
+    good = (
+        by_tx["TYPO-PRICE"] == ("price_digit_shift", "repaired")
+        and abs(repaired_value("TYPO-PRICE", "TRANS_VALUE") - 2_000_000.0) < 1e-6
+        and abs(repaired_value("TYPO-PRICE", "METER_SALE_PRICE") - 20_000.0) < 1e-6
+        and by_tx["TYPO-AREA"] == ("area_digit_shift", "repaired")
+        and abs(repaired_value("TYPO-AREA", "ACTUAL_AREA") - 100.0) < 1e-6
+        and by_tx["PARTIAL"] == ("partial_transfer", "review_only")
+        and all(by_tx[f"BULK-{i}"] == ("bulk_allocation", "review_only") for i in range(3))
+        and all(by_tx[f"LAUNCH-{i}"] == (None, "clean") for i in range(3))
+        and by_tx["TOKEN"] == ("suspected_token_transfer", "review_only")
+        and all(by_tx[f"OK-{i:03d}"] == (None, "clean") for i in range(60))
+        and repaired_value("OK-000", "TRANS_VALUE") == 2_000_000.0
+        and kept_rows(out).height == 60 + 2 + 3
+        and review_rows(out).height == 5
+        and report.action_counts.get("repaired") == 2
+    )
+    ok = check(good, "data cleaning: each rule fires only on its planted row")
+
+    # Integration: feature_engineering with the flag on uses repaired values
+    # and drops review_only rows; with the flag off it changes nothing.
+    feats = feature_engineering(frame, {"data_cleaning": True})
+    kept_tx = set(feats.get_column("TRANSACTION_NUMBER").to_list())
+    repaired_psf = feats.filter(pl.col("TRANSACTION_NUMBER") == "TYPO-PRICE")["psf"][0]
+    expected_psf = 20_000.0 / SQM_TO_SQFT
+    good = (
+        "PARTIAL" not in kept_tx and "TOKEN" not in kept_tx
+        and "BULK-0" not in kept_tx and "LAUNCH-0" in kept_tx
+        and abs(repaired_psf - expected_psf) < 1e-6
+        and "dq_action" in feats.columns
+        and feature_engineering(frame).height == frame.height
+    )
+    ok &= check(good, "feature_engineering data_cleaning flag repairs and routes")
+    return ok
 
 
 if __name__ == "__main__":

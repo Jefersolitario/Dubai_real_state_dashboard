@@ -23,8 +23,10 @@ from dashboard_constants import (
     bedroom_type_expr,
     layout_defaults as _layout_defaults,
 )
+from data_cleaning import RULE_LABELS
 from fair_value_model import (
     FairValueResult,
+    excluded_suspicious_sales,
     feature_engineering,
     flag_distress,
     load_bundle,
@@ -211,6 +213,24 @@ def get_scored(
             for c in ("pred_psf", "fair_value_aed", "spread_pct")
         )
     return score_transactions(_result, feats)
+
+
+@st.cache_resource(show_spinner="Checking for suspicious records...")
+def get_review_rows(data_version: str) -> pl.DataFrame:
+    """Sales the data-cleaning step excluded as non-market prices.
+
+    Empty unless the shipped config enables ``data_cleaning`` — the rows
+    shown here are exactly the ones ``get_features`` dropped, so the
+    expander and the model can never disagree about what was excluded.
+    """
+    feature_config, _ = load_shipping_config()
+    if not feature_config.get("data_cleaning"):
+        return pl.DataFrame()
+    reference = None
+    ref_names = reference_needed(feature_config)
+    if ref_names:
+        reference = read_reference_frames(st.secrets, ref_names)
+    return excluded_suspicious_sales(_raw_transactions(), reference=reference)
 
 
 def _features_or_error(data_version: str) -> pl.DataFrame | None:
@@ -640,6 +660,54 @@ def _render_methodology(scored: pl.DataFrame) -> None:
         st.dataframe(proc_counts, use_container_width=True, height=200)
 
 
+def _render_review_expander(data_version: str) -> None:
+    """Excluded-suspicious-records expander (only when cleaning is enabled).
+
+    These are real transfers whose registered price is not a standalone
+    market price — bulk-deal allocations, suspected related-party/token
+    prices, partial-ownership shares. On paper they look like 40-70%
+    discounts nobody could actually buy at, so the model neither trains on
+    them nor flags them; they are shown here, labelled, instead.
+    """
+    review = get_review_rows(data_version)
+    if review.is_empty():
+        return
+    with st.expander(
+        f"🔎 Excluded suspicious records ({review.height:,})", expanded=False
+    ):
+        st.caption(
+            "Sales excluded from training and from the flag list because the "
+            "registered price is unlikely to be a standalone market price. "
+            "**Price vs comp** compares the deal's AED/sqm with the project's "
+            "median (or the district's where the project is thin)."
+        )
+        counts = review.group_by("dq_rule").len().sort("len", descending=True)
+        st.markdown(
+            "\n".join(
+                f"- **{RULE_LABELS.get(rule, rule)}** — {n:,} records"
+                for rule, n in counts.iter_rows()
+            )
+        )
+        table = (
+            review.with_columns(
+                area_display_expr().alias("area_display"),
+                bedroom_type_expr().alias("bedroom_type"),
+            )
+            .sort("INSTANCE_DATE", descending=True)
+            .select(
+                pl.col("INSTANCE_DATE").cast(pl.Utf8).str.slice(0, 10).alias("Date"),
+                pl.col("area_display").alias("Area"),
+                pl.col("PROJECT_EN").alias("Project"),
+                pl.col("bedroom_type").alias("Rooms"),
+                (pl.col("ACTUAL_AREA") * SQM_TO_SQFT).round(0).alias("Size (sqft)"),
+                pl.col("TRANS_VALUE").round(0).alias("Registered price (AED)"),
+                (pl.col("dq_comp_ratio") * 100).round(0).alias("Price vs comp (%)"),
+                pl.col("dq_rule").replace(RULE_LABELS).alias("Why excluded"),
+            )
+        )
+        st.dataframe(table, use_container_width=True, height=300)
+
+
 def render_fair_value_tab(
     neighborhoods: list[str],
     bedroom: str,
@@ -692,4 +760,5 @@ def render_fair_value_tab(
 
     _render_flagged_table(flagged, view)
     _render_result_charts(view, result, threshold_pct)
+    _render_review_expander(data_version)
     _render_methodology(scored)
