@@ -251,7 +251,13 @@ def matched_cell_difference(pairs: pl.DataFrame) -> tuple[float, float, float, i
         .agg(pl.col("excess_return").median().alias("median_excess"), pl.len().alias("n"))
         .pivot(on="cohort", index=["AREA_EN", "ROOMS_EN", "entry_month", "IS_OFFPLAN_EN"],
                values=["median_excess", "n"])
-        .drop_nulls(["median_excess_flagged", "median_excess_control"])
+    )
+    required = {"median_excess_flagged", "median_excess_control", "n_flagged", "n_control"}
+    if not required.issubset(cells.columns):
+        # a sparse bucket can lack one cohort entirely
+        return float("nan"), float("nan"), float("nan"), 0
+    cells = (
+        cells.drop_nulls(["median_excess_flagged", "median_excess_control"])
         .filter((pl.col("n_flagged") >= 3) & (pl.col("n_control") >= 3))
         .with_columns(
             (pl.col("median_excess_flagged") - pl.col("median_excess_control")).alias("diff"),
