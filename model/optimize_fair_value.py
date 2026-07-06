@@ -33,7 +33,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 
-from fair_value_model import (
+from model.fair_value_model import (
     DEFAULT_FEATURE_CONFIG,
     DEFAULT_MODEL_PARAMS,
     SHIPPING_CONFIG_PATH,
@@ -49,7 +49,7 @@ from fair_value_model import (
     trim_psf,
 )
 
-REPORT_PATH = "fair_value_optimization_report.md"
+REPORT_PATH = "reports/fair_value_optimization_report.md"
 STOP_MIN_IMPROVEMENT = 0.002    # 0.2 pp of MedAPE: below this, an iteration counts as "no gain"
 ACCEPT_MIN_IMPROVEMENT = 0.0005  # 0.05 pp: smaller gains are fold noise and do not change the config
 STOP_PATIENCE = 2
@@ -61,8 +61,8 @@ MAX_ITERATIONS = 10
 # ---------------------------------------------------------------------------
 
 def load_snapshot_from_gcs() -> pl.DataFrame:
-    from dda_api import normalize_dld_transactions
-    from gcs_storage import (
+    from ingestion.dda_api import normalize_dld_transactions
+    from ingestion.gcs_storage import (
         configured_snapshot,
         gcs_client,
         load_local_secrets,
@@ -81,7 +81,7 @@ def load_snapshot_from_gcs() -> pl.DataFrame:
 
 
 def load_synthetic() -> pl.DataFrame:
-    from smoke_test_fair_value import synthetic_frame
+    from tests.smoke_test_fair_value import synthetic_frame
 
     raw, _ = synthetic_frame()
     return raw
@@ -366,7 +366,7 @@ def main() -> int:
         raw = load_synthetic()
         source = "synthetic smoke data"
     elif args.parquet:
-        from dda_api import normalize_dld_transactions
+        from ingestion.dda_api import normalize_dld_transactions
 
         raw = normalize_dld_transactions(pl.read_parquet(args.parquet))
         source = args.parquet

@@ -5,7 +5,7 @@ import sys
 from dataclasses import replace
 from datetime import date, datetime
 
-from dda_api import (
+from ingestion.dda_api import (
     DEFAULT_LOOKBACK_MONTHS,
     DEFAULT_PAGE_SIZE,
     DDAApiError,

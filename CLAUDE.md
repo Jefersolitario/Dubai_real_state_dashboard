@@ -13,32 +13,32 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m streamlit run dubai_dashboard.py
 
 # Test Dubai Data API connectivity and column mapping
-.\.venv\Scripts\python.exe smoke_test_dda_api.py --limit 5
+.\.venv\Scripts\python.exe -m tests.smoke_test_dda_api --limit 5
 
 # Test whether the API contains a specific date range
-.\.venv\Scripts\python.exe smoke_test_dda_api.py --limit 5 --start-date 2026-01-01 --end-date 2026-04-30 --require-records
+.\.venv\Scripts\python.exe -m tests.smoke_test_dda_api --limit 5 --start-date 2026-01-01 --end-date 2026-04-30 --require-records
 
 # Test Google Cloud Storage Parquet write/read/delete
-.\.venv\Scripts\python.exe smoke_test_gcs.py
+.\.venv\Scripts\python.exe -m tests.smoke_test_gcs
 
 # Incrementally update the normalized DLD transactions snapshot in GCS and verify it
-.\.venv\Scripts\python.exe store_dld_transactions_gcs.py
+.\.venv\Scripts\python.exe -m ingestion.store_dld_transactions_gcs
 
 # Force a full snapshot rebuild for the default 24-month window
-.\.venv\Scripts\python.exe store_dld_transactions_gcs.py --full-refresh --last-months 24
+.\.venv\Scripts\python.exe -m ingestion.store_dld_transactions_gcs --full-refresh --last-months 24
 
 # Pull DLD reference datasets into GCS dld_reference/ (projects, buildings,
 # service charges, units registry, Ejari rent grid; --only to pick subsets)
-.\.venv\Scripts\python.exe store_reference_data_gcs.py --only projects buildings units
-.\.venv\Scripts\python.exe store_reference_data_gcs.py --only rents   # long pull (~2-4h, chunked)
+.\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --only projects buildings units
+.\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --only rents   # long pull (~2-4h, chunked)
 
 # Offline fair-value model checks and optimization
-.\.venv\Scripts\python.exe smoke_test_fair_value.py
-.\.venv\Scripts\python.exe optimize_fair_value.py
+.\.venv\Scripts\python.exe -m tests.smoke_test_fair_value
+.\.venv\Scripts\python.exe -m model.optimize_fair_value
 
 # Train the fair-value model offline and publish the inference bundle to GCS
 # (run after each snapshot refresh — weekly cadence; the app never trains)
-.\.venv\Scripts\python.exe train_fair_value.py
+.\.venv\Scripts\python.exe -m model.train_fair_value
 
 # Install dependencies
 pip install -r requirements.txt
@@ -57,39 +57,39 @@ Single-file Streamlit app with this flow:
 5. **Chart builders** - Plotly figures for price trends, volume, momentum, tiers, and scatter views.
 6. **Streamlit UI** - two pages via `st.segmented_control` (not `st.tabs`, which executes every tab body on each rerun): "Market Overview" (`_render_market_overview`, the original page) and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`, lazy — model bundle load and scoring only run when this page is selected); shared sidebar filters.
 
-### dashboard_constants.py
+### dashboard_constants.py (root)
 
 Shared constants and pure Polars/layout helpers (`AREA_DISPLAY`, `NEIGHBORHOODS`, `TIER_*`, `DISTRICT_TIER`, `SQM_TO_SQFT`, `area_display_expr`, `bedroom_type_expr`, `layout_defaults`). No Streamlit/Plotly imports so pure modules can use it.
 
-### fair_value_model.py
+### model/fair_value_model.py
 
 Pure Polars + scikit-learn fair-value model: `feature_engineering` (Sales-only apartments, METER_SALE_PRICE area-mismatch guard, non-market-procedure exclusion, no PSF trim — apply `trim_psf` before TRAINING only; strictly past-only derived features via `closed="left"` rolling windows and `shift(1)`; optional `reference` frames for the units-registry/projects/rent-grid joins), 10-fold date-ordered `TimeSeriesSplit` `cross_validate` (fold metrics include MedAPE plus the tail pair `p90_ape` and `flag_prop` — the share of ordinary sales pushed below −15% spread by model error; campaign acceptance requires a MedAPE win AND no tail worsening), `train_fair_value_model` (HistGradientBoostingRegressor on log AED/sqft, out-of-sample permutation importances), `score_transactions` (`spread_pct = actual/fair value − 1`), and `flag_distress` (distressed = below threshold AND ≥1 residual-independent signal: forced-sale procedure, illiquid project, multiple sellers — a deep discount alone never qualifies; also emits `signal_strength` = −spread ÷ segment expected error, established ~4% vs cold-start ~6.5%). The shipped configuration (`fair_value_config.json`, via `load_shipping_config()`) uses floor/balcony features from the units registry (`unit_floor` + `project_meta` + `rel_floor`) and per-unit-type comps (`comps_rooms`) on top of repeat-sale, price-history, and relative-size groups — CV 4.08%, holdout 4.15%. The units join needs `PROJECT_NUMBER` populated in the snapshot (a normalized snapshot cannot back-fill it; rebuild from a raw pull if coverage drops).
 
-### data_cleaning.py
+### model/data_cleaning.py
 
 Pure-Polars data-quality module: `clean_transactions(df, reference=None) ->
 (df, CleaningReport)` labels every row `clean` / `repaired` / `review_only` /
 `quarantine` (`dq_rule` + `dq_action` columns) instead of silently dropping.
 Digit-shift typos (missing/extra zeros) are repaired in place when the
-corrected price lands near the project comp AND the recorded area is credible
+corrected price lands near the project median sale price AND the recorded area is credible
 for the layout (project×rooms median area, optionally the units registry);
 bulk-deal allocations (≥3 same-project same-day identical prices ≥25% below
-comp — at-market developer launch batches stay clean), suspected
-related-party/token prices (<40% of comp), and partial-ownership shares are
+the project median — at-market developer launch batches stay clean), suspected
+related-party/token prices (<40% of the project median), and partial-ownership shares are
 routed `review_only`: excluded from training and the flag list, shown in the
 tab's "Excluded suspicious records" expander. Key feed facts:
 METER_SALE_PRICE is mechanically derived from TRANS_VALUE/ACTUAL_AREA
-(agrees to ~1e-7), so comps — not MSP — are the repair instrument;
+(agrees to ~1e-7), so project median sale prices — not MSP — are the repair instrument;
 PROCEDURE_AREA currently equals ACTUAL_AREA on every row, so the
 partial-transfer rule is future-proofing. Enabled via the `"data_cleaning"`
 feature-config flag (see `fair_value_config.json` for the shipped state;
-measured before enabling per `data_cleaning_report.md`).
+measured before enabling per `reports/data_cleaning_report.md`).
 
-### fair_value_tab.py
+### fair_value_tab.py (root)
 
 Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version, full history — trailing comps need the past; loads GCS reference frames when the shipped config requires them), `get_model` (loads the pre-trained GCS bundle), `get_scored(data_version, score_start, score_end, _result)` (threshold-independent predictions for the selected scoring window only; default "Last month" keeps the tab fast); the threshold slider only re-runs `flag_distress`. The flagged table ranks distressed-first then by `signal_strength`; `FEATURE_LABELS` maps model feature names to plain language for the importance chart.
 
-### train_fair_value.py
+### model/train_fair_value.py
 
 Offline training CLI: loads the snapshot, trains the shipping configuration,
 and publishes a pickled inference bundle to
@@ -97,12 +97,12 @@ and publishes a pickled inference bundle to
 (`GCS_MODEL_OBJECT`). The Streamlit tab only loads this bundle (6h cache TTL)
 and predicts — training is too heavy for Streamlit Cloud (the in-app CV was
 profiled at ~2-4 minutes and caused watchdog kills). Ops flow: refresh
-snapshot (`store_dld_transactions_gcs.py`) → refresh reference data when
-stale (`store_reference_data_gcs.py`, monthly is plenty) →
-`train_fair_value.py` → the deployed app picks the new bundle up
-automatically.
+snapshot (`python -m ingestion.store_dld_transactions_gcs`) → refresh
+reference data when stale (`python -m ingestion.store_reference_data_gcs`,
+monthly is plenty) → `python -m model.train_fair_value` → the deployed app
+picks the new bundle up automatically.
 
-### store_reference_data_gcs.py
+### ingestion/store_reference_data_gcs.py
 
 Pulls DLD reference datasets to GCS under `dld_reference/`: `projects.parquet`
 (+developer names), `project_buildings_agg.parquet` (floors/flats per
@@ -114,15 +114,15 @@ sanitization). `sale_index.parquet` is also pulled but the gateway dataset is
 frozen at 2024-05, so no model feature uses it. Long pulls are chunked so a
 gateway blip costs one chunk (HTTP 408 is retryable in `dda_api`).
 
-### optimize_fair_value.py
+### -m model.optimize_fair_value
 
-Improvement loop: ladder of feature/model proposals measured by mean CV MedAPE, accepts a change only if it improves ≥0.05pp, stops after <0.2pp gains for 2 consecutive iterations or 10 iterations. Writes `fair_value_optimization_report.md`, optional `--progress-json`, and `fair_value_config.json` (the shipping config).
+Improvement loop: ladder of feature/model proposals measured by mean CV MedAPE, accepts a change only if it improves ≥0.05pp, stops after <0.2pp gains for 2 consecutive iterations or 10 iterations. Writes `reports/fair_value_optimization_report.md`, optional `--progress-json`, and `fair_value_config.json` (the shipping config).
 
-### smoke_test_fair_value.py
+### -m tests.smoke_test_fair_value
 
 Synthetic end-to-end test of the fair-value pipeline (planted underpriced rows must dominate the flags). Run before touching model logic.
 
-### dda_api.py
+### ingestion/dda_api.py
 
 Dubai Data API helper module. It handles:
 
@@ -141,15 +141,15 @@ Default production endpoint:
 https://apis.data.dubai/secure/ddads/openapi/1.0.0/dld/dld_transactions-open-api
 ```
 
-### smoke_test_dda_api.py
+### tests/smoke_test_dda_api.py
 
 Small CLI diagnostic for the DDA connector. It verifies credentials, endpoint access, raw columns, normalized column mapping, and optional date coverage. Use this before blaming dashboard logic for missing API records.
 
-### smoke_test_gcs.py
+### -m tests.smoke_test_gcs
 
 Small CLI diagnostic for Google Cloud Storage. It writes a tiny Polars Parquet file, reads it back, verifies the round trip, and deletes the test object unless `--keep-object` is supplied.
 
-### store_dld_transactions_gcs.py
+### -m ingestion.store_dld_transactions_gcs
 
 Incrementally updates the GCS Parquet snapshot. It reads the existing snapshot,
 fetches from the current max `INSTANCE_DATE` through today, normalizes, merges,

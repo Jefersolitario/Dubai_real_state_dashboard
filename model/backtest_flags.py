@@ -37,8 +37,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 
-from dda_api import normalize_dld_transactions
-from fair_value_model import (
+from ingestion.dda_api import normalize_dld_transactions
+from model.fair_value_model import (
     DISTRESS_PROCEDURE_PATTERN,
     feature_engineering,
     flag_distress,
@@ -48,8 +48,8 @@ from fair_value_model import (
     train_fair_value_model,
     trim_psf,
 )
-from gcs_storage import load_local_secrets, read_reference_frames
-from store_dld_transactions_gcs import dedupe_snapshot
+from ingestion.gcs_storage import load_local_secrets, read_reference_frames
+from ingestion.store_dld_transactions_gcs import dedupe_snapshot
 
 SCRATCH = Path(
     "/tmp/claude-0/-home-user-Dubai-real-state-dashboard/"

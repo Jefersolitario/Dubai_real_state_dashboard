@@ -5,7 +5,7 @@ import uuid
 
 import polars as pl
 
-from gcs_storage import dataframe_to_parquet_bytes, gcs_client, load_local_secrets, setting
+from ingestion.gcs_storage import dataframe_to_parquet_bytes, gcs_client, load_local_secrets, setting
 
 
 def main() -> int:

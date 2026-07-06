@@ -31,7 +31,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.model_selection import TimeSeriesSplit
 
-import data_cleaning
+from model import data_cleaning
 from dashboard_constants import DISTRICT_TIER, SQM_TO_SQFT
 
 # ---------------------------------------------------------------------------

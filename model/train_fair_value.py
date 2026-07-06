@@ -6,10 +6,10 @@ GCS and only runs predictions. Run this after refreshing the snapshot
 optimize_fair_value.py run that changes fair_value_config.json.
 
 Usage:
-    python train_fair_value.py                 # snapshot from GCS, metrics from config
-    python train_fair_value.py --cv            # also recompute 10-fold CV metrics
-    python train_fair_value.py --parquet f.pq  # train from a local parquet
-    python train_fair_value.py --out bundle.pkl --no-upload  # local file only
+    python -m model.train_fair_value                 # snapshot from GCS, metrics from config
+    python -m model.train_fair_value --cv            # also recompute 10-fold CV metrics
+    python -m model.train_fair_value --parquet f.pq  # train from a local parquet
+    python -m model.train_fair_value --out bundle.pkl --no-upload  # local file only
 """
 
 from __future__ import annotations
@@ -23,12 +23,12 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from dda_api import (
+from ingestion.dda_api import (
     OPTIONAL_DASHBOARD_COLUMNS,
     REQUIRED_DASHBOARD_COLUMNS,
     normalize_dld_transactions,
 )
-from fair_value_model import (
+from model.fair_value_model import (
     SHIPPING_CONFIG_PATH,
     export_bundle,
     feature_engineering,
@@ -39,7 +39,7 @@ from fair_value_model import (
     train_fair_value_model,
     trim_psf,
 )
-from store_dld_transactions_gcs import dedupe_snapshot
+from ingestion.store_dld_transactions_gcs import dedupe_snapshot
 
 
 def load_snapshot(args: argparse.Namespace) -> tuple[pl.DataFrame, str]:
@@ -48,7 +48,7 @@ def load_snapshot(args: argparse.Namespace) -> tuple[pl.DataFrame, str]:
         raw = pl.read_parquet(args.parquet)
         source = args.parquet
     else:
-        from gcs_storage import configured_snapshot, load_local_secrets, read_parquet_object
+        from ingestion.gcs_storage import configured_snapshot, load_local_secrets, read_parquet_object
 
         secrets = load_local_secrets()
         bucket_name, object_name = configured_snapshot(secrets)
@@ -103,7 +103,7 @@ def main() -> int:
     reference = None
     ref_names = reference_needed(feature_config)
     if ref_names:
-        from gcs_storage import load_local_secrets, read_reference_frames
+        from ingestion.gcs_storage import load_local_secrets, read_reference_frames
 
         reference = read_reference_frames(load_local_secrets(), ref_names)
         print(f"Reference frames loaded: {ref_names}")
@@ -148,7 +148,7 @@ def main() -> int:
         print(f"Wrote {args.out}")
 
     if not args.no_upload:
-        from gcs_storage import load_local_secrets, write_model_bundle_bytes
+        from ingestion.gcs_storage import load_local_secrets, write_model_bundle_bytes
 
         secrets = load_local_secrets()
         uri = write_model_bundle_bytes(
@@ -164,7 +164,7 @@ def main() -> int:
         print(f"Uploaded {uri}")
 
         # Read back and verify once more against live GCS bytes.
-        from gcs_storage import read_model_bundle_bytes
+        from ingestion.gcs_storage import read_model_bundle_bytes
 
         readback, _ = read_model_bundle_bytes(secrets)
         loaded_rb, _ = load_bundle(readback)

@@ -23,8 +23,8 @@ from dashboard_constants import (
     bedroom_type_expr,
     layout_defaults as _layout_defaults,
 )
-from data_cleaning import RULE_LABELS
-from fair_value_model import (
+from model.data_cleaning import RULE_LABELS
+from model.fair_value_model import (
     FairValueResult,
     excluded_suspicious_sales,
     feature_engineering,
@@ -36,7 +36,7 @@ from fair_value_model import (
     train_fair_value_model,
     trim_psf,
 )
-from gcs_storage import read_model_bundle_bytes, read_reference_frames
+from ingestion.gcs_storage import read_model_bundle_bytes, read_reference_frames
 
 MODEL_STALE_DAYS = 7
 
@@ -120,7 +120,7 @@ DATA_SOURCES_TABLE = """
 | 9 | Time / market trend | `INSTANCE_DATE` → trend + month | Now |
 | 10 | Deal structure | `TOTAL_BUYER`, `TOTAL_SELLER` | Now |
 | 11 | Distress procedure signal | `PROCEDURE_EN`, `GROUP_EN` | Now |
-| 12 | Trailing area/project comparables | derived in-dataset (past-only) | Now (in model) |
+| 12 | Trailing area/project median sale prices | derived in-dataset (past-only) | Now (in model) |
 | 13 | Same unit's previous sale (repeat-sale) | derived in-dataset (past-only) | Now (in model) |
 | 14 | Floor, balcony, layout (units registry) | DLD Units via project + exact-area match | Now (in model) |
 | 15 | Developer, building age, project size & height | DLD Projects + Buildings (project-level, in GCS) | Now (in model) |
@@ -165,7 +165,7 @@ def get_features(data_version: str) -> pl.DataFrame:
 def get_model(data_version: str) -> tuple[FairValueResult, dict]:
     """Load the pre-trained inference bundle from GCS — the app never trains.
 
-    Training happens offline via ``python train_fair_value.py`` (weekly
+    Training happens offline via ``python -m model.train_fair_value`` (weekly
     cadence); the TTL picks up a fresh bundle without an app restart.
     """
     data, _ = read_model_bundle_bytes(st.secrets)
@@ -240,7 +240,7 @@ def _features_or_error(data_version: str) -> pl.DataFrame | None:
     except FileNotFoundError as exc:
         st.error(
             f"A reference dataset the model needs is missing: {exc}. "
-            "Publish it with `python store_reference_data_gcs.py` (offline)."
+            "Publish it with `python -m ingestion.store_reference_data_gcs` (offline)."
         )
         return None
 
@@ -399,7 +399,7 @@ def _load_model_or_render_fallback(
     except FileNotFoundError:
         st.info(
             "No pre-trained model bundle found in GCS. Publish one with "
-            "`python train_fair_value.py` (run offline — training is too heavy "
+            "`python -m model.train_fair_value` (run offline — training is too heavy "
             "for this deployment)."
         )
     return result, meta
@@ -429,8 +429,8 @@ def _render_page_header(result: FairValueResult, meta: dict) -> None:
         if age_days > MODEL_STALE_DAYS:
             st.warning(
                 f"The model is {age_days} days old. Refresh it by running "
-                "`python store_dld_transactions_gcs.py` then "
-                "`python train_fair_value.py` (offline)."
+                "`python -m ingestion.store_dld_transactions_gcs` then "
+                "`python -m model.train_fair_value` (offline)."
             )
 
 
@@ -553,7 +553,7 @@ def _render_flagged_table(flagged: pl.DataFrame, view: pl.DataFrame) -> None:
         "predicted fair value; negative means the deal closed under fair value. "
         "**Signal (×)** = the discount divided by the model's typical error for that "
         "kind of sale — a −15% spread is ~3.6× the typical error where a project has "
-        "recent comparable sales, but under 1.5× for a cold-start sale (first sales in "
+        "recent sales to compare against, but under 1.5× for a cold-start sale (first sales in "
         "a project in a while), where the same discount is weak evidence. Prefer "
         "high-× deals."
     )
@@ -572,6 +572,8 @@ def _render_flagged_table(flagged: pl.DataFrame, view: pl.DataFrame) -> None:
             *building_cols,
             pl.col("bedroom_type").alias("Rooms"),
             (pl.col("ACTUAL_AREA") * SQM_TO_SQFT).round(0).alias("Size (sqft)"),
+            pl.col("psf").round(0).alias("Actual (AED/ft²)"),
+            pl.col("pred_psf").round(0).alias("Fair value (AED/ft²)"),
             pl.col("TRANS_VALUE").round(0).alias("Actual price (AED)"),
             pl.col("fair_value_aed").round(0).alias("Fair value (AED)"),
             (pl.col("spread_pct") * 100).round(1).alias("Spread (%)"),
@@ -631,7 +633,7 @@ def _render_methodology(scored: pl.DataFrame) -> None:
             "identical either way).\n\n"
             "**Accuracy.** Cross-validated median error ≈ 4.1%, confirmed at 4.15% on "
             "an untouched two-month holdout that was never used for any modelling "
-            "decision. Caveat: sales in projects with no recent comparable sales "
+            "decision. Caveat: sales in projects with no recent sales to compare against "
             "('cold starts', ~8% of rows) carry roughly ~6.5% error — treat "
             "flags on a project's first sales in a while with extra care.\n\n"
             "**Signal strength (×)** standardizes the discount by the model's typical "
@@ -678,8 +680,9 @@ def _render_review_expander(data_version: str) -> None:
         st.caption(
             "Sales excluded from training and from the flag list because the "
             "registered price is unlikely to be a standalone market price. "
-            "**Price vs comp** compares the deal's AED/sqm with the project's "
-            "median (or the district's where the project is thin)."
+            "**Project median sale price** is the median AED/ft² of the same "
+            "project's sales (the district's median where the project has too "
+            "few sales) — compare it with what the deal actually sold at."
         )
         counts = review.group_by("dq_rule").len().sort("len", descending=True)
         st.markdown(
@@ -701,7 +704,12 @@ def _render_review_expander(data_version: str) -> None:
                 pl.col("bedroom_type").alias("Rooms"),
                 (pl.col("ACTUAL_AREA") * SQM_TO_SQFT).round(0).alias("Size (sqft)"),
                 pl.col("TRANS_VALUE").round(0).alias("Registered price (AED)"),
-                (pl.col("dq_comp_ratio") * 100).round(0).alias("Price vs comp (%)"),
+                (pl.col("TRANS_VALUE") / (pl.col("ACTUAL_AREA") * SQM_TO_SQFT))
+                .round(0)
+                .alias("Sold at (AED/ft²)"),
+                (pl.col("dq_median_price_psm") / SQM_TO_SQFT)
+                .round(0)
+                .alias("Project median sale price (AED/ft²)"),
                 pl.col("dq_rule").replace(RULE_LABELS).alias("Why excluded"),
             )
         )

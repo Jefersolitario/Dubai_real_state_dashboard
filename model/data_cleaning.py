@@ -17,7 +17,7 @@ row with a disposition instead of blindly clipping or deleting:
 Instrument note: DLD's METER_SALE_PRICE is mechanically derived from
 TRANS_VALUE / ACTUAL_AREA in the open-data feed (they agree to ~1e-7 on
 303k sales), so it CANNOT arbitrate which field a typo corrupted. The
-working instruments are robust comparables (project median AED/sqm, with
+working instrument is the project median sale price (AED/sqm, with
 area fallbacks) and the layout-median registered area per project x rooms
 (optionally cross-checked against the DLD units registry). Likewise
 PROCEDURE_AREA currently equals ACTUAL_AREA on every feed row, so the
@@ -38,7 +38,8 @@ import polars as pl
 # Tunables
 # ---------------------------------------------------------------------------
 
-# Ratio zones (row AED/sqm vs comparable) that look like a digit shift.
+# Ratio zones (row AED/sqm vs the project median sale price) that look
+# like a digit shift.
 # key = decimal exponent k restoring the ratio: repaired ratio = ratio * 10^k.
 DIGIT_SHIFT_ZONES: dict[int, tuple[float, float]] = {
     2: (0.005, 0.015),   # two missing zeros in price (or two extra in area)
@@ -48,7 +49,7 @@ DIGIT_SHIFT_ZONES: dict[int, tuple[float, float]] = {
 }
 
 # A repair is accepted only if the corrected AED/sqm lands within this band
-# of the comparable — otherwise we would be fabricating a price.
+# of the project median sale price — otherwise we would be fabricating a price.
 REPAIRED_RATIO_BAND = (0.65, 1.35)
 
 # The recorded area is "credible" when within this band of the layout-median
@@ -64,28 +65,28 @@ REGISTRY_AREA_TOLERANCE = 0.02
 MSP_MISMATCH_TOLERANCE = 0.10
 
 # Partial-ownership share signatures: PROCEDURE_AREA / ACTUAL_AREA near a
-# simple fraction, with the per-share price consistent with the comparable.
+# simple fraction, with the per-share price consistent with the project median.
 PARTIAL_FRACTIONS = (0.25, 0.5, 0.75)
 PARTIAL_FRACTION_TOLERANCE = 0.02
 
 # Bulk-deal allocation: >=3 same-project same-day transactions at an
 # identical TRANS_VALUE (or identical AED/sqm to 0.1%) whose group price
-# sits well below the comparable. At-market bulk groups (developer launch
+# sits well below the project median. At-market bulk groups (developer launch
 # lists) are genuine primary-market prices and stay clean.
 BULK_MIN_GROUP = 3
 BULK_MAX_RATIO = 0.75
 
 # Suspected related-party / token transfer: internally consistent record
-# priced below this fraction of the comparable. Deliberately conservative
+# priced below this fraction of the project median. Deliberately conservative
 # (-60%): the 40-60% discount zone may contain real fire-sales and is left
 # to the model + human review, not the cleaner.
 TOKEN_MAX_RATIO = 0.40
 
 # Unexplained extreme overpricing (unrepaired high-side ratio) — routed to
-# review so a 10x typo cannot silently inflate comparables.
+# review so a 10x typo cannot silently inflate the medians.
 EXTREME_HIGH_RATIO = 6.5
 
-# Minimum group sizes before a median is trusted as a comparable.
+# Minimum group sizes before a group's median price is trusted.
 MIN_PROJECT_COMP_N = 20
 MIN_AREA_ROOMS_COMP_N = 20
 MIN_LAYOUT_AREA_N = 5
@@ -110,7 +111,7 @@ RULE_LABELS: dict[str, str] = {
 _EXAMPLE_COLUMNS = [
     "INSTANCE_DATE", "PROJECT_EN", "AREA_EN", "ROOMS_EN",
     "dq_orig_trans_value", "TRANS_VALUE", "dq_orig_actual_area",
-    "ACTUAL_AREA", "dq_comp_ratio", "dq_rule", "dq_action",
+    "ACTUAL_AREA", "dq_median_price_psm", "dq_rule", "dq_action",
 ]
 
 
@@ -211,9 +212,9 @@ def _registry_layout_match(
 
 
 def _with_comparables(df: pl.DataFrame) -> pl.DataFrame:
-    """Attach robust AED/sqm comparables and layout-median areas.
+    """Attach the project median sale price (AED/sqm) and layout-median areas.
 
-    Comparable precedence: project median (>= MIN_PROJECT_COMP_N rows) ->
+    Median precedence: project (>= MIN_PROJECT_COMP_N rows) ->
     area x rooms median -> area median -> global median. Medians are taken
     over the full frame including corrupt rows — medians shrug off the
     <1% corruption this module exists to catch. Null projects fall back to
@@ -257,23 +258,23 @@ def _with_comparables(df: pl.DataFrame) -> pl.DataFrame:
         .otherwise(pl.coalesce(pl.col("_dq_ar_layout_med"), pl.col("_dq_layout_med")))
     )
     return df.with_columns(
-        comp.alias("_dq_comp"),
+        comp.alias("dq_median_price_psm"),
         layout_med.alias("_dq_layout"),
-        (pl.col("_dq_psm") / comp).alias("dq_comp_ratio"),
+        (pl.col("_dq_psm") / comp).alias("_dq_ratio"),
     )
 
 
 def _digit_shift_exprs(registry_available: bool) -> tuple[pl.Expr, pl.Expr, pl.Expr]:
     """(k, price_fix, area_fix) expressions for the digit-shift zones.
 
-    ``k`` is the decimal exponent restoring the price/comparable ratio.
+    ``k`` is the decimal exponent restoring the price / project-median ratio.
     ``price_fix``: the recorded area is credible (layout median band or a
     registry layout match), so TRANS_VALUE is the corrupted field.
     ``area_fix``: correcting ACTUAL_AREA by 10^-k lands it in the credible
     band, so the area is the corrupted field. Both require the repaired
     ratio inside REPAIRED_RATIO_BAND.
     """
-    ratio = pl.col("dq_comp_ratio")
+    ratio = pl.col("_dq_ratio")
     k = pl.lit(None, dtype=pl.Int32)
     for exp, (lo, hi) in DIGIT_SHIFT_ZONES.items():
         k = pl.when(ratio.is_between(lo, hi)).then(pl.lit(exp, dtype=pl.Int32)).otherwise(k)
@@ -334,7 +335,7 @@ def clean_transactions(
     registry_available = df["_dq_registry_match"].dtype == pl.Boolean
 
     tv, aa = pl.col("_dq_tv"), pl.col("_dq_aa")
-    psm, ratio = pl.col("_dq_psm"), pl.col("dq_comp_ratio")
+    psm, ratio = pl.col("_dq_psm"), pl.col("_dq_ratio")
     nonpositive = tv.is_null() | aa.is_null() | (tv <= 0) | (aa <= 0)
 
     k, price_fix, area_fix = _digit_shift_exprs(registry_available)
@@ -347,7 +348,7 @@ def clean_transactions(
 
     pa = pl.col("PROCEDURE_AREA").cast(pl.Float64, strict=False)
     share = pa / aa
-    share_price_ok = ((tv / pa) / pl.col("_dq_comp")).is_between(*REPAIRED_RATIO_BAND)
+    share_price_ok = ((tv / pa) / pl.col("dq_median_price_psm")).is_between(*REPAIRED_RATIO_BAND)
     partial = (
         (pa > 0)
         & pl.any_horizontal(

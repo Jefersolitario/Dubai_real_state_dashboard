@@ -4,7 +4,7 @@ from datetime import UTC, date, datetime
 
 import polars as pl
 
-from dda_api import (
+from ingestion.dda_api import (
     DDAConfig,
     DEFAULT_LOOKBACK_MONTHS,
     DEFAULT_MAX_RECORDS,
@@ -17,7 +17,7 @@ from dda_api import (
     normalize_dld_transactions,
     validate_normalized_columns,
 )
-from gcs_storage import (
+from ingestion.gcs_storage import (
     DEFAULT_TRANSACTIONS_OBJECT,
     configured_snapshot,
     dataframe_to_parquet_bytes,

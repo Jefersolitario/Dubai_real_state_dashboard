@@ -10,9 +10,9 @@ service_charge feature groups:
                               median rent PSF (strictly past per week)
 
 Usage:
-    python store_reference_data_gcs.py --only projects buildings service
-    python store_reference_data_gcs.py --only rents     # long pull (~2-4h)
-    python store_reference_data_gcs.py                  # everything
+    python -m ingestion.store_reference_data_gcs --only projects buildings service
+    python -m ingestion.store_reference_data_gcs --only rents     # long pull (~2-4h)
+    python -m ingestion.store_reference_data_gcs                  # everything
 """
 
 from __future__ import annotations
@@ -28,8 +28,8 @@ from datetime import date
 import polars as pl
 
 from dashboard_constants import SQM_TO_SQFT
-from dda_api import DDAConfig, fetch_dataset_records, load_dda_config
-from gcs_storage import dataframe_to_parquet_bytes, gcs_client, load_local_secrets, setting
+from ingestion.dda_api import DDAConfig, fetch_dataset_records, load_dda_config
+from ingestion.gcs_storage import dataframe_to_parquet_bytes, gcs_client, load_local_secrets, setting
 
 REFERENCE_PREFIX = "dld_reference"
 RENTS_START = date(2024, 1, 1)
@@ -250,7 +250,7 @@ def _month_starts(start: date, end: date) -> list[date]:
     from calendar import monthrange
     from datetime import timedelta
 
-    from dda_api import months_before
+    from ingestion.dda_api import months_before
 
     anchor = end.replace(day=1)
     n_back = (anchor.year - start.year) * 12 + (anchor.month - start.month)

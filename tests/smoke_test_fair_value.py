@@ -15,7 +15,7 @@ import numpy as np
 import polars as pl
 
 from dashboard_constants import SQM_TO_SQFT
-from fair_value_model import (
+from model.fair_value_model import (
     cross_validate,
     export_bundle,
     feature_engineering,
@@ -270,7 +270,7 @@ def _cleaning_frame() -> pl.DataFrame:
 
 def check_data_cleaning() -> bool:
     """Each cleaning rule fires on its planted row and nothing else."""
-    from data_cleaning import clean_transactions, kept_rows, review_rows
+    from model.data_cleaning import clean_transactions, kept_rows, review_rows
 
     frame = _cleaning_frame()
     out, report = clean_transactions(frame)
