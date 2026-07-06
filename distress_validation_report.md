@@ -1,49 +1,82 @@
-# Distress-Claim Validation — Walk-Forward Outcome Backtest
+# Distress-Claim Validation — Walk-Forward Outcome Backtest (v2, corrected)
 
-**Date:** 2026-07-05 · **Script:** `backtest_flags.py` · **Data:** full 24-month
-snapshot (266,161 scoreable sales through 2026-07-02), shipped model configuration.
+**Date:** 2026-07-05 · **Script:** `backtest_flags.py` (v2) · **Data:** full
+24-month snapshot (266,161 scoreable sales through 2026-07-02), shipped model
+configuration, walk-forward flags (141,749 out-of-sample scored entries).
 
-## Design (and why it is hindsight-safe)
+> **Correction note.** The first version of this report headlined "+21% median
+> excess return" from nested horizon buckets, iid bootstrap CIs, and pairs that
+> mostly compare *different units of the same layout*. Two independent audits
+> found those statistics overstated by mechanical artifacts (unit-key
+> collisions, selection-on-price mean reversion, fake horizon replication,
+> too-narrow CIs). This v2 fixes the methodology — uniqueness strata,
+> resale-spread reversion check, symmetric cohort, disjoint buckets,
+> building-cluster bootstrap, off-plan-aware matching, deep-tail exclusion —
+> and restates the findings. The effect survives, smaller and better understood.
 
-Entries are flagged **walk-forward**: four quarterly models, each trained only on
-data strictly before its quarter, flag only that quarter (Jan 2025 – Jan 2026,
-141,749 out-of-sample scored entries). No flag decision comes from a model that
-saw the entry — or its later resale — in training. Features were already
-strictly past by construction; this extends the guarantee to the model weights.
+## The decisive test: do flagged entries' gaps close, or are the units just cheap?
 
-Outcomes are realized facts: each entry is paired with the same pseudo-unit's
-next sale (building + rooms + area to 0.1 sqm — the model's own repeat-sale
-key), and the outcome metric is **excess return** = the unit's price change
-minus its own district's change (trailing 30-day district median) over the same
-dates. Guards: ≥30-day holding (shorter = likely assignments), ≥180-day resale
-runway, excess returns winsorized at 1%/99%, non-market procedures excluded on
-both legs, 2,000-draw bootstrap CIs.
+Each pair's **resale** was scored by the walk-forward models. If flagged units
+were "persistently cheap for an unobserved reason" (fairly priced lemons), their
+resales would also sit near −15–20% spread. They do not:
 
-## Result 1 — Flagged deals carry real, recoverable value
-
-| Holding period | Flagged (spread ≤ −15%) | Near-fair controls | Matched-cell difference |
+| Cohort | Entry spread (median) | Resale spread (median) | n |
 |---|---|---|---|
-| 30–183 days | **+21.4%** [+19.1, +23.1] (n=1,490) | −0.3% [−0.5, −0.1] (n=14,280) | **+24.0%** [+21.8, +26.2] (649 cells) |
-| 30–365 days | **+21.5%** [+19.9, +23.0] (n=1,886) | −0.6% [−0.7, −0.4] (n=16,703) | **+23.6%** [+21.5, +25.5] (749 cells) |
-| 30–550 days | **+21.1%** [+19.6, +22.8] (n=1,943) | −0.6% [−0.8, −0.5] (n=17,048) | **+23.4%** [+21.3, +25.4] (763 cells) |
+| Flagged (−35% … −15%) | **−19.8%** | **+3.2%** | 1,075 |
+| Controls (±5%) | 0.0% | +0.1% | 11,893 |
+| Overpriced (≥ +15%) | +21.6% | +0.4% | 1,754 |
 
-- Controls sit at ≈0 by construction — the sanity check passes.
-- Flagged entries out-appreciate their own district by ≈ the full flagged
-  discount: the model's "below fair value" gap is **recovered at resale**.
-- Flagged units also **resell more often** (28.2% vs 21.5% of eligible entries)
-  — consistent with investors buying discounts and exiting. Both cohorts'
-  outcomes condition on reselling; this differential is disclosed.
+Flagged entries' resales come back to (slightly above) fair value: **the gap is
+real and it closes**. Overpriced entries also revert — premiums paid don't
+persist either. Both directions behave as genuine one-time price gaps, not as
+persistent unit-quality effects.
 
-## Result 2 — The signal-strength ranking is well calibrated
+## Corrected headline: excess return vs own district (cluster-robust CIs)
 
-Median excess return by signal-strength decile (30–365d holds, negative-spread
-entries): monotone from **−0.5%** (decile 1) through +1.0% (5), +4.8% (8),
-+8.7% (9) to **+23.3%** (decile 10). The ranking the UI sorts by is exactly the
-ordering of realized value — the "prefer high-× deals" guidance is validated.
+Disjoint holding buckets, entries restricted to have full runway; CIs from a
+building-level cluster bootstrap; deep tail (< −35%) excluded from "flagged"
+and shown separately:
 
-## Result 3 — Regime drift is real, modest, and now quantified
+**Held 30–183 days** (entries ≤ 2025-12-31):
 
-A model frozen at 2026-02-01 scoring the falling market out-of-sample:
+| Cohort / stratum | n | Median excess return |
+|---|---|---|
+| Flagged — all | 1,200 | **+18.2%** [+16.7, +20.1] |
+| Flagged — **unique unit** (registry-proven same apartment) | 60 | **+14.2%** [+10.5, +23.0] |
+| Flagged — stacked layout (same-spec unit trades) | 885 | +18.7% [+16.9, +20.5] |
+| Control — all | 14,280 | −0.3% [−0.5, −0.0] |
+| Overpriced (≥ +15%) | 1,938 | −9.0% [−10.0, −8.0] |
+| Deep tail (< −35%) | 290 | +64.5% [degenerate — winsor-clipped; treat as data noise] |
+| Matched flagged−control (99 off-plan-aware cells) | | **+20.6%** [+17.4, +23.7] |
+
+**Held 184–365 days** (entries ≤ 2025-07-02): flagged +19.6% [+15.0, +23.0]
+(n=228) vs controls −3.3% [−4.2, −2.3]. The 366–550d bucket has too few
+walk-forward entries with runway to report (0 qualifying matched cells).
+
+Interpretation notes:
+- The **unique-unit stratum is the strongest evidence**: collisions are
+  impossible there, and the +14.2% gap over controls (−0.9% in that stratum)
+  stands with a CI clear of zero despite n=60.
+- The stacked-layout majority measures "entry price vs the next same-spec
+  trade in the building" — still a real price gap, but not literally the same
+  buyer's exit; its higher +18.7% partly reflects within-layout position the
+  model cannot see (floor/view), so quote the unique-unit number when claiming
+  buyer-realizable value.
+- The flat profile across holding buckets + the reversion table = the value is
+  captured **at entry** (gap recapture), not post-purchase appreciation skill.
+- Overpriced entries mirror at −9% — the metric is symmetric, so the flagged
+  result must be read together with the reversion check above (which is what
+  rules out "mean reversion around noisy comps" as the whole story: resales
+  land AT fair value, not below it).
+
+## Signal-strength calibration (deep tail excluded)
+
+Monotone: decile 1 → −0.5%, decile 5 → +1.0%, decile 8 → +4.8%, decile 9 →
++7.5%, decile 10 → **+17.8%** (each n≈1,536; 30–365d holds). The UI's ranking
+order matches realized value. (Caveat: monotonicity alone is also predicted by
+gap-recapture mechanics; its value is confirming the *ordering* users see.)
+
+## Regime drift (model frozen 2026-02, scoring the falling market OOS)
 
 | Month | Median spread | Flag rate |
 |---|---|---|
@@ -52,44 +85,36 @@ A model frozen at 2026-02-01 scoring the falling market out-of-sample:
 | 2026-04 | −0.53% | 4.7% |
 | 2026-05 | −1.11% | 7.6% |
 | 2026-06 | −1.09% | 6.7% |
-| 2026-07 | −1.69% | 6.7% |
+| 2026-07 | −1.69% | 6.7% | *(partial month: 2 days)*
 
-A 5-month-stale model over-states fair values by ~1.7% and inflates the flag
-rate by ~2pp in this downturn. The model does **not** extrapolate the bull
-trend (trees saturate; no momentum features shipped) — the failure mode is
-comp-window **lag**, and weekly retraining keeps effective staleness at days,
-not months. **Ops rule adopted:** track monthly median spread; if it drifts
-beyond ±2%, retrain immediately rather than waiting for the weekly cadence.
+A ~4-month-stale model overstates fair values by ≈1.1% (June) and inflates the
+flag rate ~2pp in this decline. No trend-extrapolation blowup (trees saturate;
+no momentum features shipped); the mechanism is comp-window lag. **Ops rule:**
+weekly retrains keep staleness at days; alarm if the live monthly median spread
+drifts beyond ±2%.
 
-## Result 4 — The forced-sale signal never fires (product finding)
+## Survivorship and other disclosures
 
-`PROCEDURE_EN` in the snapshot contains **zero** forced-sale procedures (no
-court/auction/liquidation vocabulary at all — sales appear only as
-Sell / Sell - Pre registration / Delayed Sell etc.). The "distressed"
-corroboration therefore rests entirely on illiquidity and multi-seller signals
-today. DLD-ordered auctions exist but are published elsewhere (e.g. Emirates
-Auction), not in this dataset's procedure field.
+- Resale rates (clean denominators): flagged 27.3%, controls 21.5%, deep tail
+  33.3%, overpriced 24.5%. Outcomes condition on reselling; flagged units
+  resell more (flippers), deep-tail "units" most of all (consistent with
+  non-standard records).
+- `PROCEDURE_EN` contains **zero forced-sale vocabulary** across all 141,749
+  OOS entries — the "distressed" corroboration currently rests on
+  illiquidity/multi-seller proxies only. External labels (Emirates Auction
+  match, ~100 records) remain the path to a true precision/recall for the
+  distress *cause*; the monthly top-20 human review starts with live listings.
+- Controls at longer holds drift slightly negative (−3.3%): units that resell
+  within 6–12 months in a decelerating market underperform their district
+  index; cohort comparisons are within-bucket so this does not bias the gap.
 
-## Honest limitations
+## Verdict (corrected)
 
-1. **Recoverable value ≠ purchasable deal.** The backtest proves flagged prices
-   are ~20% below what the unit fetches at its next sale. It cannot prove each
-   entry was available to *you* (off-market transfers, related-party pricing,
-   or recording quirks can produce real-looking discounts). Distinguishing
-   those requires external ground truth — the planned Emirates Auction match
-   (~100 labels → precision/recall) and, once live listings land, the monthly
-   top-20 human review (precision@20).
-2. Outcomes condition on resale (28% vs 22% resale rates disclosed above);
-   units that never resold are not measured.
-3. The window covers one cycle turn; the regime table covers a mild decline.
-
-## Verdict
-
-The **below-fair-value claim is validated out-of-sample**: flags mark deals
-whose discount is real and fully recovered at resale, and the signal-strength
-ranking orders them correctly. The **"distressed" label should be reframed**
-until external labels exist: what the system reliably finds is *deeply
-underpriced sales*; the distress *cause* (forced sale vs off-market transfer
-vs motivated seller) is currently inferred from weak proxies. Recommended copy:
-"below fair value — corroborated" rather than "distressed", plus the
-Emirates Auction labelling exercise before the listings launch.
+The system's **below-fair-value flags are validated out-of-sample**: flagged
+prices are genuinely below market — their resales return to fair value, and on
+registry-proven same-unit pairs the buyer's realized edge over the district is
+**≈ +14%** (all-pairs view ≈ +18–20%, which includes same-spec trades rather
+than strict resales). The ranking is calibrated. The **distress-cause label
+remains unvalidated** (no forced-sale ground truth in this dataset) — keep the
+product wording as "below fair value — corroborated" until external labels
+exist, and treat sub-−35% "discounts" as probable data noise, not deals.
