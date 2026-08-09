@@ -1457,12 +1457,13 @@ def _render_zone_analysis(
     neighborhoods: list[str],
     bedroom: str,
     trans_type: str,
+    data_version: str,
     start_date: date,
     end_date: date,
     date_min: date,
     date_max: date,
 ) -> None:
-    """Render the Zone Analysis page: neighbourhood-filtered charts and raw data."""
+    """Render the Zone Analysis page: opportunity scanner, filtered charts, raw data."""
     if filtered.is_empty():
         st.warning(
             "No data for the selected filters/date range. "
@@ -1476,6 +1477,10 @@ def _render_zone_analysis(
         f"**{bedroom}** · "
         f"**{trans_type}** · "
         f"{start_date.strftime('%b %Y')} – {end_date.strftime('%b %Y')}"
+    )
+
+    _render_opportunity_scanner(
+        trans_type, bedroom, data_version, start_date, end_date, neighborhoods
     )
 
     latest_date = filtered["date"].max()
@@ -1526,9 +1531,6 @@ def _render_market_overview(
     )
     _render_market_pulse(trans_type, data_version, start_date, end_date)
     _render_tier_section(trans_type, data_version, start_date, end_date)
-    _render_opportunity_scanner(
-        trans_type, bedroom, data_version, start_date, end_date, neighborhoods
-    )
 
 # ---------------------------------------------------------------------------
 # Streamlit app
@@ -1710,6 +1712,7 @@ elif active_page == "🗺️ Zone Analysis":
         neighborhoods,
         bedroom,
         trans_type,
+        data_version,
         start_date,
         end_date,
         date_min,

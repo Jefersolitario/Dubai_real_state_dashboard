@@ -118,15 +118,17 @@ The app starts on http://localhost:8501. It needs `.streamlit/secrets.toml`
 **Pages** — the segmented control at the top switches between:
 
 1. **Market Overview** — city-wide context: headline KPIs, Dubai Market
-   Pulse (median/mean daily prices, weekly momentum), market-tier trends,
-   and an opportunity scanner by neighbourhood.
+   Pulse (median/mean daily prices, weekly momentum), and market-tier
+   trends.
 
    ![Market Overview](reports/figures/screenshot_market_overview.png)
 
-2. **Zone Analysis** — the sidebar selection in depth: average price over
-   time per neighbourhood, an all-neighbourhoods price-vs-time scatter, the
-   latest-month price comparison, and the raw-data table with CSV download.
-   Loads only when this page is selected, keeping Market Overview fast.
+2. **Zone Analysis** — the sidebar selection in depth: the buyer
+   opportunity scanner (price/sqft vs each area's rolling median), average
+   price over time per neighbourhood, an all-neighbourhoods price-vs-time
+   scatter, the latest-month price comparison, and the raw-data table with
+   CSV download. Loads only when this page is selected, keeping Market
+   Overview fast.
 
 3. **Fair Value Model** — the deal scanner (screenshot at the top):
    - **Sidebar filters** (shared with Overview): neighbourhoods, bedroom
