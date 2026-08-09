@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from typing import Any
 import os
 import re
+import time
 
 import polars as pl
 import requests
@@ -22,9 +23,13 @@ OAUTH_TOKEN_PATH = "/oauth/client_credential/accesstoken"
 OPENAPI_PATH = "/secure/ddads/openapi/1.0.0"
 
 DEFAULT_PAGE_SIZE = 1000
-DEFAULT_MAX_RECORDS = 100_000
-DEFAULT_LOOKBACK_MONTHS = 4
+DEFAULT_MAX_RECORDS = 1_000_000
+DEFAULT_LOOKBACK_MONTHS = 24
 REQUEST_TIMEOUT = (10, 60)
+PAGE_RETRY_ATTEMPTS = 4
+# 408: the gateway returns "Downtime exception: Read timed out" as HTTP 408
+# during long pulls — transient, same as the 5xx blips.
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 REQUIRED_DASHBOARD_COLUMNS = [
     "INSTANCE_DATE",
@@ -51,10 +56,13 @@ OPTIONAL_DASHBOARD_COLUMNS = [
     "TOTAL_SELLER",
     "MASTER_PROJECT_EN",
     "PROJECT_EN",
+    "PROJECT_NUMBER",
+    "BUILDING_NAME_EN",
     "METER_SALE_PRICE",
 ]
 
 NUMERIC_COLUMNS = {
+    "PROJECT_NUMBER",
     "TRANS_VALUE",
     "ACTUAL_AREA",
     "PROCEDURE_AREA",
@@ -174,6 +182,15 @@ COLUMN_ALIASES: dict[str, list[str]] = {
         "project_name_en",
         "project_en",
     ],
+    "PROJECT_NUMBER": [
+        "PROJECT_NUMBER",
+        "project_number",
+    ],
+    "BUILDING_NAME_EN": [
+        "BUILDING_NAME_EN",
+        "building_name_en",
+        "building_name",
+    ],
     "METER_SALE_PRICE": [
         "METER_SALE_PRICE",
         "meter_sale_price",
@@ -256,6 +273,7 @@ def load_dda_config(
 
 
 def request_access_token(config: DDAConfig) -> str:
+    """OAuth bearer token via whichever endpoint the config prefers."""
     _ensure_config(config)
     token_requesters = (
         (_request_oauth_access_token,)
@@ -351,24 +369,7 @@ def fetch_dataset_records(
             "limit": page_size,
             "offset": offset,
         }
-        try:
-            response = requests.get(
-                config.dataset_url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "x-DDA-SecurityApplicationIdentifier": (
-                        config.security_application_identifier
-                    ),
-                },
-                params=query,
-                timeout=REQUEST_TIMEOUT,
-                verify=config.verify_ssl,
-            )
-        except requests.RequestException as exc:
-            raise DDAApiError(
-                f"Dataset request failed: {type(exc).__name__}"
-            ) from exc
-        _raise_for_status(response, "Dataset request")
+        response = _request_page_with_retry(config, token, query)
         page_records = _extract_records(response.json())
         if not page_records:
             break
@@ -383,7 +384,54 @@ def fetch_dataset_records(
     return records
 
 
+def _request_page_with_retry(
+    config: DDAConfig,
+    token: str,
+    query: Mapping[str, Any],
+    attempts: int = PAGE_RETRY_ATTEMPTS,
+) -> requests.Response:
+    """One dataset page, retried with exponential backoff.
+
+    The gateway intermittently answers 502 "policy unavailable" during long
+    paginated pulls; without per-page retry a single blip discards every
+    page already fetched.
+    """
+    delay = 2.0
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = requests.get(
+                config.dataset_url,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "x-DDA-SecurityApplicationIdentifier": (
+                        config.security_application_identifier
+                    ),
+                },
+                params=query,
+                timeout=REQUEST_TIMEOUT,
+                verify=config.verify_ssl,
+            )
+            if response.status_code in RETRYABLE_STATUS_CODES and attempt < attempts:
+                last_error = DDAApiError(
+                    f"Dataset request failed with HTTP {response.status_code}"
+                )
+            else:
+                _raise_for_status(response, "Dataset request")
+                return response
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == attempts:
+                raise DDAApiError(
+                    f"Dataset request failed: {type(exc).__name__}"
+                ) from exc
+        time.sleep(delay)
+        delay *= 2
+    raise DDAApiError(f"Dataset request failed after {attempts} attempts: {last_error}")
+
+
 def months_before(end: date, months: int) -> date:
+    """Calendar-exact date ``months`` before ``end`` (clamped to month length)."""
     if months < 0:
         raise ValueError("months must be non-negative")
 
@@ -395,6 +443,7 @@ def months_before(end: date, months: int) -> date:
 
 
 def last_months_date_range(months: int = DEFAULT_LOOKBACK_MONTHS) -> tuple[date, date]:
+    """(start, today) spanning the trailing ``months`` calendar months."""
     end = date.today()
     return months_before(end, months), end
 
@@ -435,6 +484,12 @@ def records_to_dataframe(records: list[dict[str, Any]]) -> pl.DataFrame:
 
 
 def normalize_dld_transactions(data: list[dict[str, Any]] | pl.DataFrame) -> pl.DataFrame:
+    """Raw API records/frame -> the canonical 24-column dashboard schema.
+
+    Maps raw column aliases onto the dashboard names, backfills missing
+    optional columns as nulls, normalizes dtypes, and projects to the
+    canonical column set (see project_dashboard_columns).
+    """
     if isinstance(data, pl.DataFrame):
         df = data.clone()
     elif data:
@@ -454,10 +509,16 @@ def normalize_dld_transactions(data: list[dict[str, Any]] | pl.DataFrame) -> pl.
 
     df = _add_missing_optional_columns(df)
     df = _normalize_types(df)
-    return df
+    # Project to the canonical schema HERE, not at call sites: every merge
+    # participant must share the exact column set or full-row dedupe treats
+    # identical transactions as distinct and corrupts the snapshot (the
+    # 2026-07-05 near-duplicate incident). Raw-column consumers should use
+    # records_to_dataframe / infer_column_mapping directly.
+    return project_dashboard_columns(df)
 
 
 def infer_column_mapping(columns: list[str]) -> dict[str, list[str]]:
+    """{dashboard column: [raw source columns]} for the given raw header."""
     lookup: dict[str, list[str]] = {}
     for column in columns:
         lookup.setdefault(_canonical_column(column), []).append(column)
@@ -558,6 +619,7 @@ def _ensure_config(config: DDAConfig) -> None:
 
 
 def _raise_for_status(response: requests.Response, context: str) -> None:
+    """Raise DDAApiError with the response detail on non-2xx statuses."""
     if response.ok:
         return
     try:
@@ -568,6 +630,7 @@ def _raise_for_status(response: requests.Response, context: str) -> None:
 
 
 def _extract_records(payload: Any) -> list[dict[str, Any]]:
+    """Find the records list inside the gateway's nested response shapes."""
     if isinstance(payload, list):
         return [record for record in payload if isinstance(record, dict)]
 
@@ -586,7 +649,23 @@ def _extract_records(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def project_dashboard_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Restrict a normalized frame to the canonical dashboard schema.
+
+    The snapshot and every merge participant must share this exact column
+    set: mixed schemas make identical transactions look distinct to the
+    full-row dedupe and corrupt the snapshot with near-duplicates.
+    """
+    needed = [
+        column
+        for column in REQUIRED_DASHBOARD_COLUMNS + OPTIONAL_DASHBOARD_COLUMNS
+        if column in df.columns
+    ]
+    return df.select(needed)
+
+
 def _add_missing_optional_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Add any absent optional dashboard column as a null column."""
     expressions = []
     for column in OPTIONAL_DASHBOARD_COLUMNS:
         if column not in df.columns:
@@ -597,6 +676,7 @@ def _add_missing_optional_columns(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _normalize_types(df: pl.DataFrame) -> pl.DataFrame:
+    """Cast numeric/text dashboard columns to their canonical dtypes."""
     expressions = []
 
     for column in NUMERIC_COLUMNS:

@@ -1,0 +1,37 @@
+{
+ "source": "campaign 2: 59 rounds (iterations 52-110), selection < 2026-05-01, MedAPE gate + tail no-worsening veto, one-shot sequestered holdout",
+ "generated_at": "2026-07-05T13:17:23",
+ "winner": "floor features + per-unit-type comps (single model; bag5 ensemble declined: tail gain 0.04pp < 0.3pp complexity bar)",
+ "cv_medape_mean": 0.04084924931943775,
+ "cv_medape_std": 0.004563006005845571,
+ "cv_r2_mean": 0.9247788393950799,
+ "cv_p90_ape": 0.157481,
+ "cv_flag_prop": 0.049029,
+ "holdout_medape": 0.041536,
+ "holdout_note": "one-shot holdout 2026-05-01+ (17,953 sales): MedAPE 4.15% vs 4.32% shipped, P90 15.67% vs 16.01%, false-flag 6.25% vs 6.53%; forced-sale lift unmeasurable (0 forced-sale procedures in window)",
+ "data_cleaning_note": "enabled 2026-07-06 after CV A/B on the full 24m frame (see data_cleaning_report.md): MedAPE 3.452% vs 3.503%, flag_prop 4.155% vs 4.326%, holdout deep tail (<-35%) 137 vs 181; A/B protocol differs from the campaign metrics above (full frame vs selection window) so deltas, not levels, are comparable",
+ "feature_config": {
+  "project": true,
+  "building": false,
+  "amenity": true,
+  "comps_area": false,
+  "comps_project": true,
+  "repeat_sale": true,
+  "price_history": true,
+  "rel_size": true,
+  "unit_floor": true,
+  "project_meta": true,
+  "rel_floor": true,
+  "comps_rooms": true,
+  "data_cleaning": true
+ },
+ "model_params": {
+  "learning_rate": 0.04,
+  "max_iter": 800,
+  "max_leaf_nodes": 127,
+  "early_stopping": true,
+  "validation_fraction": 0.1,
+  "loss": "absolute_error",
+  "l2_regularization": 1.0
+ }
+}
