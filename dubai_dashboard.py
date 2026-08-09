@@ -87,6 +87,12 @@ TRANSACTION_SCHEMA = {
 ZONE_COLOR_CONTEXT = "#636efa"   # at/above the zone median (context)
 ZONE_COLOR_BELOW = "#ef553b"     # below the zone median / flagged deal
 
+# A spread beyond -60% means the price was under 40% of the zone median —
+# the data-cleaning module's token-price threshold for gifts/related-party
+# transfers. Such records are registered transfers, not buyable prices, so
+# the deal list and deal counts exclude them.
+NON_MARKET_SPREAD = 0.60
+
 
 # ---------------------------------------------------------------------------
 # Data loading (Polars) - production DDA API
@@ -715,8 +721,12 @@ def _ensure_transactions_cover_range(
             + ", ".join(missing)
         )
 
-    incoming_frames, fetched_rows = _fetch_missing_windows(config, windows)
+    # Mark the attempt BEFORE fetching: when the API is unreachable (the
+    # normal state on Streamlit Cloud) the fetch raises, and setting the key
+    # afterwards would retry the doomed call on every widget interaction —
+    # freezing each rerun for the full network timeout.
     st.session_state["gcs_refresh_checked"] = refresh_key
+    incoming_frames, fetched_rows = _fetch_missing_windows(config, windows)
     if not incoming_frames:
         return df, meta, {
             "mode": "incremental",
@@ -1118,7 +1128,11 @@ def zone_psf_chart(
     below = df.filter(
         (pl.col("pct_vs_median") > -thr) & (pl.col("pct_vs_median") < 0)
     )
-    deals = df.filter(pl.col("pct_vs_median") <= -thr)
+    deals = df.filter(
+        (pl.col("pct_vs_median") <= -thr)
+        & (pl.col("pct_vs_median") > -NON_MARKET_SPREAD)
+    )
+    non_market = df.filter(pl.col("pct_vs_median") <= -NON_MARKET_SPREAD)
 
     hover = (
         "%{x|%d %b %Y}<br>"
@@ -1128,6 +1142,8 @@ def zone_psf_chart(
         "<extra></extra>"
     )
     layers = (
+        (non_market, f"Non-market (> {NON_MARKET_SPREAD:.0%} below)",
+         dict(color="#8b949e", size=4, opacity=0.25)),
         (context, "At/above median",
          dict(color=ZONE_COLOR_CONTEXT, size=5, opacity=0.30)),
         (below, "Below median",
@@ -1140,7 +1156,9 @@ def zone_psf_chart(
     for frame, name, marker in layers:
         if frame.is_empty():
             continue
-        fig.add_trace(go.Scatter(
+        # Scattergl: WebGL markers stay responsive at thousands of dots,
+        # where SVG scatter rendering freezes the browser tab.
+        fig.add_trace(go.Scattergl(
             x=frame["date"].to_list(),
             y=frame["price_per_sqft"].to_list(),
             mode="markers",
@@ -1367,7 +1385,8 @@ def _render_zone_deal_finder(
         (pl.col("area") == zone) & pl.col("rolling_median_psf").is_not_null()
     )
     deals = zone_scored.filter(
-        pl.col("pct_vs_median") <= -thr
+        (pl.col("pct_vs_median") <= -thr)
+        & (pl.col("pct_vs_median") > -NON_MARKET_SPREAD)
     ).sort("pct_vs_median")
 
     st.caption(
@@ -1375,7 +1394,9 @@ def _render_zone_deal_finder(
         "**Solid line** = its 14-day rolling median AED/sqft; "
         "**dashed line** = the deal threshold below it. "
         "**Red dots** closed under the median — the strong red ones cleared "
-        "the threshold and are listed in the table underneath."
+        "the threshold and are listed in the table underneath. Grey dots more "
+        f"than {NON_MARKET_SPREAD:.0%} below are gifts/token-price transfers, "
+        "not buyable prices, and are excluded from the deal list."
     )
 
     latest_median = (
@@ -1455,7 +1476,10 @@ def _render_zone_deal_finder(
     if len(neighborhoods) > 1:
         deal_counts = (
             scored
-            .filter(pl.col("pct_vs_median") <= -thr)
+            .filter(
+                (pl.col("pct_vs_median") <= -thr)
+                & (pl.col("pct_vs_median") > -NON_MARKET_SPREAD)
+            )
             .group_by("area")
             .agg(pl.len().alias("deals"))
         )
