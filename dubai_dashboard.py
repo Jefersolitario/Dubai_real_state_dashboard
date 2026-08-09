@@ -20,7 +20,6 @@ import logging
 from datetime import UTC, date, datetime
 
 import polars as pl
-import plotly.colors
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -81,10 +80,6 @@ TRANSACTION_SCHEMA = {
     "ACTUAL_AREA": pl.Float64,
     "ROOMS_EN": pl.Utf8,
 }
-
-# Alphabet palette has 26 entries – enough for 20 neighbourhoods
-COLORS = plotly.colors.qualitative.Alphabet
-COLOR_MAP = {n: COLORS[i % len(COLORS)] for i, n in enumerate(NEIGHBORHOODS)}
 
 # Zone deal-finder colors — same semantics as the Fair Value tab's
 # COLOR_NORMAL / COLOR_BELOW so "red = below fair price" reads the same
@@ -927,148 +922,6 @@ def _y_cap_range(values: pl.Series, pad: float = 1.1) -> list[float] | None:
     return [0.0, cap * pad]
 
 
-def line_chart(df: pl.DataFrame) -> go.Figure:
-    """Neighbourhood line chart with the shared layout defaults."""
-    fig   = go.Figure()
-    dash_ = {"Studio": "dot", "1BR": "solid", "2BR": "dash", "3BR": "dashdot"}
-    nbhds = df["neighborhood"].unique().to_list()
-    # drop_nulls: a null bedroom label would compare as null and warn
-    br_types = df["bedroom_type"].unique().drop_nulls().sort().to_list()
-
-    for nbhd in NEIGHBORHOODS:          # stable iteration order
-        if nbhd not in nbhds:
-            continue
-        color = COLOR_MAP[nbhd]
-        for br in br_types:
-            sub = (
-                df.filter((pl.col("neighborhood") == nbhd) & (pl.col("bedroom_type") == br))
-                .sort("date")
-            )
-            if sub.is_empty():
-                continue
-            show_leg = br == br_types[0]
-            fig.add_trace(go.Scatter(
-                x=sub["date"].to_list(),
-                y=sub["avg_price_aed"].to_list(),
-                mode="lines",
-                name=nbhd,
-                legendgroup=nbhd,
-                showlegend=show_leg,
-                line=dict(color=color, width=2, dash=dash_.get(br, "solid")),
-                hovertemplate=(
-                    f"<b>{nbhd} – {br}</b><br>"
-                    "Date: %{x|%d %b %Y}<br>"
-                    "Avg Price: AED %{y:,.0f}<br><extra></extra>"
-                ),
-            ))
-
-    fig.update_layout(
-        **_layout_defaults("Average Apartment Price Over Time"),
-        xaxis=dict(showgrid=False, zeroline=False),
-        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#2a2e35", range=_y_cap_range(df["avg_price_aed"])),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(size=10)),
-        hovermode="x unified",
-        margin=dict(l=60, r=20, t=48, b=40),
-    )
-    if len(br_types) > 1:
-        legend_parts = [f"{dash_.get(br, 'solid').capitalize()} = {br}" for br in br_types if br in dash_]
-        if legend_parts:
-            fig.add_annotation(
-                text=" · ".join(legend_parts),
-                xref="paper", yref="paper", x=0.01, y=0.97,
-                showarrow=False, font=dict(size=10, color="#8b949e"),
-            )
-    return fig
-
-
-def bar_chart(df: pl.DataFrame, latest_date: date) -> go.Figure:
-    """Neighbourhood bar chart with the shared layout defaults."""
-    fig     = go.Figure()
-    latest  = df.filter(pl.col("date") == latest_date)
-    br_types = latest["bedroom_type"].unique().drop_nulls().sort().to_list()
-
-    # Sort neighbourhoods by descending avg price
-    order = (
-        latest.group_by("neighborhood")
-        .agg(pl.col("avg_price_aed").mean())
-        .sort("avg_price_aed", descending=True)["neighborhood"]
-        .to_list()
-    )
-
-    opacity_map = {"Studio": 0.50, "1BR": 1.0, "2BR": 0.80, "3BR": 0.65}
-    for br in br_types:
-        sub = latest.filter(pl.col("bedroom_type") == br)
-        prices = {r["neighborhood"]: r["avg_price_aed"] for r in sub.iter_rows(named=True)}
-        fig.add_trace(go.Bar(
-            x=order,
-            y=[prices.get(n, None) for n in order],
-            name=br,
-            marker_color=[COLOR_MAP[n] for n in order],
-            opacity=opacity_map.get(br, 1.0),
-            hovertemplate="<b>%{x}</b><br>Avg Price: AED %{y:,.0f}<extra></extra>",
-        ))
-
-    fig.update_layout(
-        **_layout_defaults(f"Price Comparison · {latest_date.strftime('%b %Y')}"),
-        barmode="group",
-        xaxis=dict(tickangle=-35, tickfont=dict(size=10)),
-        yaxis=dict(title="AED", tickformat=",.0f", gridcolor="#2a2e35"),
-        legend=dict(font=dict(size=10)),
-        margin=dict(l=60, r=20, t=48, b=95),
-    )
-    return fig
-
-
-def price_vs_time_scatter(df: pl.DataFrame) -> go.Figure:
-    """Scatter of avg_price_aed vs date for every neighbourhood in the filtered set.
-
-    One trace per neighbourhood; each monthly data point is a dot, coloured by
-    neighbourhood.  Bedroom type and transaction count appear in the tooltip.
-    """
-    fig   = go.Figure()
-    nbhds = set(df["neighborhood"].to_list())
-
-    for nbhd in NEIGHBORHOODS:
-        if nbhd not in nbhds:
-            continue
-        sub = df.filter(pl.col("neighborhood") == nbhd).sort("date")
-        cd  = sub.select(["bedroom_type", "transaction_count"]).to_numpy()
-        fig.add_trace(go.Scatter(
-            x=sub["date"].to_list(),
-            y=sub["avg_price_aed"].to_list(),
-            mode="markers",
-            name=nbhd,
-            legendgroup=nbhd,
-            marker=dict(
-                color=COLOR_MAP[nbhd],
-                size=5,
-                opacity=0.70,
-                line=dict(width=0),
-            ),
-            customdata=cd,
-            hovertemplate=(
-                f"<b>{nbhd}</b><br>"
-                "Date: %{x|%d %b %Y}<br>"
-                "Avg Price: AED %{y:,.0f}<br>"
-                "Type: %{customdata[0]}<br>"
-                "Transactions: %{customdata[1]}<extra></extra>"
-            ),
-        ))
-
-    fig.update_layout(
-        **_layout_defaults("Avg Price vs Time — All Neighbourhoods"),
-        xaxis=dict(showgrid=False, zeroline=False, title="Date"),
-        yaxis=dict(title="Avg Price (AED)", tickformat=",.0f", gridcolor="#2a2e35", range=_y_cap_range(df["avg_price_aed"])),
-        legend=dict(
-            orientation="v",
-            x=1.01, y=1,
-            font=dict(size=9),
-            tracegroupgap=2,
-        ),
-        hovermode="closest",
-        margin=dict(l=60, r=140, t=48, b=40),
-    )
-    return fig
 
 
 def dubai_wide_transactions_chart(dw: pl.DataFrame) -> go.Figure:
@@ -1238,79 +1091,6 @@ def tier_price_chart(tier_df: pl.DataFrame) -> go.Figure:
     return fig
 
 
-def area_psf_chart(
-    txns_df: pl.DataFrame,
-    rolling_df: pl.DataFrame,
-    neighborhoods: list[str],
-) -> go.Figure:
-    """Scatter + line chart: individual transactions (dots) and 14-day rolling
-    area median (solid line) for AED/sqft over time.
-
-    Dots below the line = that deal was cheaper than the area's recent median
-    — the clearest transaction-level buy signal available in the data.
-    """
-    fig = go.Figure()
-
-    for nbhd in NEIGHBORHOODS:           # stable ordering
-        if nbhd not in neighborhoods:
-            continue
-        color = COLOR_MAP[nbhd]
-
-        t = txns_df.filter(pl.col("area") == nbhd).sort("date")
-        r = rolling_df.filter(pl.col("area") == nbhd).sort("date")
-
-        if t.is_empty():
-            continue
-
-        # ── Scatter: individual transactions ──────────────────────────────
-        fig.add_trace(go.Scatter(
-            x=t["date"].to_list(),
-            y=t["price_per_sqft"].to_list(),
-            mode="markers",
-            name=nbhd,
-            legendgroup=nbhd,
-            showlegend=True,
-            marker=dict(color=color, size=5, opacity=0.35),
-            hovertemplate=(
-                f"<b>{nbhd}</b><br>"
-                "%{x|%d %b %Y}<br>"
-                "Transaction: AED %{y:,.0f}/sqft"
-                "<extra></extra>"
-            ),
-        ))
-
-        # ── Line: 14-day rolling median of daily area median ──────────────
-        if not r.is_empty():
-            fig.add_trace(go.Scatter(
-                x=r["date"].to_list(),
-                y=r["rolling_median_psf"].to_list(),
-                mode="lines",
-                name=f"{nbhd} 14d median",
-                legendgroup=nbhd,
-                showlegend=False,            # share legend entry with dots
-                line=dict(color=color, width=2.5),
-                hovertemplate=(
-                    f"<b>{nbhd}</b><br>"
-                    "%{x|%d %b %Y}<br>"
-                    "14-day median: AED %{y:,.0f}/sqft"
-                    "<extra></extra>"
-                ),
-            ))
-
-    fig.update_layout(
-        **_layout_defaults(
-            "Price / sqft — Individual Transactions (dots) & 14-day Rolling Area Median (line)"
-        ),
-        xaxis=dict(showgrid=False, zeroline=False),
-        yaxis=dict(title="AED / sqft", tickformat=",.0f", gridcolor="#2a2e35", range=_y_cap_range(txns_df["price_per_sqft"])),
-        legend=dict(
-            orientation="h", yanchor="bottom", y=1.02,
-            xanchor="right", x=1, font=dict(size=9),
-        ),
-        hovermode="closest",
-        margin=dict(l=60, r=20, t=54, b=40),
-    )
-    return fig
 
 
 def zone_psf_chart(
@@ -1559,17 +1339,9 @@ def _render_zone_deal_finder(
     psf_rolling: pl.DataFrame,
     zone: str,
     neighborhoods: list[str],
+    threshold_pct: int,
 ) -> None:
-    """Below-median deal finder: threshold, KPIs, diverging scanner, deals table."""
-    threshold_pct = st.slider(
-        "Deal threshold — % below the zone's 14-day median",
-        min_value=1,
-        max_value=30,
-        value=10,
-        step=1,
-        key="zone_threshold",
-        help="A transaction at least this far under the rolling median counts as a deal",
-    )
+    """Below-median deal finder: KPIs, diverging scanner, ranked deals table."""
     thr = threshold_pct / 100.0
 
     # Score every selected zone against its own median so the per-zone deal
@@ -1701,39 +1473,6 @@ def _render_zone_deal_finder(
             )
 
 
-def _render_zone_classic(
-    filtered: pl.DataFrame,
-    psf_txns: pl.DataFrame,
-    psf_rolling: pl.DataFrame,
-    zone: str,
-) -> None:
-    """The original four charts, decluttered by scoping them to one zone."""
-    st.caption(
-        "**Dots** = individual DLD transactions. **Solid line** = the zone's "
-        "14-day rolling median AED/sqft. A dot **below** the line closed cheaper "
-        "than the zone's recent median."
-    )
-    zone_txns = psf_txns.filter(pl.col("area") == zone)
-    zone_rolling = psf_rolling.filter(pl.col("area") == zone)
-    if zone_txns.is_empty():
-        st.warning(f"No transactions for {zone} in the selected window.")
-    else:
-        st.plotly_chart(
-            area_psf_chart(zone_txns, zone_rolling, [zone]),
-            use_container_width=True,
-        )
-
-    zone_filtered = filtered.filter(pl.col("neighborhood") == zone)
-    if zone_filtered.is_empty():
-        return
-    st.plotly_chart(line_chart(zone_filtered), use_container_width=True)
-    st.plotly_chart(price_vs_time_scatter(zone_filtered), use_container_width=True)
-    st.plotly_chart(
-        bar_chart(zone_filtered, zone_filtered["date"].max()),
-        use_container_width=True,
-    )
-
-
 def _render_zone_analysis(
     filtered: pl.DataFrame,
     neighborhoods: list[str],
@@ -1764,7 +1503,7 @@ def _render_zone_analysis(
     zone_options = [n for n in NEIGHBORHOODS if n in neighborhoods]
     if st.session_state.get("zone_select") not in zone_options:
         st.session_state.pop("zone_select", None)
-    zone_col, view_col = st.columns([2, 3])
+    zone_col, threshold_col = st.columns([2, 3])
     with zone_col:
         zone = st.selectbox(
             "Zone",
@@ -1772,22 +1511,21 @@ def _render_zone_analysis(
             key="zone_select",
             help="Every chart below focuses on this zone",
         )
-    with view_col:
-        view = st.radio(
-            "View",
-            ["🎯 Deal finder", "📈 Classic charts"],
-            key="zone_view",
-            horizontal=True,
-            help="Two candidate layouts for this page — compare and keep the one you prefer",
+    with threshold_col:
+        threshold_pct = st.slider(
+            "Deal threshold — % below the zone's 14-day median",
+            min_value=1,
+            max_value=30,
+            value=10,
+            step=1,
+            key="zone_threshold",
+            help="A transaction at least this far under the rolling median counts as a deal",
         )
 
     PSF_TXNS, PSF_ROLLING = generate_area_psf_timeseries(
         trans_type, bedroom, data_version, start_date, end_date,
     )
-    if view == "🎯 Deal finder":
-        _render_zone_deal_finder(PSF_TXNS, PSF_ROLLING, zone, neighborhoods)
-    else:
-        _render_zone_classic(filtered, PSF_TXNS, PSF_ROLLING, zone)
+    _render_zone_deal_finder(PSF_TXNS, PSF_ROLLING, zone, neighborhoods, threshold_pct)
 
     # ── Raw data table ────────────────────────────────────────────────────────────
     with st.expander("📋 Raw Data Table", expanded=False):
@@ -1993,7 +1731,7 @@ if active_page is None:
 # Streamlit drops the state of widgets that are not rendered in a run; the
 # Fair Value and Zone Analysis widgets disappear while another page is shown,
 # so re-assign their keys every run to keep the user's selections alive.
-for _page_key in ("fv_window", "fv_threshold", "zone_select", "zone_view", "zone_threshold"):
+for _page_key in ("fv_window", "fv_threshold", "zone_select", "zone_threshold"):
     if _page_key in st.session_state:
         st.session_state[_page_key] = st.session_state[_page_key]
 

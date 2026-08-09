@@ -123,12 +123,11 @@ The app starts on http://localhost:8501. It needs `.streamlit/secrets.toml`
 
    ![Market Overview](reports/figures/screenshot_market_overview.png)
 
-2. **Zone Analysis** — one zone in focus, with two views to compare: a
-   **deal finder** (each transaction's AED/sqft against the zone's 14-day
-   rolling median, an adjustable deal threshold, a ranked below-median
-   deals table with CSV download, and deal counts across zones) and the
-   **classic charts** (the previous four charts scoped to the selected
-   zone). Loads only when this page is selected, keeping Market Overview
+2. **Zone Analysis** — a below-median deal finder for one zone at a time:
+   each transaction's AED/sqft against the zone's 14-day rolling median,
+   an adjustable deal threshold, a ranked below-median deals table with
+   CSV download, and deal counts across zones to guide which zone to open
+   next. Loads only when this page is selected, keeping Market Overview
    fast.
 
 3. **Fair Value Model** — the deal scanner (screenshot at the top):
