@@ -1370,7 +1370,6 @@ def _render_zone_deal_finder(
         pl.col("pct_vs_median") <= -thr
     ).sort("pct_vs_median")
 
-    st.markdown(f"### Buyer Opportunity Scanner — {zone}")
     st.caption(
         "**Dots** = individual DLD transactions in the zone. "
         "**Solid line** = its 14-day rolling median AED/sqft; "
@@ -1484,7 +1483,7 @@ def _render_zone_analysis(
     date_min: date,
     date_max: date,
 ) -> None:
-    """Render the Zone Analysis page: one zone in focus, two candidate views."""
+    """Render the Buyer Opportunity Scanner page: below-median deals per zone."""
     if filtered.is_empty():
         st.warning(
             "No data for the selected filters/date range. "
@@ -1492,11 +1491,12 @@ def _render_zone_analysis(
         )
         return
 
-    st.markdown("## Zone Analysis")
+    st.markdown("## Buyer Opportunity Scanner")
     st.caption(
-        f"Showing **{len(neighborhoods)}** neighbourhood(s) · "
-        f"**{bedroom}** · "
-        f"**{trans_type}** · "
+        "Sidebar filters apply to everything on this page — "
+        f"**{len(neighborhoods)}** neighbourhood(s) · "
+        f"Bedrooms: **{bedroom}** · "
+        f"Type: **{trans_type}** · "
         f"{start_date.strftime('%b %Y')} – {end_date.strftime('%b %Y')}"
     )
 
@@ -1714,11 +1714,16 @@ if not neighborhoods:
 # Segmented control instead of st.tabs: st.tabs executes every tab body on
 # each rerun, which would load the model bundle and score transactions even
 # when the user never opens the Fair Value view. Only the active page runs,
-# which likewise keeps the Zone Analysis charts and CSV build off the other
-# pages' rerun path.
+# which likewise keeps the Buyer Opportunity Scanner charts and CSV build
+# off the other pages' rerun path.
+_PAGE_OPTIONS = ["📊 Market Overview", "🔎 Buyer Opportunity Scanner", "🎯 Fair Value Model"]
+# A stored label from before a page rename (or a deselected None) would no
+# longer match the options and crash the widget — drop it first.
+if st.session_state.get("active_page") not in _PAGE_OPTIONS:
+    st.session_state.pop("active_page", None)
 active_page = st.segmented_control(
     "Page",
-    ["📊 Market Overview", "🗺️ Zone Analysis", "🎯 Fair Value Model"],
+    _PAGE_OPTIONS,
     default="📊 Market Overview",
     key="active_page",
     label_visibility="collapsed",
@@ -1729,7 +1734,7 @@ if active_page is None:
     active_page = "📊 Market Overview"
 
 # Streamlit drops the state of widgets that are not rendered in a run; the
-# Fair Value and Zone Analysis widgets disappear while another page is shown,
+# Fair Value and Buyer Opportunity Scanner widgets disappear while another page is shown,
 # so re-assign their keys every run to keep the user's selections alive.
 for _page_key in ("fv_window", "fv_threshold", "zone_select", "zone_threshold"):
     if _page_key in st.session_state:
@@ -1737,7 +1742,7 @@ for _page_key in ("fv_window", "fv_threshold", "zone_select", "zone_threshold"):
 
 if active_page == "🎯 Fair Value Model":
     render_fair_value_tab(neighborhoods, bedroom, start_date, end_date, data_version)
-elif active_page == "🗺️ Zone Analysis":
+elif active_page == "🔎 Buyer Opportunity Scanner":
     # Fair Value never consumes the filtered frame — compute it only on the
     # pages that do, so Fair Value interactions don't pay for an unused
     # aggregation.

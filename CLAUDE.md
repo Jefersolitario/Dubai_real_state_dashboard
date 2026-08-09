@@ -55,7 +55,7 @@ Single-file Streamlit app with this flow:
 3. **Data normalization** - maps DDA API columns into the dashboard schema.
 4. **Aggregation helpers** - daily, weekly, Dubai-wide, tier, and area-level metrics using Polars.
 5. **Chart builders** - Plotly figures for price trends, volume, momentum, tiers, and scatter views.
-6. **Streamlit UI** - three pages via `st.segmented_control` (not `st.tabs`, which executes every tab body on each rerun): "Market Overview" (`_render_market_overview`: headline KPIs, Dubai Market Pulse, tier trends), "Zone Analysis" (`_render_zone_analysis`: zone picker + deal-threshold slider driving `_render_zone_deal_finder` — zone KPIs, diverging below-median scanner (`zone_psf_chart`), ranked deals table + CSV, per-zone deal counts (`deals_by_zone_chart`) — plus the raw-data table; only rendered when selected), and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`, lazy — model bundle load and scoring only run when this page is selected); shared sidebar filters.
+6. **Streamlit UI** - three pages via `st.segmented_control` (not `st.tabs`, which executes every tab body on each rerun): "Market Overview" (`_render_market_overview`: headline KPIs, Dubai Market Pulse, tier trends), "Buyer Opportunity Scanner" (`_render_zone_analysis`: zone picker + deal-threshold slider driving `_render_zone_deal_finder` — zone KPIs, diverging below-median scanner (`zone_psf_chart`), ranked deals table + CSV, per-zone deal counts (`deals_by_zone_chart`) — plus the raw-data table; only rendered when selected), and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`, lazy — model bundle load and scoring only run when this page is selected); shared sidebar filters.
 
 ### dashboard_constants.py (root)
 
