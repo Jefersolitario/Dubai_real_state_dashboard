@@ -20,6 +20,7 @@ import logging
 from datetime import UTC, date, datetime
 
 import polars as pl
+from polars.exceptions import PanicException
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -377,7 +378,7 @@ def generate_area_psf_timeseries(
             pl.col("area"),
             pl.col("price_per_sqft"),
             pl.col("bedroom_type"),
-            building_col.alias("building"),
+            building_col.fill_null("—").alias("building"),
             (pl.col("ACTUAL_AREA") * SQM_TO_SQFT).round(0).alias("size_sqft"),
             pl.col("TRANS_VALUE").alias("price_aed"),
             pl.col("IS_OFFPLAN_EN").alias("offplan"),
@@ -401,7 +402,10 @@ def generate_area_psf_timeseries(
         )
     )
 
-    return txns_df, rolling_df
+    # rechunk: hand st.cache_data compact single-chunk buffers — chunked
+    # string-view arrays from filtered frames have hit arrow binview panics
+    # in downstream kernels (polars 1.43).
+    return txns_df.rechunk(), rolling_df.rechunk()
 
 
 # ---------------------------------------------------------------------------
@@ -1116,23 +1120,39 @@ def zone_psf_chart(
     context). Same red/blue semantics as the Fair Value tab.
     """
     thr = threshold_pct / 100.0
-    df = zone_scored.with_columns(
-        pl.format("{}%", (pl.col("pct_vs_median") * 100).round(1))
-        .fill_null("—")
-        .alias("vs_median"),
-        pl.col("building").fill_null("—"),
+    # Classification and hover strings are assembled in plain Python on
+    # purpose: polars string kernels (pl.format / fill_null) panicked on
+    # these cache-round-tripped frames in production (arrow binview
+    # assertion, polars 1.43), and a Rust panic kills the Streamlit script
+    # thread with the page frozen on RUNNING. Float/date .to_list() reads
+    # are plain sequential accesses and have never tripped it.
+    rows = zip(
+        zone_scored["date"].to_list(),
+        zone_scored["price_per_sqft"].to_list(),
+        zone_scored["pct_vs_median"].to_list(),
+        zone_scored["building"].to_list(),
+        zone_scored["bedroom_type"].to_list(),
+        zone_scored["size_sqft"].to_list(),
+        zone_scored["price_aed"].to_list(),
     )
-    context = df.filter(
-        pl.col("pct_vs_median").is_null() | (pl.col("pct_vs_median") >= 0)
-    )
-    below = df.filter(
-        (pl.col("pct_vs_median") > -thr) & (pl.col("pct_vs_median") < 0)
-    )
-    deals = df.filter(
-        (pl.col("pct_vs_median") <= -thr)
-        & (pl.col("pct_vs_median") > -NON_MARKET_SPREAD)
-    )
-    non_market = df.filter(pl.col("pct_vs_median") <= -NON_MARKET_SPREAD)
+    points: dict[str, tuple[list, list, list]] = {
+        key: ([], [], []) for key in ("non_market", "context", "below", "deal")
+    }
+    for day, psf, pct, building, rooms, size, price in rows:
+        if pct is None:
+            key, pct_label = "context", "—"
+        elif pct <= -NON_MARKET_SPREAD:
+            key, pct_label = "non_market", f"{pct * 100:+.1f}%"
+        elif pct <= -thr:
+            key, pct_label = "deal", f"{pct * 100:+.1f}%"
+        elif pct < 0:
+            key, pct_label = "below", f"{pct * 100:+.1f}%"
+        else:
+            key, pct_label = "context", f"{pct * 100:+.1f}%"
+        xs, ys, custom = points[key]
+        xs.append(day)
+        ys.append(psf)
+        custom.append((pct_label, building or "—", rooms or "—", size, price))
 
     hover = (
         "%{x|%d %b %Y}<br>"
@@ -1142,31 +1162,30 @@ def zone_psf_chart(
         "<extra></extra>"
     )
     layers = (
-        (non_market, f"Non-market (> {NON_MARKET_SPREAD:.0%} below)",
+        ("non_market", f"Non-market (> {NON_MARKET_SPREAD:.0%} below)",
          dict(color="#8b949e", size=4, opacity=0.25)),
-        (context, "At/above median",
+        ("context", "At/above median",
          dict(color=ZONE_COLOR_CONTEXT, size=5, opacity=0.30)),
-        (below, "Below median",
+        ("below", "Below median",
          dict(color=ZONE_COLOR_BELOW, size=5, opacity=0.45)),
-        (deals, f"Deal — ≥ {threshold_pct}% below",
+        ("deal", f"Deal — ≥ {threshold_pct}% below",
          dict(color=ZONE_COLOR_BELOW, size=7, opacity=0.95,
               line=dict(width=1, color="#0e1117"))),
     )
     fig = go.Figure()
-    for frame, name, marker in layers:
-        if frame.is_empty():
+    for key, name, marker in layers:
+        xs, ys, custom = points[key]
+        if not xs:
             continue
         # Scattergl: WebGL markers stay responsive at thousands of dots,
         # where SVG scatter rendering freezes the browser tab.
         fig.add_trace(go.Scattergl(
-            x=frame["date"].to_list(),
-            y=frame["price_per_sqft"].to_list(),
+            x=xs,
+            y=ys,
             mode="markers",
             name=name,
             marker=marker,
-            customdata=frame.select(
-                ["vs_median", "building", "bedroom_type", "size_sqft", "price_aed"]
-            ).rows(),
+            customdata=custom,
             hovertemplate=hover,
         ))
 
@@ -1195,7 +1214,7 @@ def zone_psf_chart(
         xaxis=dict(showgrid=False, zeroline=False),
         yaxis=dict(
             title="AED / sqft", tickformat=",.0f", gridcolor="#2a2e35",
-            range=_y_cap_range(df["price_per_sqft"]),
+            range=_y_cap_range(zone_scored["price_per_sqft"]),
         ),
         legend=dict(orientation="h", yanchor="bottom", y=1.02,
                     xanchor="right", x=1, font=dict(size=10)),
@@ -1431,10 +1450,22 @@ def _render_zone_deal_finder(
             help="The furthest any transaction closed below the rolling median",
         )
 
-    st.plotly_chart(
-        zone_psf_chart(zone_scored, zone_rolling, zone, threshold_pct),
-        use_container_width=True,
-    )
+    try:
+        zone_fig = zone_psf_chart(zone_scored, zone_rolling, zone, threshold_pct)
+    except PanicException:
+        # A polars Rust panic derives from BaseException, escapes Streamlit's
+        # `except Exception` handler, and kills the script thread with the
+        # page frozen on RUNNING. Degrade to an error box instead and keep
+        # the deals table below alive.
+        LOGGER.exception("zone_psf_chart hit a polars panic")
+        zone_fig = None
+    if zone_fig is None:
+        st.error(
+            "The scanner chart failed for this filter combination — the deals "
+            "table below still works. Try a different zone/bedroom selection."
+        )
+    else:
+        st.plotly_chart(zone_fig, use_container_width=True)
 
     st.markdown(f"### Below-median deals — {zone}")
     if deals.is_empty():
@@ -1445,7 +1476,7 @@ def _render_zone_deal_finder(
     else:
         deals_display = deals.select([
             pl.col("date").cast(pl.Utf8).alias("Date"),
-            pl.col("building").fill_null("—").alias("Building"),
+            pl.col("building").alias("Building"),
             pl.col("bedroom_type").alias("Rooms"),
             pl.col("size_sqft").alias("Size (sqft)"),
             pl.col("price_aed").round(0).alias("Price (AED)"),
