@@ -887,7 +887,7 @@ def apply_filters(
 # Chart builders (Plotly)
 # ---------------------------------------------------------------------------
 
-def line_chart(df: pl.DataFrame, bedroom: str) -> go.Figure:
+def line_chart(df: pl.DataFrame) -> go.Figure:
     """Neighbourhood line chart with the shared layout defaults."""
     fig   = go.Figure()
     dash_ = {"Studio": "dot", "1BR": "solid", "2BR": "dash", "3BR": "dashdot"}
@@ -1452,10 +1452,36 @@ def _render_opportunity_scanner(
     st.divider()
 
 
-def _render_filtered_charts(filtered: pl.DataFrame, bedroom: str, latest_date: date) -> None:
-    """Neighbourhood-filtered charts and the raw-data expander."""
+def _render_zone_analysis(
+    filtered: pl.DataFrame,
+    neighborhoods: list[str],
+    bedroom: str,
+    trans_type: str,
+    start_date: date,
+    end_date: date,
+    date_min: date,
+    date_max: date,
+) -> None:
+    """Render the Zone Analysis page: neighbourhood-filtered charts and raw data."""
+    if filtered.is_empty():
+        st.warning(
+            "No data for the selected filters/date range. "
+            f"The loaded data covers {date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}."
+        )
+        return
+
+    st.markdown("## Zone Analysis")
+    st.caption(
+        f"Showing **{len(neighborhoods)}** neighbourhood(s) · "
+        f"**{bedroom}** · "
+        f"**{trans_type}** · "
+        f"{start_date.strftime('%b %Y')} – {end_date.strftime('%b %Y')}"
+    )
+
+    latest_date = filtered["date"].max()
+
     # ── Filtered charts ───────────────────────────────────────────────────────────
-    st.plotly_chart(line_chart(filtered, bedroom), use_container_width=True)
+    st.plotly_chart(line_chart(filtered), use_container_width=True)
 
     st.plotly_chart(price_vs_time_scatter(filtered), use_container_width=True)
 
@@ -1495,7 +1521,7 @@ def _render_market_overview(
         )
         return
 
-    latest_date = _render_headline_kpis(
+    _render_headline_kpis(
         filtered, neighborhoods, bedroom, trans_type, start_date, end_date
     )
     _render_market_pulse(trans_type, data_version, start_date, end_date)
@@ -1503,7 +1529,6 @@ def _render_market_overview(
     _render_opportunity_scanner(
         trans_type, bedroom, data_version, start_date, end_date, neighborhoods
     )
-    _render_filtered_charts(filtered, bedroom, latest_date)
 
 # ---------------------------------------------------------------------------
 # Streamlit app
@@ -1651,10 +1676,12 @@ if not neighborhoods:
 
 # Segmented control instead of st.tabs: st.tabs executes every tab body on
 # each rerun, which would load the model bundle and score transactions even
-# when the user never opens the Fair Value view. Only the active page runs.
+# when the user never opens the Fair Value view. Only the active page runs,
+# which likewise keeps the Zone Analysis charts and CSV build off the other
+# pages' rerun path.
 active_page = st.segmented_control(
     "Page",
-    ["📊 Market Overview", "🎯 Fair Value Model"],
+    ["📊 Market Overview", "🗺️ Zone Analysis", "🎯 Fair Value Model"],
     default="📊 Market Overview",
     key="active_page",
     label_visibility="collapsed",
@@ -1673,9 +1700,22 @@ for _fv_key in ("fv_window", "fv_threshold"):
 
 if active_page == "🎯 Fair Value Model":
     render_fair_value_tab(neighborhoods, bedroom, start_date, end_date, data_version)
+elif active_page == "🗺️ Zone Analysis":
+    # Fair Value never consumes the filtered frame — compute it only on the
+    # pages that do, so Fair Value interactions don't pay for an unused
+    # aggregation.
+    filtered = apply_filters(DAILY_DATA, neighborhoods, bedroom, start_date, end_date)
+    _render_zone_analysis(
+        filtered,
+        neighborhoods,
+        bedroom,
+        trans_type,
+        start_date,
+        end_date,
+        date_min,
+        date_max,
+    )
 else:
-    # Only the overview consumes the filtered frame — compute it here so
-    # Fair Value interactions don't pay for an unused aggregation.
     filtered = apply_filters(DAILY_DATA, neighborhoods, bedroom, start_date, end_date)
     _render_market_overview(
         filtered,
