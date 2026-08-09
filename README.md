@@ -118,13 +118,20 @@ The app starts on http://localhost:8501. It needs `.streamlit/secrets.toml`
 **Pages** — the segmented control at the top switches between:
 
 1. **Market Overview** — city-wide context: headline KPIs, Dubai Market
-   Pulse (median/mean daily prices, weekly momentum), market-tier trends,
-   an opportunity scanner by neighbourhood, and charts for the filtered
-   selection.
+   Pulse (median/mean daily prices, weekly momentum), and market-tier
+   trends.
 
    ![Market Overview](reports/figures/screenshot_market_overview.png)
 
-2. **Fair Value Model** — the deal scanner (screenshot at the top):
+2. **Buyer Opportunity Scanner** — a below-median deal finder for one
+   zone at a time:
+   each transaction's AED/sqft against the zone's 14-day rolling median,
+   an adjustable deal threshold, a ranked below-median deals table with
+   CSV download, and deal counts across zones to guide which zone to open
+   next. Loads only when this page is selected, keeping Market Overview
+   fast.
+
+3. **Fair Value Model** — the deal scanner (screenshot at the top):
    - **Sidebar filters** (shared with Overview): neighbourhoods, bedroom
      type, date range. The Transaction Type filter doesn't apply here — this
      page always analyses Sales.
@@ -160,7 +167,7 @@ value — corroborated", not proof of a forced sale.
 ## Repository layout
 
 ```
-dubai_dashboard.py       # Streamlit entrypoint (Market Overview + page routing)
+dubai_dashboard.py       # Streamlit entrypoint (Market Overview, Buyer Opportunity Scanner + page routing)
 fair_value_tab.py        # Fair Value page UI
 dashboard_constants.py   # shared constants (areas, tiers, unit conversion)
 ingestion/               # DLD API client, GCS storage, snapshot & reference pulls
