@@ -34,6 +34,10 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --probe-rents  # print raw Ejari columns (minutes)
 .\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --only rents   # long pull (~2-4h, chunked; publishes rent_index + both Rent Scanner artifacts)
 
+# Audit the Ejari feed + rent artifacts after a rents refresh (duplicates,
+# types, outliers, gaps, pagination sentinel; writes reports/rent_data_quality_report.md)
+.\.venv\Scripts\python.exe -m tests.audit_rent_data_quality --check-pagination
+
 # Offline fair-value model checks and optimization
 .\.venv\Scripts\python.exe -m tests.smoke_test_fair_value
 .\.venv\Scripts\python.exe -m model.optimize_fair_value
@@ -134,9 +138,13 @@ sanitization), plus the Rent Scanner artifacts from the same pull:
 n/median/q1/q3/p10/p90, including an "All" band — quantiles don't compose
 across bands — and a `segment` all/new column) and
 `rent_recent_contracts.parquet` (contract-level slim rows for the 20 scanner
-districts, trailing 183 days, deduped). `--probe-rents` prints the raw Ejari
-columns in minutes — run it before the long pull to confirm the optional
-`contract_reg_type_en` (new-vs-renewal) field name. `sale_index.parquet` is also pulled but the gateway dataset is
+districts, trailing 183 days, deduped). The pull pages by `contract_id`
+(stable pagination — date ordering duplicated AND skipped ~25% of rows),
+dedupes on (contract_id, line_number) plus one row per single-property
+contract, and excludes bulk `no_of_prop>1` contracts whose annual_amount is
+a contract total, not a unit rent (IAAO allocated-price rule). `--probe-rents`
+prints the raw Ejari columns in minutes — run it before the long pull to
+confirm the optional `contract_reg_type_en` (new-vs-renewal) field name. `sale_index.parquet` is also pulled but the gateway dataset is
 frozen at 2024-05, so no model feature uses it. Long pulls are chunked so a
 gateway blip costs one chunk (HTTP 408 is retryable in `dda_api`).
 
@@ -161,6 +169,8 @@ Dubai Data API helper module. It handles:
 
 `DEFAULT_LOOKBACK_MONTHS = 24` and `DEFAULT_MAX_RECORDS = 1_000_000` size the default fetch window. `fetch_dataset_records` retries each page with exponential backoff (the gateway intermittently returns 502).
 
+Pagination MUST order by a unique key (`transaction_id` for sales, `contract_id` for rents): ordering by date shuffles page boundaries between requests — measured 11% (sales) and ~25% (rents) of rows both duplicated and silently skipped per window. The rent audit's `--check-pagination` is the regression sentinel.
+
 Default production endpoint:
 
 ```text
@@ -174,6 +184,19 @@ Small CLI diagnostic for the DDA connector. It verifies credentials, endpoint ac
 ### -m tests.smoke_test_gcs
 
 Small CLI diagnostic for Google Cloud Storage. It writes a tiny Polars Parquet file, reads it back, verifies the round trip, and deletes the test object unless `--keep-object` is supplied.
+
+### -m tests.audit_rent_data_quality
+
+Rigorous audit of the Ejari feed and the three rent artifacts, following
+`reports/data_cleaning_research_report.md` (IAAO reason codes, local-comp
+outlier bands, explicit duplicate definitions D1–D4, sensitivity tests
+against the scanner's weekly medians). Fetches a 2-month all-columns raw
+sample (stably ordered), checks types/nulls/bands, outliers vs zone×band
+comps, week/month/day gaps, cross-artifact integrity, and (with
+`--check-pagination`) re-measures the date-ordered paging defect as a
+regression sentinel. Writes `reports/rent_data_quality_report.md`; exits
+non-zero when open ACTION findings exist. Run after every rents refresh;
+alarm thresholds from the research: repairs > 0.2%, review-routed > 2%.
 
 ### -m ingestion.store_dld_transactions_gcs
 

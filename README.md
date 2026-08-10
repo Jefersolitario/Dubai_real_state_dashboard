@@ -24,7 +24,7 @@ flowchart LR
     I --> J[Human review UI\n+ CSV export]
 ```
 
-1. **Ingest** — `ingestion/` pulls DLD transactions (24 months, ~323k rows)
+1. **Ingest** — `ingestion/` pulls DLD transactions (24 months, ~363k rows)
    and reference datasets (projects, buildings, units registry, Ejari rents)
    into Google Cloud Storage. The raw snapshot is **never rewritten** with
    derived values; every downstream step runs from raw + code, so results are
@@ -183,7 +183,7 @@ rent_scanner_tab.py      # Rent Opportunity Scanner page UI
 dashboard_constants.py   # shared constants (areas, tiers, unit conversion)
 ingestion/               # DLD API client, GCS storage, snapshot & reference pulls
 model/                   # fair-value model, data cleaning, training, optimization, backtest
-tests/                   # smoke tests (API, GCS, end-to-end model)
+tests/                   # smoke tests (API, GCS, model) + rent data-quality audit
 reports/                 # research & results reports with findings (+ figures/)
 docs/                    # access notes, phase-3 plan
 ```
@@ -197,6 +197,13 @@ python -m ingestion.store_dld_transactions_gcs
 # Refresh reference datasets (projects/buildings/units; monthly is plenty)
 python -m ingestion.store_reference_data_gcs --only projects buildings units
 
+# Refresh Ejari rents + both Rent Scanner artifacts (long pull, ~2.5h)
+python -m ingestion.store_reference_data_gcs --only rents
+
+# Audit the rent feed & artifacts after a rents refresh
+# (duplicates, types, outliers, gaps, pagination; writes reports/rent_data_quality_report.md)
+python -m tests.audit_rent_data_quality --check-pagination
+
 # Retrain offline and publish the inference bundle (weekly, after refresh)
 python -m model.train_fair_value
 
@@ -208,6 +215,10 @@ The deployed app never trains — it loads the published bundle (6h cache).
 Monitoring rules: retrain weekly (a 4-month-stale model overstates fair
 values ≈1.1% in a falling market); alarm if the live monthly median spread
 drifts beyond ±2% or cleaning counts jump (repairs > 0.2%, review > 2%).
+All gateway fetches page by a unique key (`transaction_id` for sales,
+`contract_id` for rents) — paging by date shuffled page boundaries between
+requests and both duplicated and silently skipped 11–25% of rows; the rent
+audit's pagination check is the regression sentinel for this.
 
 ## Reports index
 
@@ -219,6 +230,7 @@ drifts beyond ±2% or cleaning counts jump (repairs > 0.2%, review > 2%).
 | `reports/data_cleaning_report.md` | Cleaning rules, real-data counts, enable decision |
 | `reports/data_cleaning_research_report.md` | Industry best-practice review (IAAO, Land Registry…) |
 | `reports/data_quality_report.md` | DLD snapshot audit (procedures, distributions) |
+| `reports/rent_data_quality_report.md` | Ejari feed & rent-artifact audit (duplicates, pagination, outliers, gaps) |
 | `reports/features_research_report.md` | Home-price-driver research behind the feature groups |
 | `reports/building_quality_research_report.md` | Building reviews / comfort research (Phase 3 input) |
 | `docs/phase3_plan.md` | Planned: Google reviews, live listings (Bayut/dubizzle) |
@@ -260,8 +272,10 @@ Bucket: dubai-real-estate-dashboard-jef (EU multi-region, uniform access, public
 Service account: dubai-dashboard-gcs@realstateproject-500813.iam.gserviceaccount.com (Storage Object Admin)
 ```
 
-Current snapshot: **323,170 rows, 24 months** (verified row count, columns,
-dedup, and date coverage on every refresh).
+Current snapshot: **363,219 rows, 24 months** (verified row count, columns,
+dedup, and date coverage on every refresh; rebuilt 2026-08-10 with stable
+`transaction_id` pagination, recovering ~40k transactions that date-ordered
+paging had silently skipped).
 
 ## Commit safety
 
