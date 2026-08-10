@@ -255,12 +255,17 @@ def pull_sale_index(config: "DDAConfig", secrets: dict) -> None:
     upload(secrets, "sale_index.parquet", monthly)
 
 
+# The feed writes both spaced and unspaced variants ("2 bed rooms+hall" and
+# "1bed room+Hall") — the unspaced 1BR label alone was 41% of flats in the
+# 2026-07 audit sample, so every count needs both needles.
 ROOMS_BAND_MAP = {
     "studio": "Studio",
-    "1 bed": "1BR", "one bed": "1BR",
-    "2 bed": "2BR", "two bed": "2BR",
-    "3 bed": "3BR", "three bed": "3BR",
+    "1 bed": "1BR", "one bed": "1BR", "1bed": "1BR",
+    "2 bed": "2BR", "two bed": "2BR", "2bed": "2BR",
+    "3 bed": "3BR", "three bed": "3BR", "3bed": "3BR",
     "4 bed": "4BR+", "five": "4BR+", "5 bed": "4BR+", "penthouse": "4BR+",
+    "4bed": "4BR+", "5bed": "4BR+", "6 bed": "4BR+", "7 bed": "4BR+",
+    "8 bed": "4BR+",
 }
 
 
@@ -300,6 +305,11 @@ def _slim_rents(chunk: pl.DataFrame) -> pl.DataFrame:
         .alias("AREA_EN"),
         rooms_band_expr().alias("rooms_band"),
         pl.col("ejari_property_type_en").cast(pl.Utf8).alias("ptype"),
+        # Row identity for pagination dedupe, plus the bulk-contract flag
+        # (IAAO: allocated bulk amounts are not unit prices).
+        pl.col("contract_id").cast(pl.Utf8),
+        pl.col("line_number").cast(pl.Int64, strict=False),
+        pl.col("no_of_prop").cast(pl.Int64, strict=False),
         pl.lit(1).alias("_raw_row"),
     ]
     # New-vs-renewal flag: RERA caps renewal rents below market, so the rent
@@ -356,7 +366,10 @@ def _weekly_stats(rents: pl.DataFrame) -> pl.DataFrame:
 def _recent_contracts(rents: pl.DataFrame) -> pl.DataFrame:
     """Contract-level slim rows: 20 scanner districts, trailing RENT_RECENT_DAYS."""
     cutoff = date.today() - timedelta(days=RENT_RECENT_DAYS)
-    cols = ["start", "AREA_EN", "rooms_band", "size_sqft", "annual_amount", "rent_psf"]
+    # contract_id keeps row identity honest: .unique() below then removes
+    # only true repeats, never two genuinely identical units let the same day.
+    cols = ["start", "AREA_EN", "rooms_band", "size_sqft", "annual_amount",
+            "rent_psf", "contract_id"]
     if "reg_type" in rents.columns:
         cols.append("reg_type")
     return (
@@ -425,7 +438,12 @@ def pull_rents(config: "DDAConfig", secrets: dict) -> None:
                     f"contract_start_date>='{lo.isoformat()}' AND "
                     f"contract_start_date<'{hi.isoformat()}'"
                 ),
-                "order_by": "contract_start_date",
+                # contract_id ordering is STABLE across page requests.
+                # Ordering by contract_start_date (thousands of ties per day)
+                # shuffled page boundaries between requests: measured on
+                # 2026-07 it duplicated ~25% of rows AND silently skipped a
+                # different ~25% of contracts (rent_data_quality_report.md).
+                "order_by": "contract_id",
                 "order_dir": "asc",
             },
         )
@@ -435,6 +453,12 @@ def pull_rents(config: "DDAConfig", secrets: dict) -> None:
                         max_records=1_000_000, transform=_slim_rents)
     if raw.is_empty():
         raise RuntimeError("rents pull returned no records; not overwriting GCS")
+
+    # Belt-and-braces after the stable ordering: only boundary repeats remain.
+    n_fetched = raw.height
+    raw = raw.unique(subset=["contract_id", "line_number"], keep="first")
+    if raw.height != n_fetched:
+        print(f"pagination dedupe: {n_fetched:,} -> {raw.height:,} rows", flush=True)
 
     n0 = raw.height
     rents = raw.drop("_raw_row").drop_nulls(["start", "annual_amount", "AREA_EN"])
@@ -446,6 +470,10 @@ def pull_rents(config: "DDAConfig", secrets: dict) -> None:
         & (pl.col("actual_area") >= RENT_AREA_MIN)
         & (pl.col("actual_area") <= RENT_AREA_MAX)
         & pl.col("ptype").str.to_lowercase().str.contains("flat")
+        # IAAO: allocated bulk amounts are disqualified — no_of_prop>1 rows
+        # stamp the contract TOTAL against a single unit's area (measured
+        # median PSF 17x the single-unit median in the audit sample).
+        & (pl.col("no_of_prop") <= 1)
     ).with_columns(
         (pl.col("annual_amount") / (pl.col("actual_area") * SQM_TO_SQFT)).alias("rent_psf"),
         pl.col("start").dt.truncate("1w").alias("week"),

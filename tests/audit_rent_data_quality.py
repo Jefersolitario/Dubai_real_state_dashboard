@@ -86,7 +86,9 @@ def fetch_raw_sample(months) -> tuple[pl.DataFrame, dict]:
                     "property_usage_en='Residential' AND "
                     f"contract_start_date>='{lo}' AND contract_start_date<'{hi}'"
                 ),
-                "order_by": "contract_start_date",
+                # Stable pagination — see the pagination check below for why
+                # date ordering must never be used for paging this dataset.
+                "order_by": "contract_id",
                 "order_dir": "asc",
             },
             max_records=200_000,
@@ -142,8 +144,10 @@ def audit_duplicates(raw: pl.DataFrame) -> pl.DataFrame:
         f"{d2_groups.height:,} duplicated keys, {conflicting:,} with conflicting amount/area",
         "none needed" if d2_surplus == 0 else "dedupe on (contract_id, line_number) keeping latest load_timestamp")
 
-    # D3: multi-line contracts (NOT duplicates — multi-property contracts)
-    lines = work.group_by("contract_id").agg(
+    # D3: multi-line contracts (NOT duplicates — multi-property contracts).
+    # Dedupe on the row key first: D2 repeats would otherwise masquerade as
+    # extra lines and swamp the real multi-property count.
+    lines = work.unique(subset=key, keep="first").group_by("contract_id").agg(
         pl.len().alias("lines"), pl.col("no_of_prop").max().alias("props")
     )
     multi = lines.filter(pl.col("lines") > 1)
@@ -171,6 +175,46 @@ def audit_duplicates(raw: pl.DataFrame) -> pl.DataFrame:
 
     surplus = work.join(d2_groups.select(key), on=key, how="inner") if d2_groups.height else work.head(0)
     return surplus
+
+
+def audit_pagination(raw_by_id: pl.DataFrame) -> None:
+    """Regression check: date-ordered paging must not duplicate/skip rows.
+
+    Fetches the first sample month ordered by contract_start_date (the
+    ordering the pull used before the fix) and diffs row keys against the
+    contract_id-ordered sample. Measured 2026-08: date ordering duplicated
+    ~25% of rows and skipped a different ~25% entirely.
+    """
+    month = raw_by_id["_sample_month"].min()
+    lo = f"{month}-01"
+    year, m = int(month[:4]), int(month[5:7])
+    hi = f"{year + (m == 12)}-{(m % 12) + 1:02d}-01"
+    config = load_dda_config(load_local_secrets())
+    cfg = replace(config, dataset="dld_rent_contracts-open-api")
+    records = fetch_dataset_records(
+        cfg,
+        params={
+            "filter": (
+                "property_usage_en='Residential' AND "
+                f"contract_start_date>='{lo}' AND contract_start_date<'{hi}'"
+            ),
+            "order_by": "contract_start_date",
+            "order_dir": "asc",
+        },
+        max_records=200_000,
+    )
+    by_date = pl.DataFrame(records, infer_schema_length=None)
+    key = ["contract_id", "line_number"]
+    ids = raw_by_id.filter(pl.col("_sample_month") == month).select(key).unique()
+    dates = by_date.select(key).unique()
+    dupes = by_date.height - dates.height
+    skipped = ids.join(dates, on=key, how="anti").height
+    add("1 Duplicates", "pagination stability (date-ordered fetch)",
+        OK if (dupes / max(by_date.height, 1) < 0.01 and skipped / max(ids.height, 1) < 0.01) else ACTION,
+        f"{dupes:,} dupes, {skipped:,} skipped of {ids.height:,} ({month})",
+        "date-ordered paging vs the contract_id-ordered sample",
+        "keep order_by=contract_id in every Ejari fetch"
+        if dupes or skipped else "none needed")
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +720,8 @@ def main() -> int:
     parser.add_argument("--raw-parquet", help="reuse a saved raw sample parquet")
     parser.add_argument("--type-census", help="json with the wire-type census for --raw-parquet")
     parser.add_argument("--raw-only", action="store_true", help="skip GCS artifact checks")
+    parser.add_argument("--check-pagination", action="store_true",
+                        help="refetch one month date-ordered and diff (regression check)")
     parser.add_argument("--pull-log", help="rents pull output file for month-level gap checks")
     parser.add_argument("--out", default="reports/rent_data_quality_report.md")
     args = parser.parse_args()
@@ -691,6 +737,8 @@ def main() -> int:
     context = f"raw sample: {raw.height:,} rows ({', '.join(months)})"
 
     d2_surplus = audit_duplicates(raw)
+    if args.check_pagination:
+        audit_pagination(raw)
     audit_types_and_missing(raw, census)
     audit_outliers(raw, d2_surplus)
 
