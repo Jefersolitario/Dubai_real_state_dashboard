@@ -468,7 +468,14 @@ def build_dld_transactions_params(
         filters.append(f"instance_date<='{end.strftime('%Y-%m-%d')}'")
 
     params = {
-        "order_by": "instance_date",
+        # transaction_id ordering is STABLE across page requests. Ordering by
+        # instance_date (hundreds of ties per day) shuffled page boundaries
+        # between requests: measured on 2026-07 flats it duplicated 11.3% of
+        # rows and silently skipped an equal number of distinct transactions.
+        # Note transaction_id embeds the year, so order_desc no longer means
+        # strictly newest-first — irrelevant for complete (uncapped) windows,
+        # which is how every caller uses this.
+        "order_by": "transaction_id",
         "order_dir": "desc" if order_desc else "asc",
     }
     if filters:
