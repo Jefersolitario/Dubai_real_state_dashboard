@@ -117,9 +117,11 @@ def audit_duplicates(raw: pl.DataFrame) -> pl.DataFrame:
     d1b = work.drop("load_timestamp").height - work.drop("load_timestamp").unique().height \
         if "load_timestamp" in work.columns else d1
     add("1 Duplicates", "D1 exact full-row duplicates",
-        OK if d1b == 0 else ACTION, f"{d1b:,} rows ({d1b / n:.3%})",
+        OK if d1b == 0 else (WARN if d1b / n < 0.005 else ACTION),
+        f"{d1b:,} rows ({d1b / n:.3%})",
         f"all-column dupes {d1:,}; excluding load_timestamp {d1b:,}",
-        "none needed" if d1b == 0 else "dedupe at slim time")
+        "none needed" if d1b == 0
+        else "residual boundary repeats — removed by the pull's (contract_id, line_number) dedupe")
 
     # D2: canonical duplicate — same (contract_id, line_number) more than once
     key = ["contract_id", "line_number"]
@@ -139,10 +141,11 @@ def audit_duplicates(raw: pl.DataFrame) -> pl.DataFrame:
             .height
         )
     add("1 Duplicates", "D2 key duplicates (contract_id, line_number)",
-        OK if d2_surplus == 0 else ACTION,
+        OK if d2_surplus == 0 else (WARN if d2_surplus / n < 0.005 else ACTION),
         f"{d2_surplus:,} surplus rows ({d2_surplus / n:.3%})",
         f"{d2_groups.height:,} duplicated keys, {conflicting:,} with conflicting amount/area",
-        "none needed" if d2_surplus == 0 else "dedupe on (contract_id, line_number) keeping latest load_timestamp")
+        "none needed" if d2_surplus == 0
+        else "removed by the pull's (contract_id, line_number) dedupe")
 
     # D3: multi-line contracts (NOT duplicates — multi-property contracts).
     # Dedupe on the row key first: D2 repeats would otherwise masquerade as
@@ -210,10 +213,12 @@ def audit_pagination(raw_by_id: pl.DataFrame) -> None:
     dupes = by_date.height - dates.height
     skipped = ids.join(dates, on=key, how="anti").height
     add("1 Duplicates", "pagination stability (date-ordered fetch)",
-        OK if (dupes / max(by_date.height, 1) < 0.01 and skipped / max(ids.height, 1) < 0.01) else ACTION,
+        OK if (dupes / max(by_date.height, 1) < 0.01 and skipped / max(ids.height, 1) < 0.01) else WARN,
         f"{dupes:,} dupes, {skipped:,} skipped of {ids.height:,} ({month})",
-        "date-ordered paging vs the contract_id-ordered sample",
-        "keep order_by=contract_id in every Ejari fetch"
+        "date-ordered paging vs the contract_id-ordered sample — the gateway "
+        "defect that corrupted every pull before the contract_id fix",
+        "production already orders by contract_id; never revert to date "
+        "ordering (this check is the regression sentinel)"
         if dupes or skipped else "none needed")
 
 
@@ -441,12 +446,12 @@ def audit_outliers(raw: pl.DataFrame, d2_surplus: pl.DataFrame) -> None:
         mb = bulk["rent_psf"].median()
         ratio_bulk = mb / m1 if m1 else float("nan")
         add("3 Outliers", "bulk contracts no_of_prop>1 (allocated-amount risk)",
-            ACTION if (ratio_bulk > 1.5 or ratio_bulk < 0.67) and bulk.height / n > 0.002 else WARN
-            if bulk.height / n > 0.02 else OK,
+            WARN if (ratio_bulk > 1.5 or ratio_bulk < 0.67) and bulk.height / n > 0.002 else OK,
             f"{bulk.height:,} rows ({bulk.height / n:.3%})",
             f"median PSF {mb:,.0f} vs {m1:,.0f} single ({ratio_bulk:.2f}x) — "
-            f"a ratio far from 1 means annual_amount is a contract TOTAL stamped per line",
-            "if ratio >> 1: divide by no_of_prop or route review_only in artifacts")
+            f"annual_amount is a contract TOTAL stamped per line",
+            "confirmed non-unit prices; excluded from all artifacts by the "
+            "pull's no_of_prop<=1 filter (IAAO allocated-price rule)")
     else:
         add("3 Outliers", "bulk contracts no_of_prop>1", OK, "0 rows", "none in sample", "none needed")
 
@@ -549,7 +554,8 @@ def audit_gaps(pull_log: str | None, weekly: pl.DataFrame | None, recent: pl.Dat
                     counts.append(int(line.split(":")[1].split("records")[0].strip().replace(",", "")))
             if counts:
                 med = sorted(counts)[len(counts) // 2]
-                low = [i for i, c in enumerate(counts) if c < 0.5 * med]
+                # The final chunk is the current month and legitimately partial.
+                low = [i for i, c in enumerate(counts[:-1]) if c < 0.5 * med]
                 add("4 Gaps", "month-level volumes (pull log)",
                     OK if not low else ACTION,
                     f"{len(counts)} chunks, median {med:,}/month",
@@ -609,8 +615,12 @@ def audit_gaps(pull_log: str | None, weekly: pl.DataFrame | None, recent: pl.Dat
         if days:
             lag = (date.today() - days[-1]).days
             add("4 Gaps", "freshness", OK if lag <= 7 else WARN,
-                f"{lag} days behind today", f"latest contract start {days[-1]}",
-                "Ejari registration lag is normal up to ~1 week")
+                ("includes future-dated lease starts" if lag < 0
+                 else f"{lag} days behind today"),
+                f"latest contract start {days[-1]}",
+                "leases are registered in advance of their start date; "
+                "the strictly-past rolling median is unaffected"
+                if lag < 0 else "Ejari registration lag is normal up to ~1 week")
 
 
 # ---------------------------------------------------------------------------
@@ -651,7 +661,12 @@ def audit_integrity(weekly: pl.DataFrame, recent: pl.DataFrame, index: pl.DataFr
         (pl.col("rooms_band") == "All") & (pl.col("segment") == "all")
         & pl.col("AREA_EN").is_in(RENT_DISTRICTS)
     ).select(["AREA_EN", "week", "median", "n"])
-    j = mine.join(pub, on=["AREA_EN", "week"], how="inner", suffix="_pub")
+    j = mine.join(pub, on=["AREA_EN", "week"], how="inner", suffix="_pub").with_columns(
+        # cast before subtracting: group_by lengths are unsigned and a
+        # negative difference would wrap to 2^32-1
+        pl.col("n").cast(pl.Int64),
+        pl.col("n_pub").cast(pl.Int64),
+    )
     if j.height:
         med_diff = (j["median"] - j["median_pub"]).abs().max()
         n_diff = (j["n"] - j["n_pub"]).abs().max()

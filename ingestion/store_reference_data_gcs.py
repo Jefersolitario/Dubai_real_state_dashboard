@@ -478,6 +478,12 @@ def pull_rents(config: "DDAConfig", secrets: dict) -> None:
         (pl.col("annual_amount") / (pl.col("actual_area") * SQM_TO_SQFT)).alias("rent_psf"),
         pl.col("start").dt.truncate("1w").alias("week"),
     )
+    # Feed quirk: ~0.1% of single-property contracts carry duplicate lines
+    # (same lease registered twice with line_number 1..n despite no_of_prop=1).
+    # One contract = one lease observation, so keep one row per contract_id —
+    # this also keeps rent_weekly_stats consistent with the deduped
+    # rent_recent_contracts artifact.
+    rents = rents.unique(subset=["contract_id"], keep="first")
     print(f"Ejari sanitization: {n0:,} -> {rents.height:,} usable flat contracts", flush=True)
 
     # Weekly grid: value at week w = median rent PSF over contracts starting in
