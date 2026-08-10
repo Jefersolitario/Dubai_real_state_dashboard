@@ -28,9 +28,11 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m ingestion.store_dld_transactions_gcs --full-refresh --last-months 24
 
 # Pull DLD reference datasets into GCS dld_reference/ (projects, buildings,
-# service charges, units registry, Ejari rent grid; --only to pick subsets)
+# service charges, units registry, Ejari rent grid + Rent Scanner artifacts;
+# --only to pick subsets)
 .\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --only projects buildings units
-.\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --only rents   # long pull (~2-4h, chunked)
+.\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --probe-rents  # print raw Ejari columns (minutes)
+.\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --only rents   # long pull (~2-4h, chunked; publishes rent_index + both Rent Scanner artifacts)
 
 # Offline fair-value model checks and optimization
 .\.venv\Scripts\python.exe -m tests.smoke_test_fair_value
@@ -55,7 +57,7 @@ Single-file Streamlit app with this flow:
 3. **Data normalization** - maps DDA API columns into the dashboard schema.
 4. **Aggregation helpers** - daily, weekly, Dubai-wide, tier, and area-level metrics using Polars.
 5. **Chart builders** - Plotly figures for price trends, volume, momentum, tiers, and scatter views.
-6. **Streamlit UI** - three pages via `st.segmented_control` (not `st.tabs`, which executes every tab body on each rerun): "Market Overview" (`_render_market_overview`: headline KPIs, Dubai Market Pulse, tier trends), "Buyer Opportunity Scanner" (`_render_zone_analysis`: zone picker + deal-threshold slider driving `_render_zone_deal_finder` — zone KPIs, diverging below-median scanner (`zone_psf_chart`), ranked deals table + CSV (transfers >60% below the median are excluded as non-market token prices), per-zone deal counts (`deals_by_zone_chart`) — plus the raw-data table; only rendered when selected), and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`, lazy — model bundle load and scoring only run when this page is selected); shared sidebar filters.
+6. **Streamlit UI** - four pages via `st.segmented_control` (not `st.tabs`, which executes every tab body on each rerun): "Market Overview" (`_render_market_overview`: headline KPIs, Dubai Market Pulse, tier trends), "Buyer Opportunity Scanner" (`_render_zone_analysis`: zone picker + deal-threshold slider driving `_render_zone_deal_finder` — zone KPIs, diverging below-median scanner (`zone_psf_chart`), ranked deals table + CSV (transfers >60% below the median are excluded as non-market token prices), per-zone deal counts (`deals_by_zone_chart`) — plus the raw-data table; only rendered when selected), "Rent Scanner" (`render_rent_scanner` from `rent_scanner_tab.py`, lazy — Ejari contracts vs the zone's 14-day median rent: dot view + deals table for windows ≤92 days inside the contract artifact's coverage, weekly percentile box plots otherwise; renewals excluded by default when the reg-type flag exists; shares `zone_select` with the sales scanner), and "Fair Value Model" (`render_fair_value_tab` from `fair_value_tab.py`, lazy — model bundle load and scoring only run when this page is selected); shared sidebar filters.
 
 ### dashboard_constants.py (root)
 
@@ -89,6 +91,23 @@ measured before enabling per `reports/data_cleaning_report.md`).
 
 Streamlit UI for the Fair Value tab. Caching contract: `get_features` (one untrimmed feature pass per data version, full history — trailing comps need the past; loads GCS reference frames when the shipped config requires them), `get_model` (loads the pre-trained GCS bundle), `get_scored(data_version, score_start, score_end, _result)` (threshold-independent predictions for the selected scoring window only; default "Last month" keeps the tab fast); the threshold slider only re-runs `flag_distress`. The flagged table ranks distressed-first then by `signal_strength`; `FEATURE_LABELS` maps model feature names to plain language for the importance chart.
 
+### rent_scanner_tab.py (root)
+
+Streamlit UI for the Rent Opportunity Scanner (tenant view of Ejari rents,
+all figures annual AED/sqft/yr). Caching contract: `load_rent_artifacts`
+(resource cache, 6h TTL) reads `rent_weekly_stats.parquet` +
+`rent_recent_contracts.parquet` from GCS and derives `rent_version` from
+`blob.updated` — the sales snapshot's `data_version` never keys rent caches;
+`generate_rent_psf_timeseries` (data cache, `max_entries=4`) slices the
+contract frame per filter selection. `use_dot_view` picks the view: raw dots
++ ranked below-median deals table for windows ≤`RENT_DOT_MAX_DAYS` (92) that
+the contract artifact covers, weekly precomputed box plots (q1–q3 box,
+p10–p90 whiskers) otherwise. Renewals (RERA-capped) are excluded by default
+via an anchored `^new` match on `reg_type` when the flag exists; token rents
+beyond −60% vs the median are excluded like the sales scanner. Ejari has no
+building key, so deal rows are zone × rooms × size only. The page shows an
+actionable error until `--only rents` has published the artifacts.
+
 ### model/train_fair_value.py
 
 Offline training CLI: loads the snapshot, trains the shipping configuration,
@@ -110,7 +129,14 @@ project), `service_charges.parquet` (latest budget year), `units_slim.parquet`
 (flats registry: floor, exact area, balcony — chunked by rooms), and
 `rent_index.parquet` (weekly AREA_EN × rooms-band trailing-180d median rent
 PSF, strictly past, built from a monthly-chunked Ejari pull with
-sanitization). `sale_index.parquet` is also pulled but the gateway dataset is
+sanitization), plus the Rent Scanner artifacts from the same pull:
+`rent_weekly_stats.parquet` (weekly AREA_EN × rooms-band percentile stats
+n/median/q1/q3/p10/p90, including an "All" band — quantiles don't compose
+across bands — and a `segment` all/new column) and
+`rent_recent_contracts.parquet` (contract-level slim rows for the 20 scanner
+districts, trailing 183 days, deduped). `--probe-rents` prints the raw Ejari
+columns in minutes — run it before the long pull to confirm the optional
+`contract_reg_type_en` (new-vs-renewal) field name. `sale_index.parquet` is also pulled but the gateway dataset is
 frozen at 2024-05, so no model feature uses it. Long pulls are chunked so a
 gateway blip costs one chunk (HTTP 408 is retryable in `dda_api`).
 

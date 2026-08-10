@@ -134,6 +134,23 @@ def bedroom_type_expr() -> pl.Expr:
     return pl.col("ROOMS_EN").cast(pl.Utf8).str.replace(" B/R", "BR")
 
 
+def y_cap_range(values: pl.Series, pad: float = 1.1) -> list[float] | None:
+    """[0, p99*pad] axis range when extreme outliers would squash the chart.
+
+    Returns None (Plotly autorange) unless the max exceeds 1.5x the 99th
+    percentile, so ordinary data keeps the automatic axis. "lower"
+    interpolation keeps the quantile below the max even for small samples,
+    where "nearest" would land on the max itself and never trigger.
+    """
+    if values.len() == 0:
+        return None
+    cap = values.quantile(0.99, interpolation="lower")
+    vmax = values.max()
+    if cap is None or vmax is None or vmax <= cap * 1.5:
+        return None
+    return [0.0, cap * pad]
+
+
 def layout_defaults(title: str) -> dict:
     """Shared dark-theme Plotly layout. Must not include margin —
     individual charts set margins themselves (see CLAUDE.md)."""

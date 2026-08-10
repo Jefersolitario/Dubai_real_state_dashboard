@@ -60,8 +60,10 @@ from dashboard_constants import (
     TIER_ORDER,
     area_display_expr as _area_display_expr,
     layout_defaults as _layout_defaults,
+    y_cap_range as _y_cap_range,
 )
 from fair_value_tab import render_fair_value_tab
+from rent_scanner_tab import render_rent_scanner
 
 LOGGER = logging.getLogger(__name__)
 
@@ -918,22 +920,7 @@ def apply_filters(
 # ---------------------------------------------------------------------------
 # Chart builders (Plotly)
 # ---------------------------------------------------------------------------
-
-def _y_cap_range(values: pl.Series, pad: float = 1.1) -> list[float] | None:
-    """[0, p99*pad] axis range when extreme outliers would squash the chart.
-
-    Returns None (Plotly autorange) unless the max exceeds 1.5x the 99th
-    percentile, so ordinary data keeps the automatic axis. "lower"
-    interpolation keeps the quantile below the max even for small samples,
-    where "nearest" would land on the max itself and never trigger.
-    """
-    if values.len() == 0:
-        return None
-    cap = values.quantile(0.99, interpolation="lower")
-    vmax = values.max()
-    if cap is None or vmax is None or vmax <= cap * 1.5:
-        return None
-    return [0.0, cap * pad]
+# _y_cap_range lives in dashboard_constants (shared with rent_scanner_tab).
 
 
 
@@ -1771,7 +1758,12 @@ if not neighborhoods:
 # when the user never opens the Fair Value view. Only the active page runs,
 # which likewise keeps the Buyer Opportunity Scanner charts and CSV build
 # off the other pages' rerun path.
-_PAGE_OPTIONS = ["📊 Market Overview", "🔎 Buyer Opportunity Scanner", "🎯 Fair Value Model"]
+_PAGE_OPTIONS = [
+    "📊 Market Overview",
+    "🔎 Buyer Opportunity Scanner",
+    "🔑 Rent Scanner",
+    "🎯 Fair Value Model",
+]
 # A stored label from before a page rename (or a deselected None) would no
 # longer match the options and crash the widget — drop it first.
 if st.session_state.get("active_page") not in _PAGE_OPTIONS:
@@ -1791,12 +1783,31 @@ if active_page is None:
 # Streamlit drops the state of widgets that are not rendered in a run; the
 # Fair Value and Buyer Opportunity Scanner widgets disappear while another page is shown,
 # so re-assign their keys every run to keep the user's selections alive.
-for _page_key in ("fv_window", "fv_threshold", "zone_select", "zone_threshold"):
+for _page_key in (
+    "fv_window",
+    "fv_threshold",
+    "zone_select",
+    "zone_threshold",
+    "rent_threshold",
+    "rent_incl_renewals",
+):
     if _page_key in st.session_state:
         st.session_state[_page_key] = st.session_state[_page_key]
 
 if active_page == "🎯 Fair Value Model":
     render_fair_value_tab(neighborhoods, bedroom, start_date, end_date, data_version)
+elif active_page == "🔑 Rent Scanner":
+    # Rent data lives in its own GCS artifacts — no DAILY_DATA/apply_filters
+    # here, and all rent reads happen inside the page module (lazy). The
+    # sales PSF generator is injected for the implied-gross-yield KPI.
+    render_rent_scanner(
+        neighborhoods,
+        bedroom,
+        start_date,
+        end_date,
+        generate_area_psf_timeseries,
+        data_version,
+    )
 elif active_page == "🔎 Buyer Opportunity Scanner":
     # Fair Value never consumes the filtered frame — compute it only on the
     # pages that do, so Fair Value interactions don't pay for an unused

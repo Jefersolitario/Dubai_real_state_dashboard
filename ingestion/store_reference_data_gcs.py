@@ -8,9 +8,17 @@ service_charge feature groups:
 - service_charges.parquet     latest budget-year service cost per project
 - rent_index.parquet          weekly area x rooms-band grid of trailing-180d
                               median rent PSF (strictly past per week)
+- rent_weekly_stats.parquet   weekly area x rooms-band percentile stats of
+                              rent PSF (n/median/q1/q3/p10/p90, incl. an
+                              "All" band and a segment column) for the Rent
+                              Opportunity Scanner's box view
+- rent_recent_contracts.parquet  contract-level slim rows for the 20 scanner
+                              districts, trailing RENT_RECENT_DAYS, for the
+                              scanner's dot view and deals table
 
 Usage:
     python -m ingestion.store_reference_data_gcs --only projects buildings service
+    python -m ingestion.store_reference_data_gcs --probe-rents    # print raw Ejari columns (minutes)
     python -m ingestion.store_reference_data_gcs --only rents     # long pull (~2-4h)
     python -m ingestion.store_reference_data_gcs                  # everything
 """
@@ -23,11 +31,11 @@ import sys
 import time
 from dataclasses import replace
 from typing import Callable
-from datetime import date
+from datetime import date, timedelta
 
 import polars as pl
 
-from dashboard_constants import SQM_TO_SQFT
+from dashboard_constants import AREA_DISPLAY, NEIGHBORHOODS, SQM_TO_SQFT
 from ingestion.dda_api import DDAConfig, fetch_dataset_records, load_dda_config
 from ingestion.gcs_storage import dataframe_to_parquet_bytes, gcs_client, load_local_secrets, setting
 
@@ -39,6 +47,26 @@ RENTS_START = date(2024, 1, 1)
 RENT_YEAR_MIN, RENT_YEAR_MAX = 2020, 2027
 RENT_ANNUAL_MIN, RENT_ANNUAL_MAX = 5_000, 5_000_000
 RENT_AREA_MIN, RENT_AREA_MAX = 15.0, 1_000.0  # sqm
+
+# Contract-level rent artifact: trailing window and the 20 scanner districts
+# (official DLD names whose display name is in the sidebar NEIGHBORHOODS
+# list) — restricted so the dashboard's resident memory stays bounded.
+RENT_RECENT_DAYS = 183
+RENT_DISTRICTS = sorted(
+    district
+    for district, display in AREA_DISPLAY.items()
+    if display in set(NEIGHBORHOODS)
+)
+
+# Raw Ejari fields --probe-rents highlights; names unverified until probed.
+RENT_PROBE_CANDIDATES = (
+    "contract_reg_type_en",
+    "contract_end_date",
+    "contract_amount",
+    "ejari_contract_number",
+    "no_of_prop",
+    "version",
+)
 
 
 def fetch_dataset(config: "DDAConfig", dataset: str, params: dict | None = None,
@@ -260,21 +288,128 @@ def _month_starts(start: date, end: date) -> list[date]:
 
 
 def _slim_rents(chunk: pl.DataFrame) -> pl.DataFrame:
-    """Reduce a raw Ejari chunk to the columns the weekly rent grid needs."""
-    return chunk.select(
+    """Reduce a raw Ejari chunk to the columns the rent artifacts need."""
+    cols = [
         pl.col("contract_start_date").cast(pl.Utf8).str.slice(0, 10)
         .str.to_date("%Y-%m-%d", strict=False).alias("start"),
         pl.col("annual_amount").cast(pl.Float64, strict=False),
         pl.col("actual_area").cast(pl.Float64, strict=False),
-        pl.col("area_name_en").cast(pl.Utf8).str.to_uppercase().alias("AREA_EN"),
+        # strip_chars matches the sales path (dda_api normalization) so the
+        # rent and sales AREA_EN vocabularies join cleanly.
+        pl.col("area_name_en").cast(pl.Utf8).str.to_uppercase().str.strip_chars()
+        .alias("AREA_EN"),
         rooms_band_expr().alias("rooms_band"),
         pl.col("ejari_property_type_en").cast(pl.Utf8).alias("ptype"),
         pl.lit(1).alias("_raw_row"),
+    ]
+    # New-vs-renewal flag: RERA caps renewal rents below market, so the rent
+    # scanner needs to separate them. Presence-guarded — confirm the raw
+    # field name with --probe-rents; fetch_chunked's diagonal_relaxed concat
+    # tolerates chunks with and without the column.
+    if "contract_reg_type_en" in chunk.columns:
+        cols.append(
+            pl.col("contract_reg_type_en").cast(pl.Utf8).str.strip_chars()
+            .alias("reg_type")
+        )
+    return chunk.select(cols)
+
+
+def _weekly_stats(rents: pl.DataFrame) -> pl.DataFrame:
+    """Per AREA_EN x rooms_band x week percentile stats, incl. an "All" band.
+
+    Quantiles are not composable across bands, so the "All" rows (which also
+    absorb null-band contracts) must be computed here, not in the app. The
+    segment column separates "all" contracts from "new" (non-renewal) ones
+    when the reg_type flag is available.
+    """
+    def stats(df: pl.DataFrame, band: pl.Expr, segment: str) -> pl.DataFrame:
+        return (
+            df.group_by("AREA_EN", band.alias("rooms_band"), "week")
+            .agg(
+                pl.len().alias("n"),
+                pl.col("rent_psf").median().round(1).alias("median"),
+                pl.col("rent_psf").quantile(0.25).round(1).alias("q1"),
+                pl.col("rent_psf").quantile(0.75).round(1).alias("q3"),
+                pl.col("rent_psf").quantile(0.10).round(1).alias("p10"),
+                pl.col("rent_psf").quantile(0.90).round(1).alias("p90"),
+            )
+            .with_columns(pl.lit(segment).alias("segment"))
+        )
+
+    frames = [
+        stats(rents.filter(pl.col("rooms_band").is_not_null()), pl.col("rooms_band"), "all"),
+        stats(rents, pl.lit("All"), "all"),
+    ]
+    if "reg_type" in rents.columns:
+        # Anchored match: "Renew"/"Renewal" also *contain* "new", so only a
+        # leading "New" identifies a genuinely new contract.
+        new = rents.filter(
+            pl.col("reg_type").str.contains(r"(?i)^new").fill_null(False)
+        )
+        frames.append(
+            stats(new.filter(pl.col("rooms_band").is_not_null()), pl.col("rooms_band"), "new")
+        )
+        frames.append(stats(new, pl.lit("All"), "new"))
+    return pl.concat(frames).sort("AREA_EN", "rooms_band", "week")
+
+
+def _recent_contracts(rents: pl.DataFrame) -> pl.DataFrame:
+    """Contract-level slim rows: 20 scanner districts, trailing RENT_RECENT_DAYS."""
+    cutoff = date.today() - timedelta(days=RENT_RECENT_DAYS)
+    cols = ["start", "AREA_EN", "rooms_band", "size_sqft", "annual_amount", "rent_psf"]
+    if "reg_type" in rents.columns:
+        cols.append("reg_type")
+    return (
+        rents.filter(
+            pl.col("AREA_EN").is_in(RENT_DISTRICTS) & (pl.col("start") >= cutoff)
+        )
+        .with_columns((pl.col("actual_area") * SQM_TO_SQFT).round(0).alias("size_sqft"))
+        .select(cols)
+        .unique()  # versioned/repeated gateway rows: exact-duplicate dedupe
+        .sort("AREA_EN", "start")
     )
 
 
+def probe_rents(config: "DDAConfig") -> int:
+    """Print the raw Ejari column names from a 5-record sample.
+
+    Run before the long rents pull to confirm the optional field names
+    (new-vs-renewal flag, contract end date) that _slim_rents keeps when
+    present. Needs DDA credentials only, no GCS.
+    """
+    cfg = replace(config, dataset="dld_rent_contracts-open-api")
+    records = fetch_dataset_records(
+        cfg,
+        params={
+            "filter": "property_usage_en='Residential'",
+            "order_by": "contract_start_date",
+            "order_dir": "desc",
+        },
+        page_size=5,
+        max_records=5,
+    )
+    if not records:
+        print("No records returned; cannot probe columns.")
+        return 1
+    names = sorted({key for record in records for key in record})
+    print(f"Raw Ejari columns ({len(names)}):")
+    for name in names:
+        print(f"  {name}")
+    matched = [c for c in RENT_PROBE_CANDIDATES if c in names]
+    print("Candidate fields matched: " + (", ".join(matched) if matched else "none"))
+    print("Sample record (values truncated to 60 chars):")
+    for name in names:
+        print(f"  {name} = {str(records[0].get(name, ''))[:60]}")
+    return 0
+
+
 def pull_rents(config: "DDAConfig", secrets: dict) -> None:
-    """Publish the weekly area x rooms-band trailing-180d rent-PSF grid."""
+    """Publish the rent grid plus the Rent Opportunity Scanner artifacts.
+
+    One fetch, three uploads: rent_index.parquet (model feature grid,
+    unchanged schema), rent_weekly_stats.parquet (box-view percentiles),
+    rent_recent_contracts.parquet (dot-view contract rows).
+    """
     # Monthly chunks: a ~11M-row pull runs for hours, and one unrecoverable
     # gateway error mid-pagination used to discard everything fetched so far.
     # Per-chunk the page retry still applies; a failed chunk is retried once
@@ -338,7 +473,11 @@ def pull_rents(config: "DDAConfig", secrets: dict) -> None:
         .drop_nulls(["area_rent_psf_180d"])
         .select("AREA_EN", "rooms_band", "week", "area_rent_psf_180d", "rent_contracts_180d")
     )
+    # rent_index first: it feeds the fair-value model, so a failure in the
+    # newer scanner artifacts below still leaves the model's grid refreshed.
     upload(secrets, "rent_index.parquet", grid)
+    upload(secrets, "rent_weekly_stats.parquet", _weekly_stats(rents))
+    upload(secrets, "rent_recent_contracts.parquet", _recent_contracts(rents))
 
 
 def main() -> int:
@@ -351,6 +490,10 @@ def main() -> int:
         default=["projects", "buildings", "service", "rents", "units"],
         choices=["projects", "buildings", "service", "rents", "units", "saleindex"],
     )
+    parser.add_argument(
+        "--probe-rents", action="store_true",
+        help="Fetch 5 raw Ejari records, print the available columns, and exit",
+    )
     args = parser.parse_args()
 
     secrets = load_local_secrets()
@@ -358,6 +501,9 @@ def main() -> int:
     if config.missing_fields():
         print("Missing DDA configuration: " + ", ".join(config.missing_fields()))
         return 2
+
+    if args.probe_rents:
+        return probe_rents(config)
 
     if "projects" in args.only:
         pull_projects(config, secrets)

@@ -131,7 +131,17 @@ The app starts on http://localhost:8501. It needs `.streamlit/secrets.toml`
    next. Loads only when this page is selected, keeping Market Overview
    fast.
 
-3. **Fair Value Model** — the deal scanner (screenshot at the top):
+3. **Rent Scanner** — the tenant-side twin, built from Ejari rental
+   contracts (flats, annual **AED/sqft/yr**): windows of 3 months or less
+   show individual contracts against the zone's 14-day rolling median rent
+   with a ranked below-median deals table and CSV download; longer windows
+   switch automatically to weekly box plots (median, q1–q3 box, p10–p90
+   whiskers) from pre-aggregated stats, because Ejari volume dwarfs the
+   sales feed. Renewal contracts (RERA rent-cap keeps them below market)
+   are excluded by default. Requires the rents ingestion pull to have
+   published its GCS artifacts.
+
+4. **Fair Value Model** — the deal scanner (screenshot at the top):
    - **Sidebar filters** (shared with Overview): neighbourhoods, bedroom
      type, date range. The Transaction Type filter doesn't apply here — this
      page always analyses Sales.
@@ -169,6 +179,7 @@ value — corroborated", not proof of a forced sale.
 ```
 dubai_dashboard.py       # Streamlit entrypoint (Market Overview, Buyer Opportunity Scanner + page routing)
 fair_value_tab.py        # Fair Value page UI
+rent_scanner_tab.py      # Rent Opportunity Scanner page UI
 dashboard_constants.py   # shared constants (areas, tiers, unit conversion)
 ingestion/               # DLD API client, GCS storage, snapshot & reference pulls
 model/                   # fair-value model, data cleaning, training, optimization, backtest
