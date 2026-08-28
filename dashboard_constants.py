@@ -19,7 +19,8 @@ AREA_DISPLAY: dict[str, str] = {
     "AL BARSHAA SOUTH THIRD": "Arjan",
     "AL JADAF": "Al Jadaf",
     "AL THANYAH FIFTH": "Jumeirah Lakes Towers",
-    "AL THANYAH THIRD": "The Greens / Barsha Heights",
+    "AL THANYAH THIRD": "The Greens",
+    "AL THANYAH FIRST": "Barsha Heights (TECOM)",
     "AL KHAIRAN FIRST": "Dubai Creek Harbour",
     "AL MERKADH": "Sobha Hartland (MBR City)",
     "BUKADRA": "Sobha Hartland II",
@@ -42,58 +43,101 @@ AREA_DISPLAY: dict[str, str] = {
     "BUSINESS BAY": "Business Bay",
     "BURJ KHALIFA": "Downtown Dubai (Burj Khalifa)",
     "PALM JUMEIRAH": "Palm Jumeirah",
+    # Verified against the live snapshot + Ejari artifacts (note the DLD
+    # spellings: AL SAFOUH, AL BARSHAA SOUTH SECOND, TRADE CENTER).
+    "AL SAFOUH FIRST": "Al Sufouh (Internet City)",
+    "AL SAFOUH SECOND": "Al Sufouh (Internet City)",
+    "AL BARSHA FIRST": "Al Barsha",
+    "AL BARSHAA SOUTH SECOND": "Dubai Science Park (Al Barsha South 2)",
+    "WADI AL SAFA 2": "Liwan",
+    "WADI AL SAFA 3": "Majan (Dubailand)",
+    "WADI AL SAFA 4": "Dubailand (Wadi Al Safa 4)",
+    "WADI AL SAFA 5": "Dubai Residence Complex (Dubailand)",
+    "AL WASL": "City Walk (Al Wasl)",
+    "AL SATWA": "Al Satwa / Jumeirah Garden City",
+    "AL KIFAF": "Al Kifaf (Wasl1)",
+    "UM SUQAIM THIRD": "Madinat Jumeirah Living (Umm Suqeim 3)",
+    "JUMEIRAH FIRST": "La Mer / Jumeirah 1",
+    "JUMEIRAH SECOND": "Jumeirah Bay Island (Jumeirah 2)",
+    "TRADE CENTER FIRST": "Trade Centre / DIFC",
+    "TRADE CENTER SECOND": "Trade Centre / DIFC",
+    "ZAABEEL FIRST": "Za'abeel",
+    "RAS AL KHOR INDUSTRIAL FIRST": "Ras Al Khor",
+    "AL HEBIAH SECOND": "Dubai Studio City",
+    "SAIH SHUAIB 2": "Dubai Industrial City",
+    "MIRDIF": "Mirdif",
+    "PALM JABAL ALI": "Palm Jebel Ali",
+    "DUBAI INVESTMENT PARK FIRST": "Dubai Investment Park (DIP)",
+    "DUBAI INVESTMENT PARK SECOND": "Dubai Investment Park (DIP)",
+    "AL GOZE FOURTH": "Al Quoz 4",
+    "NAD AL HAMAR": "Nad Al Hamar",
+    # Rental-market districts: huge in Ejari, negligible apartment sales.
+    # Industrial/labor districts are deliberately unmapped — shared-housing
+    # rents would skew zone medians.
+    "AL NAHDA FIRST": "Al Nahda",
+    "AL NAHDA SECOND": "Al Nahda",
+    "AL KARAMA": "Al Karama",
+    "AL MURQABAT": "Al Muraqqabat (Deira)",
+    "AL WARQA FIRST": "Al Warqaa 1",
+    "MANKHOOL": "Mankhool (Bur Dubai)",
+    "AL QUSAIS": "Al Qusais",
+    "MUHAISANAH FOURTH": "Muhaisnah 4",
+    "AL RAFFA": "Al Raffa (Bur Dubai)",
+    "AL SUQ AL KABEER": "Al Souk Al Kabeer (Bur Dubai)",
+    "NAIF": "Naif (Deira)",
+    "AL MUTEENA": "Al Muteena (Deira)",
+    "HOR AL ANZ": "Hor Al Anz",
+    "HOR AL ANZ EAST": "Hor Al Anz",
+    "AL HAMRIYA": "Al Hamriya (Bur Dubai)",
+    "OUD METHA": "Oud Metha",
+    "AL MAMZER": "Al Mamzar",
+    "AL BARAHA": "Al Baraha (Deira)",
+    "AL BADA": "Al Bada'a",
+    "PORT SAEED": "Port Saeed (Deira)",
 }
 
-# Sidebar options — display names of the highest-volume districts in the data.
-NEIGHBORHOODS: list[str] = [
-    # High-volume
-    "Dubai South (Expo City)",
-    "Jumeirah Village Circle (JVC)",
-    "Al Furjan / Discovery Gardens",
-    "Business Bay",
-    "Dubai Islands",
-    "Dubai Marina",
-    "Arjan",
-    "Dubai Creek Harbour",
-    "Dubai Production City",
-    "Jumeirah Lakes Towers",
-    # Mid-volume
-    "Jumeirah Village Triangle (JVT)",
-    "Sobha Hartland (MBR City)",
-    "Dubai Sports City",
-    "Motor City",
-    "Town Square",
-    "Downtown Dubai (Burj Khalifa)",
-    "Dubai Hills Estate",
-    "Al Jadaf",
-    "Dubai Silicon Oasis",
-    "Palm Jumeirah",
-]
+# Sidebar options — every area with a friendly display name, A-Z.
+# Derived from AREA_DISPLAY so the picker can never miss a mapped area.
+NEIGHBORHOODS: list[str] = sorted(set(AREA_DISPLAY.values()))
 
+# Tiers cover areas with meaningful sales volume, calibrated to each tier's
+# 12-month median sales PSF (Ultra ~3,150 / Premium ~2,500 / Mid ~1,770 /
+# Value ~1,500 / Budget ~1,100 AED/sqft). Rental-only districts (Al Karama,
+# Al Nahda, ...) carry no tier — tiers feed sales charts and the model only.
 TIER_MAP: dict[str, str] = {}
 TIER_AREAS: dict[str, list[str]] = {
     "Ultra-premium": [
         "Palm Jumeirah", "Downtown Dubai (Burj Khalifa)", "Za'abeel",
+        "City Walk (Al Wasl)", "La Mer / Jumeirah 1",
+        "Jumeirah Bay Island (Jumeirah 2)", "Trade Centre / DIFC",
+        "Palm Jebel Ali",
     ],
     "Premium": [
         "Dubai Marina", "Dubai Creek Harbour", "Dubai Hills Estate",
         "Sobha Hartland (MBR City)", "Sobha Hartland II", "Business Bay",
         "Dubai Maritime City", "Dubai Islands",
+        "Madinat Jumeirah Living (Umm Suqeim 3)",
+        "Al Satwa / Jumeirah Garden City", "Al Kifaf (Wasl1)", "Ras Al Khor",
     ],
     "Mid-market": [
         "Jumeirah Lakes Towers", "Jumeirah Village Triangle (JVT)",
-        "The Greens / Barsha Heights", "Al Jadaf", "Nad Al Sheba",
+        "The Greens", "Al Jadaf", "Nad Al Sheba",
         "Town Square", "Al Furjan / Discovery Gardens", "DAMAC Hills",
+        "Al Barsha", "Al Sufouh (Internet City)",
+        "Dubai Science Park (Al Barsha South 2)", "Dubailand (Wadi Al Safa 4)",
     ],
     "Value": [
         "Jumeirah Village Circle (JVC)", "Arjan", "Motor City",
         "Dubai Silicon Oasis", "Dubai Production City", "Dubai Sports City",
         "Dubai South (Expo City)",
+        "Barsha Heights (TECOM)", "Majan (Dubailand)",
+        "Dubai Residence Complex (Dubailand)", "Dubai Studio City",
+        "Dubai Industrial City", "Liwan", "Mirdif",
     ],
     "Budget": [
         "International City Phase 1", "International City (Warsan 4)",
-        "DAMAC Hills 2", "DUBAI INVESTMENT PARK FIRST",
-        "DUBAI INVESTMENT PARK SECOND",
+        "DAMAC Hills 2", "Dubai Investment Park (DIP)",
+        "Al Quoz 4", "Nad Al Hamar",
     ],
 }
 for tier, areas in TIER_AREAS.items():
