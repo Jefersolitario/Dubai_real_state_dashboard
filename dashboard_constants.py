@@ -38,15 +38,15 @@ AREA_DISPLAY: dict[str, str] = {
     "PALM DEIRA": "Dubai Islands",
     "MADINAT DUBAI ALMELAHEYAH": "Dubai Maritime City",
     "JABAL ALI FIRST": "Al Furjan / Discovery Gardens",
-    "ZAABEEL SECOND": "Za'abeel",
+    "ZAABEEL SECOND": "Za'abeel 2",
     "NAD AL SHIBA FIRST": "Nad Al Sheba",
     "BUSINESS BAY": "Business Bay",
     "BURJ KHALIFA": "Downtown Dubai (Burj Khalifa)",
     "PALM JUMEIRAH": "Palm Jumeirah",
     # Verified against the live snapshot + Ejari artifacts (note the DLD
     # spellings: AL SAFOUH, AL BARSHAA SOUTH SECOND, TRADE CENTER).
-    "AL SAFOUH FIRST": "Al Sufouh (Internet City)",
-    "AL SAFOUH SECOND": "Al Sufouh (Internet City)",
+    "AL SAFOUH FIRST": "Al Sufouh 1",
+    "AL SAFOUH SECOND": "Al Sufouh 2 (Internet City)",
     "AL BARSHA FIRST": "Al Barsha",
     "AL BARSHAA SOUTH SECOND": "Dubai Science Park (Al Barsha South 2)",
     "WADI AL SAFA 2": "Liwan",
@@ -59,23 +59,23 @@ AREA_DISPLAY: dict[str, str] = {
     "UM SUQAIM THIRD": "Madinat Jumeirah Living (Umm Suqeim 3)",
     "JUMEIRAH FIRST": "La Mer / Jumeirah 1",
     "JUMEIRAH SECOND": "Jumeirah Bay Island (Jumeirah 2)",
-    "TRADE CENTER FIRST": "Trade Centre / DIFC",
-    "TRADE CENTER SECOND": "Trade Centre / DIFC",
-    "ZAABEEL FIRST": "Za'abeel",
+    "TRADE CENTER FIRST": "Trade Centre 1",
+    "TRADE CENTER SECOND": "Trade Centre 2 (DIFC)",
+    "ZAABEEL FIRST": "Za'abeel 1",
     "RAS AL KHOR INDUSTRIAL FIRST": "Ras Al Khor",
     "AL HEBIAH SECOND": "Dubai Studio City",
     "SAIH SHUAIB 2": "Dubai Industrial City",
     "MIRDIF": "Mirdif",
     "PALM JABAL ALI": "Palm Jebel Ali",
-    "DUBAI INVESTMENT PARK FIRST": "Dubai Investment Park (DIP)",
-    "DUBAI INVESTMENT PARK SECOND": "Dubai Investment Park (DIP)",
+    "DUBAI INVESTMENT PARK FIRST": "Dubai Investment Park 1",
+    "DUBAI INVESTMENT PARK SECOND": "Dubai Investment Park 2",
     "AL GOZE FOURTH": "Al Quoz 4",
     "NAD AL HAMAR": "Nad Al Hamar",
     # Rental-market districts: huge in Ejari, negligible apartment sales.
     # Industrial/labor districts are deliberately unmapped — shared-housing
     # rents would skew zone medians.
-    "AL NAHDA FIRST": "Al Nahda",
-    "AL NAHDA SECOND": "Al Nahda",
+    "AL NAHDA FIRST": "Al Nahda 1",
+    "AL NAHDA SECOND": "Al Nahda 2",
     "AL KARAMA": "Al Karama",
     "AL MURQABAT": "Al Muraqqabat (Deira)",
     "AL WARQA FIRST": "Al Warqaa 1",
@@ -87,7 +87,7 @@ AREA_DISPLAY: dict[str, str] = {
     "NAIF": "Naif (Deira)",
     "AL MUTEENA": "Al Muteena (Deira)",
     "HOR AL ANZ": "Hor Al Anz",
-    "HOR AL ANZ EAST": "Hor Al Anz",
+    "HOR AL ANZ EAST": "Hor Al Anz East",
     "AL HAMRIYA": "Al Hamriya (Bur Dubai)",
     "OUD METHA": "Oud Metha",
     "AL MAMZER": "Al Mamzar",
@@ -100,6 +100,11 @@ AREA_DISPLAY: dict[str, str] = {
 # Derived from AREA_DISPLAY so the picker can never miss a mapped area.
 NEIGHBORHOODS: list[str] = sorted(set(AREA_DISPLAY.values()))
 
+# The Rent Scanner box view plots precomputed weekly quantiles keyed by
+# display name; quantiles don't compose across districts, so each display
+# must map exactly one district.
+assert len(AREA_DISPLAY) == len(set(AREA_DISPLAY.values())), "one district per display"
+
 # Tiers cover areas with meaningful sales volume, calibrated to each tier's
 # 12-month median sales PSF (Ultra ~3,150 / Premium ~2,500 / Mid ~1,770 /
 # Value ~1,500 / Budget ~1,100 AED/sqft). Rental-only districts (Al Karama,
@@ -107,9 +112,11 @@ NEIGHBORHOODS: list[str] = sorted(set(AREA_DISPLAY.values()))
 TIER_MAP: dict[str, str] = {}
 TIER_AREAS: dict[str, list[str]] = {
     "Ultra-premium": [
-        "Palm Jumeirah", "Downtown Dubai (Burj Khalifa)", "Za'abeel",
+        "Palm Jumeirah", "Downtown Dubai (Burj Khalifa)",
+        "Za'abeel 1", "Za'abeel 2",
         "City Walk (Al Wasl)", "La Mer / Jumeirah 1",
-        "Jumeirah Bay Island (Jumeirah 2)", "Trade Centre / DIFC",
+        "Jumeirah Bay Island (Jumeirah 2)",
+        "Trade Centre 1", "Trade Centre 2 (DIFC)",
         "Palm Jebel Ali",
     ],
     "Premium": [
@@ -123,7 +130,7 @@ TIER_AREAS: dict[str, list[str]] = {
         "Jumeirah Lakes Towers", "Jumeirah Village Triangle (JVT)",
         "The Greens", "Al Jadaf", "Nad Al Sheba",
         "Town Square", "Al Furjan / Discovery Gardens", "DAMAC Hills",
-        "Al Barsha", "Al Sufouh (Internet City)",
+        "Al Barsha", "Al Sufouh 1", "Al Sufouh 2 (Internet City)",
         "Dubai Science Park (Al Barsha South 2)", "Dubailand (Wadi Al Safa 4)",
     ],
     "Value": [
@@ -136,7 +143,7 @@ TIER_AREAS: dict[str, list[str]] = {
     ],
     "Budget": [
         "International City Phase 1", "International City (Warsan 4)",
-        "DAMAC Hills 2", "Dubai Investment Park (DIP)",
+        "DAMAC Hills 2", "Dubai Investment Park 1", "Dubai Investment Park 2",
         "Al Quoz 4", "Nad Al Hamar",
     ],
 }
