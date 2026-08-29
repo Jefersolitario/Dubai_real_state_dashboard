@@ -43,12 +43,11 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m model.optimize_fair_value
 
 # Campaign 3 runner: rent-feature ladder with reference frames + tail-veto gate.
-# 2026-08 result: all 11 district-granularity candidates rejected (best +0.02pp
-# vs the 0.05pp gate) — a measured null; the groups stay in fair_value_model.py,
-# off by default (reports/rent_campaign_report.md). Phase 2 added a
-# project-granularity rung (`rent_project`: trailing project rent PSF, count,
-# same-project gross yield) that runs once rent_project_index.parquet exists in
-# GCS — i.e. after the next `--only rents` pull; the runner skips it until then.
+# 2026-08 verdict, both phases: all 12 candidates rejected — district x rooms
+# features AND phase 2's project-linked rents (`rent_project`, best rung at
+# +0.02pp vs the 0.05pp gate). Rent features are a measured null even at
+# project granularity; the groups stay in fair_value_model.py, off by default
+# (reports/rent_campaign_report.md has the full two-phase conclusion).
 .\.venv\Scripts\python.exe -m model.optimize_rent_features
 
 # Train the fair-value model offline and publish the inference bundle to GCS
