@@ -42,6 +42,12 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m tests.smoke_test_fair_value
 .\.venv\Scripts\python.exe -m model.optimize_fair_value
 
+# Campaign 3 runner: rent-feature ladder with reference frames + tail-veto gate.
+# 2026-08 result: all 11 candidates rejected (best +0.02pp vs the 0.05pp gate) —
+# rent features are a measured null at district x rooms granularity; the groups
+# stay in fair_value_model.py, off by default (reports/rent_campaign_report.md).
+.\.venv\Scripts\python.exe -m model.optimize_rent_features
+
 # Train the fair-value model offline and publish the inference bundle to GCS
 # (run after each snapshot refresh — weekly cadence; the app never trains)
 .\.venv\Scripts\python.exe -m model.train_fair_value
