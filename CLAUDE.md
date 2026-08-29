@@ -43,9 +43,12 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m model.optimize_fair_value
 
 # Campaign 3 runner: rent-feature ladder with reference frames + tail-veto gate.
-# 2026-08 result: all 11 candidates rejected (best +0.02pp vs the 0.05pp gate) —
-# rent features are a measured null at district x rooms granularity; the groups
-# stay in fair_value_model.py, off by default (reports/rent_campaign_report.md).
+# 2026-08 result: all 11 district-granularity candidates rejected (best +0.02pp
+# vs the 0.05pp gate) — a measured null; the groups stay in fair_value_model.py,
+# off by default (reports/rent_campaign_report.md). Phase 2 added a
+# project-granularity rung (`rent_project`: trailing project rent PSF, count,
+# same-project gross yield) that runs once rent_project_index.parquet exists in
+# GCS — i.e. after the next `--only rents` pull; the runner skips it until then.
 .\.venv\Scripts\python.exe -m model.optimize_rent_features
 
 # Train the fair-value model offline and publish the inference bundle to GCS
@@ -144,7 +147,13 @@ sanitization), plus the Rent Scanner artifacts from the same pull:
 n/median/q1/q3/p10/p90, including an "All" band — quantiles don't compose
 across bands — and a `segment` all/new column) and
 `rent_recent_contracts.parquet` (contract-level slim rows for the 20 scanner
-districts, trailing 183 days, deduped). The pull pages by `contract_id`
+districts, trailing 183 days, deduped), and `rent_project_index.parquet`
+(weekly per-project trailing-180d rent PSF + contract count, strictly past —
+contracts resolved to their project via the Ejari `project_name_en` join plus
+the layout fingerprint: district × exact area @2dp sqm × rooms band against
+the units registry, unique-key-only; validated 62% unique / 97% accurate on
+labeled sales. Needs the projects + units artifacts published first; the
+linkage prints coverage and route-agreement diagnostics). The pull pages by `contract_id`
 (stable pagination — date ordering duplicated AND skipped ~25% of rows),
 dedupes on (contract_id, line_number) plus one row per single-property
 contract, and excludes bulk `no_of_prop>1` contracts whose annual_amount is

@@ -66,6 +66,8 @@ RENT_PROBE_CANDIDATES = (
     "ejari_contract_number",
     "no_of_prop",
     "version",
+    "project_name_en",
+    "master_project_en",
 )
 
 
@@ -321,6 +323,13 @@ def _slim_rents(chunk: pl.DataFrame) -> pl.DataFrame:
             pl.col("contract_reg_type_en").cast(pl.Utf8).str.strip_chars()
             .alias("reg_type")
         )
+    # Project name (~26% populated per the data-quality audit): the direct
+    # half of the rent-to-project linkage behind rent_project_index.
+    if "project_name_en" in chunk.columns:
+        cols.append(
+            pl.col("project_name_en").cast(pl.Utf8).str.to_uppercase()
+            .str.strip_chars().alias("project_name")
+        )
     return chunk.select(cols)
 
 
@@ -380,6 +389,139 @@ def _recent_contracts(rents: pl.DataFrame) -> pl.DataFrame:
         .select(cols)
         .unique()  # versioned/repeated gateway rows: exact-duplicate dedupe
         .sort("AREA_EN", "start")
+    )
+
+
+def _link_rent_projects(rents: pl.DataFrame, secrets: dict) -> pl.DataFrame | None:
+    """Attach ``project_number`` to rent contracts via two measured routes.
+
+    Route A (direct): Ejari ``project_name_en`` joined to the projects table
+    name (populated ~26% of contracts). Route B (fingerprint): Dubai layouts
+    have near-unique exact registered areas, so (district, area to 2dp sqm,
+    rooms band) resolved against the units registry identifies the project
+    for ~62% of units at 97% accuracy (validated on 315k labeled sales,
+    2026-08). B fills contracts A cannot; keys matching multiple projects
+    stay unlinked rather than guessed.
+
+    Needs the projects + units artifacts in GCS (run ``--only projects
+    units`` first); returns None with a warning when they are missing.
+    """
+    from ingestion.gcs_storage import read_reference_frames
+
+    try:
+        ref = read_reference_frames(secrets, ["projects", "units"])
+    except FileNotFoundError as exc:
+        print(f"rent-project linkage skipped: {exc}", flush=True)
+        return None
+
+    projects = (
+        ref["projects"]
+        .select(
+            pl.col("project_id").cast(pl.Int64, strict=False),
+            pl.col("project_number").cast(pl.Int64, strict=False),
+            pl.col("project_name").cast(pl.Utf8).str.to_uppercase()
+            .str.strip_chars().alias("project_name"),
+            pl.col("area_name_en").cast(pl.Utf8).str.to_uppercase()
+            .str.strip_chars().alias("AREA_EN"),
+        )
+        .drop_nulls(["project_id", "project_number"])
+        .unique("project_id")
+    )
+
+    # Route A: direct name join (project names are unique in the registry).
+    name_lut = (
+        projects.drop_nulls("project_name")
+        .group_by("project_name")
+        .agg(pl.col("project_number").n_unique().alias("_n"),
+             pl.col("project_number").first().alias("_pn_name"))
+        .filter(pl.col("_n") == 1)
+        .drop("_n")
+    )
+    if "project_name" in rents.columns:
+        rents = rents.join(name_lut, on="project_name", how="left")
+    else:
+        rents = rents.with_columns(pl.lit(None, dtype=pl.Int64).alias("_pn_name"))
+
+    # Route B: (district, exact area @2dp, rooms band) -> unique project.
+    fingerprint = (
+        ref["units"]
+        .select(
+            pl.col("project_id").cast(pl.Int64, strict=False),
+            ((pl.col("actual_area").cast(pl.Float64, strict=False)) * 100)
+            .round(0).cast(pl.Int64).alias("_akey"),
+            rooms_band_from_units().alias("rooms_band"),
+        )
+        .join(projects.select("project_id", "project_number", "AREA_EN"),
+              on="project_id", how="inner")
+        .group_by("AREA_EN", "_akey", "rooms_band")
+        .agg(pl.col("project_number").n_unique().alias("_n"),
+             pl.col("project_number").first().alias("_pn_fp"))
+        .filter(pl.col("_n") == 1)
+        .drop("_n")
+    )
+    rents = rents.with_columns(
+        (pl.col("actual_area") * 100).round(0).cast(pl.Int64).alias("_akey")
+    ).join(fingerprint, on=["AREA_EN", "_akey", "rooms_band"], how="left")
+
+    n = rents.height
+    both = rents.filter(pl.col("_pn_name").is_not_null() & pl.col("_pn_fp").is_not_null())
+    agree = both.filter(pl.col("_pn_name") == pl.col("_pn_fp"))
+    rents = rents.with_columns(
+        pl.coalesce([pl.col("_pn_name"), pl.col("_pn_fp")]).alias("project_number")
+    ).drop("_akey", "_pn_name", "_pn_fp")
+    linked = rents.filter(pl.col("project_number").is_not_null())
+    print(
+        f"rent-project linkage: {linked.height:,}/{n:,} contracts linked "
+        f"({linked.height / n:.1%}); routes agree on "
+        f"{(agree.height / both.height if both.height else 0):.1%} of "
+        f"{both.height:,} doubly-linked rows",
+        flush=True,
+    )
+    return rents
+
+
+def rooms_band_from_units() -> pl.Expr:
+    """Units-registry rooms_en (e.g. '1 B/R') mapped to the dashboard bands."""
+    rooms = pl.col("rooms_en").cast(pl.Utf8)
+    digit = rooms.str.extract(r"(\d+)").cast(pl.Int32, strict=False)
+    return (
+        pl.when(rooms.str.to_lowercase().str.contains("studio")).then(pl.lit("Studio"))
+        .when(digit == 1).then(pl.lit("1BR"))
+        .when(digit == 2).then(pl.lit("2BR"))
+        .when(digit == 3).then(pl.lit("3BR"))
+        .when(digit >= 4).then(pl.lit("4BR+"))
+        .otherwise(pl.lit(None, dtype=pl.Utf8))
+    )
+
+
+def _project_rent_index(linked: pl.DataFrame) -> pl.DataFrame:
+    """Weekly per-project trailing-180d rent stats, strictly past.
+
+    Mirrors the district grid construction: the value at week w covers only
+    contracts starting before w (rolling closed="left" over weekly medians),
+    so the model's backward as-of join stays lookahead-free. PSF pools rooms
+    bands within the project — per-sqft normalizes the size mix.
+    """
+    weekly = (
+        linked.filter(pl.col("project_number").is_not_null())
+        .group_by("project_number", "week")
+        .agg(pl.col("rent_psf").median().alias("wk_med"), pl.len().alias("wk_n"))
+        .sort("week")
+    )
+    return (
+        weekly.with_columns(
+            pl.col("wk_med")
+            .rolling_mean_by("week", window_size="180d", closed="left")
+            .over("project_number")
+            .alias("project_rent_psf_180d"),
+            pl.col("wk_n")
+            .rolling_sum_by("week", window_size="180d", closed="left")
+            .over("project_number")
+            .alias("project_rent_contracts_180d"),
+        )
+        .drop_nulls(["project_rent_psf_180d"])
+        .select("project_number", "week",
+                "project_rent_psf_180d", "project_rent_contracts_180d")
     )
 
 
@@ -512,6 +654,11 @@ def pull_rents(config: "DDAConfig", secrets: dict) -> None:
     upload(secrets, "rent_index.parquet", grid)
     upload(secrets, "rent_weekly_stats.parquet", _weekly_stats(rents))
     upload(secrets, "rent_recent_contracts.parquet", _recent_contracts(rents))
+    # Project-linked rent index (rent_project model feature). Last so a
+    # linkage failure never costs the three artifacts above.
+    linked = _link_rent_projects(rents, secrets)
+    if linked is not None:
+        upload(secrets, "rent_project_index.parquet", _project_rent_index(linked))
 
 
 def main() -> int:

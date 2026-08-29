@@ -76,6 +76,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "rent_anchor": False,            # income-approach price anchor: rent / city band yield
     "rent_divergence": False,        # rent momentum minus area sale-price momentum
     "rent_new_segment": False,       # new-contract (non-renewal) rents: level + premium vs stock
+    "rent_project": False,           # project-linked rents: trailing PSF, count, same-project yield
     # --- data quality (see data_cleaning.py) ---
     "data_cleaning": False,          # repair digit-shift typos; exclude review_only/quarantine rows
 }
@@ -205,6 +206,12 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric.append("rent_price_div")
     if cfg["rent_new_segment"]:
         numeric += ["rent_new_psf_13w", "rent_new_premium"]
+    if cfg["rent_project"]:
+        numeric += [
+            "project_rent_psf_180d",
+            "project_rent_contracts_180d",
+            "project_gross_yield",
+        ]
     return numeric, categorical
 
 
@@ -224,6 +231,7 @@ REFERENCE_REQUIREMENTS = {
     "rent_anchor": ("rent_index",),
     "rent_divergence": ("rent_index",),
     "rent_new_segment": ("rent_index", "rent_weekly_stats"),
+    "rent_project": ("rent_project_index",),
 }
 
 # feature groups resolved inside _join_rent_grid
@@ -697,6 +705,49 @@ def _join_rent_grid(
     )
 
 
+def _join_project_rent(
+    df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
+) -> pl.DataFrame:
+    """As-of join the project-linked rent index (strictly past by construction).
+
+    The index is built from Ejari contracts resolved to their project via the
+    name join + layout fingerprint (store_reference_data_gcs). Joining on
+    PROJECT_NUMBER puts rents and sale comps on the SAME stock, so
+    ``project_gross_yield`` is the quality-matched ratio the district-level
+    campaign features could not build.
+    """
+    if not cfg["rent_project"]:
+        return df
+    grid = (
+        reference["rent_project_index"]
+        .select(
+            pl.col("project_number").cast(pl.Int64, strict=False).alias("_pn"),
+            pl.col("week").cast(pl.Date),
+            pl.col("project_rent_psf_180d").cast(pl.Float64, strict=False),
+            pl.col("project_rent_contracts_180d").cast(pl.Float64, strict=False),
+        )
+        .drop_nulls(["_pn", "week"])
+        .sort("week")
+    )
+    df = df.with_columns(
+        pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_pn")
+    ).sort("date")
+    df = df.join_asof(
+        grid, left_on="date", right_on="week", by=["_pn"], strategy="backward"
+    ).drop("_pn", "week")
+    if "project_comp_psf" in df.columns:
+        df = df.with_columns(
+            pl.when(pl.col("project_comp_psf") > 0)
+            .then(pl.col("project_rent_psf_180d") / pl.col("project_comp_psf"))
+            .alias("project_gross_yield")
+        )
+    else:
+        df = df.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("project_gross_yield")
+        )
+    return df
+
+
 def _join_units_registry(
     df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
 ) -> pl.DataFrame:
@@ -853,6 +904,7 @@ def feature_engineering(
     _require_reference_frames(cfg, reference)
     df = _join_project_reference(df, cfg, reference)
     df = _join_rent_grid(df, cfg, reference)
+    df = _join_project_rent(df, cfg, reference)
     df = _join_units_registry(df, cfg, reference)
     return _select_output_columns(df, cfg)
 

@@ -69,6 +69,13 @@ SELECTION_END = date(2026, 8, 1)
 # the current champion. Ordered by expected value from the evidence.
 CANDIDATE_LADDER: list[dict] = [
     {
+        "name": "+ project-linked rents",
+        "detail": "trailing project rent PSF, contract count, and same-project "
+                  "gross yield — rents mapped to projects via the name join + "
+                  "layout fingerprint (needs rent_project_index in GCS)",
+        "toggle": {"rent_project": True},
+    },
+    {
         "name": "+ new-contract rents",
         "detail": "non-renewal Ejari rents, 13w smoothed + premium vs stock "
                   "(new-tenant indexes lead mixed ones ~3 quarters; RERA caps renewals)",
@@ -151,18 +158,33 @@ def load_snapshot() -> pl.DataFrame:
     return dedupe_snapshot(normalize_dld_transactions(raw))
 
 
-def load_references(configs: list[dict]) -> dict[str, pl.DataFrame]:
-    """Union of reference frames any evaluated config can require."""
+def load_references(configs: list[dict]) -> tuple[dict[str, pl.DataFrame], list[str]]:
+    """(frames, missing) for the union of reference frames any config needs.
+
+    A frame not yet published (e.g. rent_project_index before the first
+    linked rents pull) is reported rather than fatal: candidates that need
+    it are skipped so the rest of the ladder still runs.
+    """
     from ingestion.gcs_storage import load_local_secrets, read_reference_frames
 
     names: list[str] = []
     for cfg in configs:
         names += [n for n in reference_needed(cfg) if n not in names]
+    frames: dict[str, pl.DataFrame] = {}
+    missing: list[str] = []
     if not names:
-        return {}
-    frames = read_reference_frames(load_local_secrets(), names)
-    print(f"Reference frames loaded: {names}")
-    return frames
+        return frames, missing
+    secrets = load_local_secrets()
+    for name in names:
+        try:
+            frames.update(read_reference_frames(secrets, [name]))
+        except FileNotFoundError:
+            missing.append(name)
+    if frames:
+        print(f"Reference frames loaded: {sorted(frames)}")
+    if missing:
+        print(f"Reference frames MISSING — candidates needing them are skipped: {missing}")
+    return frames, missing
 
 
 def config_key(cfg: dict, params: dict) -> str:
@@ -333,7 +355,22 @@ def main() -> int:
     ]
 
     raw = load_snapshot()
-    reference = load_references(ladder_configs)
+    reference, missing_refs = load_references(ladder_configs)
+    if any(n in missing_refs for n in reference_needed(shipped_cfg)):
+        raise SystemExit(
+            f"Baseline config needs missing reference frames: {missing_refs}"
+        )
+    runnable_ladder = []
+    for spec in CANDIDATE_LADDER:
+        lacking = [
+            n
+            for n in reference_needed({**shipped_cfg, **spec.get("toggle", {})})
+            if n in missing_refs
+        ]
+        if lacking:
+            print(f"skip '{spec['name']}': missing reference {lacking}")
+        else:
+            runnable_ladder.append(spec)
     cache = FeatureCache(raw, reference)
     print(f"Snapshot: {raw.height:,} rows; selection window < {SELECTION_END}")
 
@@ -410,7 +447,7 @@ def main() -> int:
     evaluated: dict[str, dict] = {base_key: state["baseline"]["metrics"]}
     iteration = 0
     pass_num = 0
-    pending = list(CANDIDATE_LADDER)
+    pending = list(runnable_ladder)
     while pending and iteration < args.max_evals:
         pass_num += 1
         accepted_this_pass = False
