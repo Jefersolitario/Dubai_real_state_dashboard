@@ -323,8 +323,15 @@ def _slim_rents(chunk: pl.DataFrame) -> pl.DataFrame:
             pl.col("contract_reg_type_en").cast(pl.Utf8).str.strip_chars()
             .alias("reg_type")
         )
-    # Project name (~26% populated per the data-quality audit): the direct
-    # half of the rent-to-project linkage behind rent_project_index.
+    # Project identity (~26% populated per the data-quality audit): the
+    # direct half of the rent-to-project linkage behind rent_project_index.
+    # The raw feed carries a first-class project_number (probe 2026-08) —
+    # the same key as the sales snapshot — plus the name as fallback.
+    if "project_number" in chunk.columns:
+        cols.append(
+            pl.col("project_number").cast(pl.Int64, strict=False)
+            .alias("ejari_project_number")
+        )
     if "project_name_en" in chunk.columns:
         cols.append(
             pl.col("project_name_en").cast(pl.Utf8).str.to_uppercase()
@@ -395,8 +402,9 @@ def _recent_contracts(rents: pl.DataFrame) -> pl.DataFrame:
 def _link_rent_projects(rents: pl.DataFrame, secrets: dict) -> pl.DataFrame | None:
     """Attach ``project_number`` to rent contracts via two measured routes.
 
-    Route A (direct): Ejari ``project_name_en`` joined to the projects table
-    name (populated ~26% of contracts). Route B (fingerprint): Dubai layouts
+    Route A (direct): the feed's own ``project_number`` (registry-validated),
+    falling back to ``project_name_en`` joined to the projects table name
+    (~26% of contracts carry project identity). Route B (fingerprint): Dubai layouts
     have near-unique exact registered areas, so (district, area to 2dp sqm,
     rooms band) resolved against the units registry identifies the project
     for ~62% of units at 97% accuracy (validated on 315k labeled sales,
@@ -427,6 +435,17 @@ def _link_rent_projects(rents: pl.DataFrame, secrets: dict) -> pl.DataFrame | No
         .drop_nulls(["project_id", "project_number"])
         .unique("project_id")
     )
+
+    # Route A0: the feed's own project_number, kept only when the registry
+    # knows it (guards against placeholder/garbage ids).
+    if "ejari_project_number" in rents.columns:
+        valid = projects.select(
+            pl.col("project_number").alias("ejari_project_number"),
+            pl.col("project_number").alias("_pn_raw"),
+        ).unique("ejari_project_number")
+        rents = rents.join(valid, on="ejari_project_number", how="left")
+    else:
+        rents = rents.with_columns(pl.lit(None, dtype=pl.Int64).alias("_pn_raw"))
 
     # Route A: direct name join (project names are unique in the registry).
     name_lut = (
@@ -464,15 +483,19 @@ def _link_rent_projects(rents: pl.DataFrame, secrets: dict) -> pl.DataFrame | No
     ).join(fingerprint, on=["AREA_EN", "_akey", "rooms_band"], how="left")
 
     n = rents.height
-    both = rents.filter(pl.col("_pn_name").is_not_null() & pl.col("_pn_fp").is_not_null())
-    agree = both.filter(pl.col("_pn_name") == pl.col("_pn_fp"))
-    rents = rents.with_columns(
-        pl.coalesce([pl.col("_pn_name"), pl.col("_pn_fp")]).alias("project_number")
-    ).drop("_akey", "_pn_name", "_pn_fp")
+    direct = pl.coalesce([pl.col("_pn_raw"), pl.col("_pn_name")])
+    both = rents.filter(direct.is_not_null() & pl.col("_pn_fp").is_not_null())
+    agree = both.filter(direct == pl.col("_pn_fp"))
+    for route, col in (("raw number", "_pn_raw"), ("name", "_pn_name"),
+                       ("fingerprint", "_pn_fp")):
+        print(f"  route {route}: {rents.get_column(col).drop_nulls().len() / n:.1%}",
+              flush=True)
+    rents = rents.with_columns(direct.fill_null(pl.col("_pn_fp")).alias("project_number"))
+    rents = rents.drop("_akey", "_pn_raw", "_pn_name", "_pn_fp")
     linked = rents.filter(pl.col("project_number").is_not_null())
     print(
         f"rent-project linkage: {linked.height:,}/{n:,} contracts linked "
-        f"({linked.height / n:.1%}); routes agree on "
+        f"({linked.height / n:.1%}); direct routes agree with the fingerprint on "
         f"{(agree.height / both.height if both.height else 0):.1%} of "
         f"{both.height:,} doubly-linked rows",
         flush=True,
