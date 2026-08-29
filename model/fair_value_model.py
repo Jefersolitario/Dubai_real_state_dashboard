@@ -67,6 +67,15 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "rent_density": False,           # trailing 180d Ejari contract count for area x rooms band
     "comps_rooms": False,            # trailing comps per project x rooms and area x rooms (strictly past)
     "rooms_dynamics": False,         # dispersion + liquidity per project x rooms (strictly past)
+    # --- rent campaign feature groups (campaign 3; all strictly past) ---
+    "rent_level": False,             # area x rooms trailing 180d rent PSF, level only
+    "rent_momentum": False,          # rent grid now vs ~13 weeks ago (area x rooms)
+    "yield_matched": False,          # rent PSF / area x rooms sale comp (needs comps_rooms)
+    "yield_spread": False,           # matched yield minus same-band city yield (needs comps_rooms)
+    "rent_pooling": False,           # rent PSF shrunk toward the city band (precision-weighted)
+    "rent_anchor": False,            # income-approach price anchor: rent / city band yield
+    "rent_divergence": False,        # rent momentum minus area sale-price momentum
+    "rent_new_segment": False,       # new-contract (non-renewal) rents: level + premium vs stock
     # --- data quality (see data_cleaning.py) ---
     "data_cleaning": False,          # repair digit-shift typos; exclude review_only/quarantine rows
 }
@@ -180,6 +189,22 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
         numeric += ["project_rooms_comp_psf", "area_rooms_comp_psf"]
     if cfg["rooms_dynamics"]:
         numeric += ["project_rooms_comp_std", "project_rooms_txn_90d"]
+    if cfg["rent_level"]:
+        numeric.append("rent_psf_180d")
+    if cfg["rent_momentum"]:
+        numeric.append("rent_mom_91d")
+    if cfg["yield_matched"]:
+        numeric.append("matched_gross_yield")
+    if cfg["yield_spread"]:
+        numeric.append("yield_spread")
+    if cfg["rent_pooling"]:
+        numeric.append("rent_psf_shrunk")
+    if cfg["rent_anchor"]:
+        numeric.append("rent_implied_psf")
+    if cfg["rent_divergence"]:
+        numeric.append("rent_price_div")
+    if cfg["rent_new_segment"]:
+        numeric += ["rent_new_psf_13w", "rent_new_premium"]
     return numeric, categorical
 
 
@@ -191,7 +216,22 @@ REFERENCE_REQUIREMENTS = {
     "unit_floor": ("projects", "units"),
     "rel_floor": ("projects", "units", "buildings_agg"),
     "rent_density": ("rent_index",),
+    "rent_level": ("rent_index",),
+    "rent_momentum": ("rent_index",),
+    "yield_matched": ("rent_index",),
+    "yield_spread": ("rent_index",),
+    "rent_pooling": ("rent_index",),
+    "rent_anchor": ("rent_index",),
+    "rent_divergence": ("rent_index",),
+    "rent_new_segment": ("rent_index", "rent_weekly_stats"),
 }
+
+# feature groups resolved inside _join_rent_grid
+RENT_GRID_GROUPS = (
+    "rent_yield", "rent_density", "rent_level", "rent_momentum",
+    "yield_matched", "yield_spread", "rent_pooling", "rent_anchor",
+    "rent_divergence", "rent_new_segment",
+)
 
 
 def reference_needed(feature_config: dict | None = None) -> list[str]:
@@ -502,13 +542,19 @@ def _join_project_reference(
 def _join_rent_grid(
     df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
 ) -> pl.DataFrame:
-    """As-of join the weekly Ejari rent grid (strictly past by construction).
+    """As-of join the weekly Ejari rent grid + derived rent features.
 
-    The grid's week-w value covers only contracts starting before w, and the
-    backward as-of join attaches week <= transaction date.
+    Strictly past by construction: the grid's week-w value covers only
+    contracts starting before w (rolling ``closed="left"`` upstream in
+    store_reference_data_gcs), every grid-level lag or pool below looks
+    further back only, and the backward as-of join attaches week <=
+    transaction date. Ejari has no building key, so everything here is
+    area x rooms-band granularity.
     """
-    if not (cfg["rent_yield"] or cfg["rent_density"]):
+    if not any(cfg[g] for g in RENT_GRID_GROUPS):
         return df
+    if (cfg["yield_matched"] or cfg["yield_spread"]) and not cfg["comps_rooms"]:
+        raise ValueError("yield_matched/yield_spread require comps_rooms enabled")
     rooms = pl.col("ROOMS_EN").cast(pl.Utf8)
     band = (
         pl.when(rooms.str.to_lowercase().str.contains("studio"))
@@ -523,40 +569,132 @@ def _join_rent_grid(
         .then(pl.lit("4BR+"))
         .otherwise(pl.lit(None, dtype=pl.Utf8))
     )
-    grid_cols = [
-        pl.col("AREA_EN").cast(pl.Utf8),
-        pl.col("rooms_band").cast(pl.Utf8).alias("_rooms_band"),
-        pl.col("week").cast(pl.Date),
-        pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
-    ]
-    if cfg["rent_density"]:
-        grid_cols.append(
-            pl.col("rent_contracts_180d").cast(pl.Float64, strict=False)
-        )
+    need_city = cfg["yield_spread"] or cfg["rent_pooling"] or cfg["rent_anchor"]
     grid = (
         reference["rent_index"]
-        .select(grid_cols)
+        .select(
+            pl.col("AREA_EN").cast(pl.Utf8),
+            pl.col("rooms_band").cast(pl.Utf8).alias("_rooms_band"),
+            pl.col("week").cast(pl.Date),
+            pl.col("area_rent_psf_180d").cast(pl.Float64, strict=False),
+            pl.col("rent_contracts_180d").cast(pl.Float64, strict=False),
+        )
         .drop_nulls(["AREA_EN", "_rooms_band", "week"])
-        .sort("week")
+        .sort("AREA_EN", "_rooms_band", "week")
     )
+    if cfg["rent_momentum"] or cfg["rent_divergence"]:
+        # 13 grid steps ~ 91 days; a sparse cell that skips weeks lags
+        # further into the past, never forward.
+        prev = pl.col("area_rent_psf_180d").shift(13).over("AREA_EN", "_rooms_band")
+        grid = grid.with_columns(
+            pl.when(prev > 0)
+            .then(pl.col("area_rent_psf_180d") / prev)
+            .alias("rent_mom_91d")
+        )
+    if need_city:
+        # Contracts-weighted city rent per band-week: quantiles don't
+        # compose across districts, but a weighted mean of medians is a
+        # stable city-level location for pooling and the yield spread.
+        city = grid.group_by("_rooms_band", "week").agg(
+            (
+                (pl.col("area_rent_psf_180d") * pl.col("rent_contracts_180d")).sum()
+                / pl.col("rent_contracts_180d").sum()
+            ).alias("_city_band_rent")
+        )
+        grid = grid.join(city, on=["_rooms_band", "week"], how="left")
+        if cfg["rent_pooling"] or cfg["rent_anchor"]:
+            k = float(cfg.get("rent_pool_k", 25))
+            n = pl.col("rent_contracts_180d")
+            grid = grid.with_columns(
+                ((n * pl.col("area_rent_psf_180d") + k * pl.col("_city_band_rent")) / (n + k))
+                .alias("rent_psf_shrunk")
+            )
     df = df.with_columns(band.alias("_rooms_band")).sort("date")
     df = df.join_asof(
-        grid,
+        grid.sort("week"),
         left_on="date",
         right_on="week",
         by=["AREA_EN", "_rooms_band"],
         strategy="backward",
-    ).drop("_rooms_band", "week")
+    ).drop("week")
+
+    if cfg["rent_new_segment"]:
+        # Renewals are RERA-capped and lag the market; the "new" segment of
+        # the weekly stats is the leading series. Weekly medians are noisy,
+        # so smooth with a strictly-past 91d rolling median per cell.
+        new_grid = (
+            reference["rent_weekly_stats"]
+            .filter((pl.col("segment") == "new") & (pl.col("rooms_band") != "All"))
+            .select(
+                pl.col("AREA_EN").cast(pl.Utf8),
+                pl.col("rooms_band").cast(pl.Utf8).alias("_rooms_band"),
+                pl.col("week").cast(pl.Date),
+                pl.col("median").cast(pl.Float64, strict=False).alias("_new_wk"),
+            )
+            .drop_nulls(["AREA_EN", "_rooms_band", "week", "_new_wk"])
+            .sort("week")
+            .with_columns(
+                pl.col("_new_wk")
+                .rolling_median_by("week", window_size="91d", closed="left")
+                .over("AREA_EN", "_rooms_band")
+                .alias("rent_new_psf_13w")
+            )
+            .drop("_new_wk")
+        )
+        df = df.join_asof(
+            new_grid,
+            left_on="date",
+            right_on="week",
+            by=["AREA_EN", "_rooms_band"],
+            strategy="backward",
+        ).drop("week")
+
+    if cfg["yield_spread"] or cfg["rent_anchor"]:
+        # Trailing city-wide sale PSF per rooms band, strictly past — the
+        # denominator that turns the city band rent into a cap-rate level.
+        df = df.with_columns(_past_stat("psf", "60d", "_rooms_band").alias("_band_price"))
+
+    exprs: list[pl.Expr] = []
+    matched = pl.when(pl.col("area_rooms_comp_psf") > 0).then(
+        pl.col("area_rent_psf_180d") / pl.col("area_rooms_comp_psf")
+    )
+    city_yield = pl.when(pl.col("_band_price") > 0).then(
+        pl.col("_city_band_rent") / pl.col("_band_price")
+    ) if (cfg["yield_spread"] or cfg["rent_anchor"]) else None
+    if cfg["rent_level"]:
+        exprs.append(pl.col("area_rent_psf_180d").alias("rent_psf_180d"))
+    if cfg["yield_matched"]:
+        exprs.append(matched.alias("matched_gross_yield"))
+    if cfg["yield_spread"]:
+        exprs.append((matched - city_yield).alias("yield_spread"))
+    if cfg["rent_anchor"]:
+        src = "rent_psf_shrunk" if cfg["rent_pooling"] else "area_rent_psf_180d"
+        exprs.append(
+            pl.when(city_yield > 0).then(pl.col(src) / city_yield).alias("rent_implied_psf")
+        )
+    if cfg["rent_divergence"]:
+        area_mom = _past_stat("psf", "30d", "AREA_EN") / _past_stat("psf", "180d", "AREA_EN")
+        exprs.append((pl.col("rent_mom_91d") - area_mom).alias("rent_price_div"))
+    if cfg["rent_new_segment"]:
+        exprs.append(
+            pl.when(pl.col("area_rent_psf_180d") > 0)
+            .then(pl.col("rent_new_psf_13w") / pl.col("area_rent_psf_180d"))
+            .alias("rent_new_premium")
+        )
     if cfg["rent_yield"]:
         denom_cols = [c for c in ("project_comp_psf", "area_comp_psf") if c in df.columns]
         if denom_cols:
-            df = df.with_columns(
+            exprs.append(
                 (pl.col("area_rent_psf_180d") / pl.coalesce([pl.col(c) for c in denom_cols]))
                 .alias("implied_gross_yield")
             )
         else:
-            df = df.with_columns(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
-    return df
+            exprs.append(pl.lit(None, dtype=pl.Float64).alias("implied_gross_yield"))
+    if exprs:
+        df = df.with_columns(exprs)
+    return df.drop(
+        c for c in ("_rooms_band", "_city_band_rent", "_band_price") if c in df.columns
+    )
 
 
 def _join_units_registry(
