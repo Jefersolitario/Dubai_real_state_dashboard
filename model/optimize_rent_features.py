@@ -69,11 +69,17 @@ SELECTION_END = date(2026, 8, 1)
 # the current champion. Ordered by expected value from the evidence.
 CANDIDATE_LADDER: list[dict] = [
     {
-        "name": "+ renovation permits",
+        "name": "+ renovation permits (5y)",
         "detail": "trailing 5y DM adjustment-permit count + days since last permit "
                   "on the project (building-investment proxy for unit condition; "
                   "campaign 4, needs modification_permits in GCS)",
         "toggle": {"renovation_permits": True},
+    },
+    {
+        "name": "renovation permit window 2y",
+        "detail": "trailing 2y adjustment-permit count variant — recent works "
+                  "only, closer to the condition-decay horizon",
+        "toggle": {"renovation_permits": True, "permit_window_days": 730},
     },
     {
         "name": "+ project-linked rents",

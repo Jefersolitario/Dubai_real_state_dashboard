@@ -214,7 +214,7 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
             "project_gross_yield",
         ]
     if cfg["renovation_permits"]:
-        numeric += ["permits_5y", "days_since_permit"]
+        numeric += ["permits_window", "days_since_permit"]
     return numeric, categorical
 
 
@@ -759,8 +759,9 @@ def _join_permits(
 
     Dubai Municipality adjustment/addition permits are public events dated
     before the sale; two backward as-of joins against the cumulative event
-    count give the trailing five-year permit count and the recency of the
-    last permit — a building-investment proxy for unit condition. A project
+    count give the trailing permit count (window from
+    ``permit_window_days``, default 5 years) and the recency of the last
+    permit — a building-investment proxy for unit condition. A project
     absent from the permits data means no adjustment permits: count 0, no
     recency.
     """
@@ -783,18 +784,19 @@ def _join_permits(
     df = df.join_asof(
         events, left_on="date", right_on="permit_date", by=["_pn"], strategy="backward"
     ).rename({"_cum": "_cum_now"})
+    window_days = int(cfg.get("permit_window_days", 1826))
     df = df.with_columns(
         (pl.col("date") - pl.col("permit_date")).dt.total_days()
         .cast(pl.Float64).alias("days_since_permit"),
-        (pl.col("date") - pl.duration(days=1826)).alias("_d5"),
+        (pl.col("date") - pl.duration(days=window_days)).alias("_dw"),
     ).drop("permit_date")
     df = df.join_asof(
-        events, left_on="_d5", right_on="permit_date", by=["_pn"], strategy="backward"
-    ).rename({"_cum": "_cum_5y_ago"})
+        events, left_on="_dw", right_on="permit_date", by=["_pn"], strategy="backward"
+    ).rename({"_cum": "_cum_window_ago"})
     return df.with_columns(
-        (pl.col("_cum_now").fill_null(0) - pl.col("_cum_5y_ago").fill_null(0))
-        .cast(pl.Float64).alias("permits_5y")
-    ).drop("_pn", "_d5", "_cum_now", "_cum_5y_ago", "permit_date")
+        (pl.col("_cum_now").fill_null(0) - pl.col("_cum_window_ago").fill_null(0))
+        .cast(pl.Float64).alias("permits_window")
+    ).drop("_pn", "_dw", "_cum_now", "_cum_window_ago", "permit_date")
 
 
 def _join_units_registry(
