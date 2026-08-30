@@ -77,6 +77,7 @@ DEFAULT_FEATURE_CONFIG: dict[str, bool] = {
     "rent_divergence": False,        # rent momentum minus area sale-price momentum
     "rent_new_segment": False,       # new-contract (non-renewal) rents: level + premium vs stock
     "rent_project": False,           # project-linked rents: trailing PSF, count, same-project yield
+    "renovation_permits": False,     # DM adjustment-permit history on the project (campaign 4)
     # --- data quality (see data_cleaning.py) ---
     "data_cleaning": False,          # repair digit-shift typos; exclude review_only/quarantine rows
 }
@@ -212,6 +213,8 @@ def feature_columns(feature_config: dict[str, bool] | None = None) -> tuple[list
             "project_rent_contracts_180d",
             "project_gross_yield",
         ]
+    if cfg["renovation_permits"]:
+        numeric += ["permits_5y", "days_since_permit"]
     return numeric, categorical
 
 
@@ -232,6 +235,7 @@ REFERENCE_REQUIREMENTS = {
     "rent_divergence": ("rent_index",),
     "rent_new_segment": ("rent_index", "rent_weekly_stats"),
     "rent_project": ("rent_project_index",),
+    "renovation_permits": ("modification_permits",),
 }
 
 # feature groups resolved inside _join_rent_grid
@@ -748,6 +752,51 @@ def _join_project_rent(
     return df
 
 
+def _join_permits(
+    df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
+) -> pl.DataFrame:
+    """Renovation-permit history on the sale's project, strictly past.
+
+    Dubai Municipality adjustment/addition permits are public events dated
+    before the sale; two backward as-of joins against the cumulative event
+    count give the trailing five-year permit count and the recency of the
+    last permit — a building-investment proxy for unit condition. A project
+    absent from the permits data means no adjustment permits: count 0, no
+    recency.
+    """
+    if not cfg["renovation_permits"]:
+        return df
+    events = (
+        reference["modification_permits"]
+        .select(
+            pl.col("project_number").cast(pl.Int64, strict=False).alias("_pn"),
+            pl.col("permit_date").cast(pl.Date),
+        )
+        .drop_nulls()
+        .unique()
+        .sort("permit_date")
+        .with_columns(pl.col("permit_date").cum_count().over("_pn").alias("_cum"))
+    )
+    df = df.with_columns(
+        pl.col("PROJECT_NUMBER").cast(pl.Int64, strict=False).alias("_pn")
+    ).sort("date")
+    df = df.join_asof(
+        events, left_on="date", right_on="permit_date", by=["_pn"], strategy="backward"
+    ).rename({"_cum": "_cum_now"})
+    df = df.with_columns(
+        (pl.col("date") - pl.col("permit_date")).dt.total_days()
+        .cast(pl.Float64).alias("days_since_permit"),
+        (pl.col("date") - pl.duration(days=1826)).alias("_d5"),
+    ).drop("permit_date")
+    df = df.join_asof(
+        events, left_on="_d5", right_on="permit_date", by=["_pn"], strategy="backward"
+    ).rename({"_cum": "_cum_5y_ago"})
+    return df.with_columns(
+        (pl.col("_cum_now").fill_null(0) - pl.col("_cum_5y_ago").fill_null(0))
+        .cast(pl.Float64).alias("permits_5y")
+    ).drop("_pn", "_d5", "_cum_now", "_cum_5y_ago", "permit_date")
+
+
 def _join_units_registry(
     df: pl.DataFrame, cfg: dict, reference: dict[str, pl.DataFrame] | None
 ) -> pl.DataFrame:
@@ -905,6 +954,7 @@ def feature_engineering(
     df = _join_project_reference(df, cfg, reference)
     df = _join_rent_grid(df, cfg, reference)
     df = _join_project_rent(df, cfg, reference)
+    df = _join_permits(df, cfg, reference)
     df = _join_units_registry(df, cfg, reference)
     return _select_output_columns(df, cfg)
 

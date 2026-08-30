@@ -69,6 +69,13 @@ SELECTION_END = date(2026, 8, 1)
 # the current champion. Ordered by expected value from the evidence.
 CANDIDATE_LADDER: list[dict] = [
     {
+        "name": "+ renovation permits",
+        "detail": "trailing 5y DM adjustment-permit count + days since last permit "
+                  "on the project (building-investment proxy for unit condition; "
+                  "campaign 4, needs modification_permits in GCS)",
+        "toggle": {"renovation_permits": True},
+    },
+    {
         "name": "+ project-linked rents",
         "detail": "trailing project rent PSF, contract count, and same-project "
                   "gross yield — rents mapped to projects via the name join + "
@@ -188,7 +195,11 @@ def load_references(configs: list[dict]) -> tuple[dict[str, pl.DataFrame], list[
 
 
 def config_key(cfg: dict, params: dict) -> str:
-    payload = json.dumps({"cfg": cfg, "params": params}, sort_keys=True, default=str)
+    """Hash of the ACTIVE configuration only: False-valued flags are dropped,
+    so adding a new (default-off) group to DEFAULT_FEATURE_CONFIG does not
+    invalidate every cached/resumed evaluation."""
+    active = {k: v for k, v in cfg.items() if v is not False}
+    payload = json.dumps({"cfg": active, "params": params}, sort_keys=True, default=str)
     return hashlib.md5(payload.encode()).hexdigest()[:12]
 
 
@@ -343,6 +354,9 @@ def main() -> int:
     parser.add_argument("--baseline-only", action="store_true")
     parser.add_argument("--resume", action="store_true",
                         help="Reuse completed evals from the progress JSON.")
+    parser.add_argument("--rungs",
+                        help="Comma-separated name substrings: only matching "
+                             "ladder candidates are evaluated.")
     parser.add_argument("--n-splits", type=int, default=10)
     parser.add_argument("--max-evals", type=int, default=MAX_EVALS)
     parser.add_argument("--progress-json", default=DEFAULT_PROGRESS)
@@ -360,8 +374,16 @@ def main() -> int:
         raise SystemExit(
             f"Baseline config needs missing reference frames: {missing_refs}"
         )
+    selected_ladder = CANDIDATE_LADDER
+    if args.rungs:
+        needles = [n.strip().lower() for n in args.rungs.split(",") if n.strip()]
+        selected_ladder = [
+            spec for spec in CANDIDATE_LADDER
+            if any(n in spec["name"].lower() for n in needles)
+        ]
+        print(f"--rungs filter: {len(selected_ladder)} of {len(CANDIDATE_LADDER)} candidates")
     runnable_ladder = []
-    for spec in CANDIDATE_LADDER:
+    for spec in selected_ladder:
         lacking = [
             n
             for n in reference_needed({**shipped_cfg, **spec.get("toggle", {})})

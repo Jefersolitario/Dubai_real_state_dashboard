@@ -399,6 +399,79 @@ def _recent_contracts(rents: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def pull_permits(config: "DDAConfig", secrets: dict) -> None:
+    """Publish per-project renovation-permit events (dm_building_permits).
+
+    Dubai Municipality publishes building permits with ``parcel_id`` and
+    permit type; ``dld_buildings`` carries the same ``parcel_id`` next to
+    ``project_id``, and the projects table bridges to ``project_number`` —
+    the key the sales snapshot speaks. Only adjustment/addition permits with
+    a delivered ``permit_date`` are kept: they signal renovation investment
+    in the building, a candidate unit-condition proxy for the fair-value
+    model (campaign 4).
+    """
+    from ingestion.gcs_storage import read_reference_frames
+
+    permits = fetch_dataset(
+        replace(config, entity="dm"),
+        "dm_building_permits-open-api",
+        # Stable unique-key ordering — date ordering shuffles page
+        # boundaries between requests (measured on sales and rents).
+        params={"order_by": "application_id", "order_dir": "asc"},
+        max_records=2_000_000,
+    )
+    permits = (
+        permits.select(
+            pl.col("parcel_id").cast(pl.Int64, strict=False),
+            pl.col("permit_date").cast(pl.Utf8).str.slice(0, 10)
+            .str.to_date("%Y-%m-%d", strict=False).alias("permit_date"),
+            pl.col("application_type_english").cast(pl.Utf8).alias("permit_type"),
+            pl.col("building_type").cast(pl.Utf8),
+        )
+        .drop_nulls(["parcel_id", "permit_date"])
+        .filter(
+            pl.col("permit_type").str.contains(r"(?i)adjust|addition")
+            & ~pl.col("permit_type").str.contains(r"(?i)cancel")
+        )
+        .unique()
+    )
+    print(f"adjustment/addition permits with a permit_date: {permits.height:,}", flush=True)
+
+    buildings = fetch_dataset(
+        config,
+        "dld_buildings-open-api",
+        params={"order_by": "property_id", "order_dir": "asc"},
+        max_records=2_000_000,
+    )
+    parcel_map = (
+        buildings.select(
+            pl.col("parcel_id").cast(pl.Int64, strict=False),
+            pl.col("project_id").cast(pl.Int64, strict=False),
+        )
+        .drop_nulls()
+        .unique()
+    )
+    projects = read_reference_frames(secrets, ["projects"])["projects"].select(
+        pl.col("project_id").cast(pl.Int64, strict=False),
+        pl.col("project_number").cast(pl.Int64, strict=False),
+    ).drop_nulls().unique("project_id")
+    events = (
+        permits.join(parcel_map, on="parcel_id", how="inner")
+        .join(projects, on="project_id", how="inner")
+        .select("project_number", "permit_date", "permit_type", "building_type")
+        .unique()
+        .sort("project_number", "permit_date")
+    )
+    print(
+        f"permit-project linkage: {events.height:,} events on "
+        f"{events['project_number'].n_unique():,} projects "
+        f"(parcel join matched {permits.join(parcel_map, on='parcel_id', how='inner').height:,} "
+        f"of {permits.height:,} permits)",
+        flush=True,
+    )
+    upload(secrets, "modification_permits.parquet", events)
+
+
 def _link_rent_projects(rents: pl.DataFrame, secrets: dict) -> pl.DataFrame | None:
     """Attach ``project_number`` to rent contracts via two measured routes.
 
@@ -692,7 +765,8 @@ def main() -> int:
     parser.add_argument(
         "--only", nargs="*",
         default=["projects", "buildings", "service", "rents", "units"],
-        choices=["projects", "buildings", "service", "rents", "units", "saleindex"],
+        choices=["projects", "buildings", "service", "rents", "units",
+                 "saleindex", "permits"],
     )
     parser.add_argument(
         "--probe-rents", action="store_true",
@@ -721,6 +795,8 @@ def main() -> int:
         pull_units(config, secrets)
     if "saleindex" in args.only:
         pull_sale_index(config, secrets)
+    if "permits" in args.only:
+        pull_permits(config, secrets)
     return 0
 
 
