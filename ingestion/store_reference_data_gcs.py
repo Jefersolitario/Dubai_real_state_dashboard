@@ -399,29 +399,10 @@ def _recent_contracts(rents: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def pull_permits(config: "DDAConfig", secrets: dict) -> None:
-    """Publish per-project renovation-permit events (dm_building_permits).
-
-    Dubai Municipality publishes building permits with ``parcel_id`` and
-    permit type; ``dld_buildings`` carries the same ``parcel_id`` next to
-    ``project_id``, and the projects table bridges to ``project_number`` —
-    the key the sales snapshot speaks. Only adjustment/addition permits with
-    a delivered ``permit_date`` are kept: they signal renovation investment
-    in the building, a candidate unit-condition proxy for the fair-value
-    model (campaign 4).
-    """
-    from ingestion.gcs_storage import read_reference_frames
-
-    permits = fetch_dataset(
-        replace(config, entity="dm"),
-        "dm_building_permits-open-api",
-        # Stable unique-key ordering — date ordering shuffles page
-        # boundaries between requests (measured on sales and rents).
-        params={"order_by": "application_id", "order_dir": "asc"},
-        max_records=2_000_000,
-    )
-    permits = (
-        permits.select(
+def _slim_permits(chunk: pl.DataFrame) -> pl.DataFrame:
+    """Reduce a raw permits chunk to delivered adjustment/addition events."""
+    return (
+        chunk.select(
             pl.col("parcel_id").cast(pl.Int64, strict=False),
             pl.col("permit_date").cast(pl.Utf8).str.slice(0, 10)
             .str.to_date("%Y-%m-%d", strict=False).alias("permit_date"),
@@ -435,6 +416,50 @@ def pull_permits(config: "DDAConfig", secrets: dict) -> None:
         )
         .unique()
     )
+
+
+def pull_permits(config: "DDAConfig", secrets: dict) -> None:
+    """Publish per-project renovation-permit events (dm_building_permits).
+
+    Dubai Municipality publishes building permits with ``parcel_id`` and
+    permit type; ``dld_buildings`` carries the same ``parcel_id`` next to
+    ``project_id``, and the projects table bridges to ``project_number`` —
+    the key the sales snapshot speaks. Only adjustment/addition permits with
+    a delivered ``permit_date`` are kept: they signal renovation investment
+    in the building, a candidate unit-condition proxy for the fair-value
+    model (campaign 4).
+    """
+    from ingestion.gcs_storage import read_reference_frames
+
+    # Yearly chunks: one token per chunk (a single multi-hour fetch expires
+    # the gateway bearer token mid-pagination — measured 2026-08), visible
+    # progress, and a chunk-level retry. 2010 onward is ample margin for the
+    # trailing-5y feature window; stable unique-key ordering within chunks.
+    this_year = date.today().year
+    chunks = [
+        (
+            str(year),
+            {
+                "filter": (
+                    f"application_submission_date>='{year}-01-01' AND "
+                    f"application_submission_date<'{year + 1}-01-01'"
+                ),
+                "order_by": "application_id",
+                "order_dir": "asc",
+            },
+        )
+        for year in range(2010, this_year + 1)
+    ]
+    permits = fetch_chunked(
+        replace(config, entity="dm"),
+        "dm_building_permits-open-api",
+        chunks,
+        max_records=400_000,
+        transform=_slim_permits,
+    )
+    if permits.is_empty():
+        raise RuntimeError("permits pull returned no records; not overwriting GCS")
+    permits = permits.unique()
     print(f"adjustment/addition permits with a permit_date: {permits.height:,}", flush=True)
 
     buildings = fetch_dataset(
