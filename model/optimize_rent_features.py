@@ -48,7 +48,10 @@ from model.fair_value_model import (
     trim_psf,
 )
 
-REPORT_PATH = "reports/rent_campaign_report.md"
+# The runner's own output is the LAST RUN only — a filtered --rungs run would
+# otherwise clobber the curated cumulative record in rent_campaign_report.md,
+# which carries every campaign's table and the conclusions drawn from them.
+REPORT_PATH = "reports/campaign_last_run.md"
 DEFAULT_PROGRESS = "reports/rent_campaign_progress.json"
 
 # Campaign 2 acceptance protocol (see fair_value_optimization_report.md):

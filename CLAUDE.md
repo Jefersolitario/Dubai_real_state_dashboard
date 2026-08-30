@@ -42,13 +42,25 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m tests.smoke_test_fair_value
 .\.venv\Scripts\python.exe -m model.optimize_fair_value
 
-# Campaign 3 runner: rent-feature ladder with reference frames + tail-veto gate.
-# 2026-08 verdict, both phases: all 12 candidates rejected — district x rooms
-# features AND phase 2's project-linked rents (`rent_project`, best rung at
-# +0.02pp vs the 0.05pp gate). Rent features are a measured null even at
-# project granularity; the groups stay in fair_value_model.py, off by default
-# (reports/rent_campaign_report.md has the full two-phase conclusion).
+# Campaign runner for unit-signal features (rents, renovation permits) with
+# reference frames + tail-veto gate. --rungs filters to named candidates; the
+# run's own table goes to reports/campaign_last_run.md, while
+# reports/rent_campaign_report.md is the CURATED cumulative record (edit by
+# hand — a filtered run must not erase earlier campaigns).
+# 2026-08 verdict across campaigns 3-4: every candidate rejected — district
+# rents, project-linked rents (`rent_project`) and renovation permits
+# (`renovation_permits`) all landed at +0.00..+0.02pp vs the 0.05pp gate. The
+# groups stay in fair_value_model.py, off by default; the residual ~4% error
+# is unit-level (view, floor, condition) and not reachable from public
+# aggregates.
 .\.venv\Scripts\python.exe -m model.optimize_rent_features
+.\.venv\Scripts\python.exe -m model.optimize_rent_features --rungs renovation
+
+# Pull DM building permits and publish dld_reference/modification_permits.parquet
+# (adjustment/addition permits linked to projects via parcel_id -> dld_buildings;
+# yearly chunks so the gateway token cannot expire mid-pull). Feeds the Fair
+# Value tab's "Building works" column.
+.\.venv\Scripts\python.exe -m ingestion.store_reference_data_gcs --only permits
 
 # Train the fair-value model offline and publish the inference bundle to GCS
 # (run after each snapshot refresh — weekly cadence; the app never trains)
