@@ -605,6 +605,38 @@ def _render_result_charts(
         st.plotly_chart(importance_chart(result.importances), use_container_width=True)
 
 
+def _render_buyer_guide() -> None:
+    """How to turn model output into viewings — the buyer's funnel."""
+    with st.expander("🎯 How to spot a real opportunity", expanded=False):
+        st.markdown(
+            "**The model is a funnel, not an oracle.** Its typical pricing error "
+            "is ~4%, so the error that remains is **unit-level** — view, "
+            "condition, renovation, exact floor. No available data feed can see "
+            "those (measured twice, at district and at project granularity) — "
+            "but *you* can, in a 20-minute viewing. The right workflow: the "
+            "model funnels ~10,000 monthly sales down to a handful of "
+            "corroborated candidates → **your eyes do the last 4%**.\n\n"
+            "1. **Ignore small discounts.** Below ~8% (twice the typical error) "
+            "a discount is indistinguishable from model noise.\n"
+            "2. **Work from the flag list, ranked by signal strength** — how "
+            "many times the typical error a discount represents, for that "
+            "segment. A −15% spread is strong evidence in a liquid project and "
+            "noise in a cold start.\n"
+            "3. **Prefer corroborated (distressed) rows.** In the current DLD "
+            "open feed that means **multiple sellers** (~4% of sales — often "
+            "estates, splits, or joint owners exiting) or an **illiquid "
+            "project**; forced-sale procedure keywords exist in the rules but "
+            "no such procedures appear in the public feed today.\n"
+            "4. **Then go look.** Every flag needs a viewing — the cheapest "
+            "flat on paper may be priced for its condition or its view.\n\n"
+            "⚠️ **Falling-market caveat:** the model prices against *trailing* "
+            "comps — in a falling market, fair values lag reality by a few "
+            "weeks, so apparent discounts are **slightly overstated**. Favor "
+            "strongly corroborated flags over maximal discounts, and re-check "
+            "the market trend on the Market Overview page."
+        )
+
+
 def _render_methodology(scored: pl.DataFrame) -> None:
     """The Data & methodology expander (model, caveats, sources, procedures)."""
     with st.expander("📚 Data & methodology", expanded=False):
@@ -762,6 +794,7 @@ def render_fair_value_tab(
     flagged = view.filter(pl.col("below_fair_value"))
 
     _render_metric_row(result, view, flagged, threshold_pct)
+    _render_buyer_guide()
     if view.is_empty():
         _render_empty_view_warning(score_start, score_end, start_date, end_date)
         return
