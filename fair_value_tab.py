@@ -23,6 +23,7 @@ from dashboard_constants import (
     bedroom_type_expr,
     layout_defaults as _layout_defaults,
 )
+from buyer_context import attach_buyer_context
 from model.data_cleaning import RULE_LABELS
 from model.fair_value_model import (
     FairValueResult,
@@ -231,6 +232,24 @@ def get_review_rows(data_version: str) -> pl.DataFrame:
     if ref_names:
         reference = read_reference_frames(st.secrets, ref_names)
     return excluded_suspicious_sales(_raw_transactions(), reference=reference)
+
+
+@st.cache_resource(ttl=6 * 3600, show_spinner="Loading rent and permit context...")
+def get_buyer_context_frames() -> dict[str, pl.DataFrame]:
+    """Optional reference frames behind the rent/yield and works columns.
+
+    Each is independent and skipped when it has not been published yet, so
+    the flagged table degrades column by column instead of erroring: rent
+    needs the rents pull, works needs `--only permits`. Refreshed on the
+    same 6h TTL as the model bundle.
+    """
+    frames: dict[str, pl.DataFrame] = {}
+    for name in ("rent_project_index", "rent_index", "modification_permits"):
+        try:
+            frames[name] = read_reference_frames(st.secrets, [name])[name]
+        except (FileNotFoundError, KeyError):
+            continue
+    return frames
 
 
 def _features_or_error(data_version: str) -> pl.DataFrame | None:
@@ -545,6 +564,19 @@ def _render_empty_view_warning(
         st.warning("No scored transactions for the selected filters/date range.")
 
 
+def _with_buyer_context(flagged: pl.DataFrame) -> pl.DataFrame:
+    """Rent/yield and building-works columns, skipped if artifacts are absent."""
+    frames = get_buyer_context_frames()
+    if not frames or flagged.is_empty():
+        return flagged
+    return attach_buyer_context(
+        flagged.with_columns((pl.col("ACTUAL_AREA") * SQM_TO_SQFT).alias("size_sqft")),
+        rent_project_index=frames.get("rent_project_index"),
+        rent_index=frames.get("rent_index"),
+        permits=frames.get("modification_permits"),
+    )
+
+
 def _render_flagged_table(flagged: pl.DataFrame, view: pl.DataFrame) -> None:
     """The ranked flagged-deals table plus its CSV download button."""
     st.markdown("#### Flagged transactions")
@@ -562,6 +594,16 @@ def _render_flagged_table(flagged: pl.DataFrame, view: pl.DataFrame) -> None:
         if "BUILDING_NAME_EN" in view.columns
         else []
     )
+    flagged = _with_buyer_context(flagged)
+    income_cols: list[pl.Expr] = []
+    if "gross_yield" in flagged.columns:
+        income_cols += [
+            pl.col("est_annual_rent").round(0).alias("Est. rent (AED/yr)"),
+            (pl.col("gross_yield") * 100).round(1).alias("Gross yield (%)"),
+            pl.col("rent_basis").alias("Rent from"),
+        ]
+    if "works_label" in flagged.columns:
+        income_cols.append(pl.col("works_label").alias("Building works"))
     table = (
         flagged
         .sort(["distressed", "signal_strength"], descending=[True, True])
@@ -578,11 +620,29 @@ def _render_flagged_table(flagged: pl.DataFrame, view: pl.DataFrame) -> None:
             pl.col("fair_value_aed").round(0).alias("Fair value (AED)"),
             (pl.col("spread_pct") * 100).round(1).alias("Spread (%)"),
             pl.col("signal_strength").round(1).alias("Signal (×)"),
+            *income_cols,
             pl.col("cold_start").alias("Cold start"),
             pl.col("distressed").alias("Distressed"),
             pl.col("signals").alias("Signals"),
         )
     )
+    if income_cols:
+        st.caption(
+            "**Est. rent** is what similar flats currently let for — from the same "
+            "project where Ejari contracts could be matched to it, otherwise from "
+            "the district and bedroom count (**Rent from** says which). "
+            "**Gross yield** is that rent over the price actually paid, *before* "
+            "service charges, which in Dubai commonly run 10–25 AED/ft²/yr and can "
+            "take a percentage point or more off. "
+            + (
+                "**Building works** counts Dubai Municipality alteration permits on "
+                "the project in the last five years — a sign of investment in the "
+                "building, though it can equally mean ongoing disruption; treat it "
+                "as a question to ask, not an answer."
+                if "works_label" in flagged.columns
+                else ""
+            )
+        )
     st.dataframe(table, use_container_width=True, height=420)
     st.download_button(
         "Download flagged transactions CSV",
@@ -636,6 +696,20 @@ def _render_buyer_guide() -> None:
             "neighbours sold for. It cannot see the view from the window, the state "
             "of the kitchen, or whether the place has been renovated — and that is "
             "roughly the last 4% of the price.\n\n"
+            "**“What would it rent for, and is that a good return?”**\n\n"
+            "The list shows the rent similar flats currently achieve and the gross "
+            "yield that rent would give you on the price paid. Around 5–7% is "
+            "ordinary for a Dubai apartment. Two honest caveats: the figure is "
+            "*gross*, so subtract service charges (commonly 10–25 AED/ft²/yr, which "
+            "can cost you a full percentage point), and a high yield often reflects "
+            "a location or building that appreciates more slowly. Use it to compare "
+            "flats with each other, not as a forecast of your return.\n\n"
+            "**“Has the building been worked on?”**\n\n"
+            "Where the column appears, it counts alteration permits filed with "
+            "Dubai Municipality for that project in the last five years. Recent "
+            "works can mean upgraded flats — or scaffolding, noise and a special "
+            "levy. It is a question to raise with the agent, not an answer in "
+            "itself.\n\n"
             "**“Prices are falling — does that change anything?”**\n\n"
             "Yes, and it is worth knowing. Fair value is built from sales that "
             "already closed, so in a falling market it lags reality by a few weeks. "

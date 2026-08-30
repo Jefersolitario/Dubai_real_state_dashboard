@@ -128,6 +128,7 @@ PASSTHROUGH_COLUMNS = [
     "PROCEDURE_EN",
     "AREA_EN",
     "PROJECT_EN",
+    "PROJECT_NUMBER",  # key for project-linked reference data (rents, permits)
     "MASTER_PROJECT_EN",
     "BUILDING_NAME_EN",
     "ROOMS_EN",
