@@ -369,8 +369,7 @@ def fetch_dataset_records(
             "limit": page_size,
             "offset": offset,
         }
-        response = _request_page_with_retry(config, token, query)
-        page_records = _extract_records(response.json())
+        page_records = _extract_records(_request_page_with_retry(config, token, query))
         if not page_records:
             break
 
@@ -389,12 +388,16 @@ def _request_page_with_retry(
     token: str,
     query: Mapping[str, Any],
     attempts: int = PAGE_RETRY_ATTEMPTS,
-) -> requests.Response:
-    """One dataset page, retried with exponential backoff.
+) -> Any:
+    """One dataset page's parsed payload, retried with exponential backoff.
 
     The gateway intermittently answers 502 "policy unavailable" during long
     paginated pulls; without per-page retry a single blip discards every
-    page already fetched.
+    page already fetched. Decoding happens HERE rather than in the caller
+    because the gateway also truncates response bodies mid-stream (measured
+    on dld_buildings, 2026-08): that surfaces as a JSONDecodeError, which is
+    a RequestException and just as retryable as the 502 — but only if the
+    parse sits inside this loop.
     """
     delay = 2.0
     last_error: Exception | None = None
@@ -418,7 +421,7 @@ def _request_page_with_retry(
                 )
             else:
                 _raise_for_status(response, "Dataset request")
-                return response
+                return response.json()
         except requests.RequestException as exc:
             last_error = exc
             if attempt == attempts:

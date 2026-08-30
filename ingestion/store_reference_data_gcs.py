@@ -431,6 +431,34 @@ def pull_permits(config: "DDAConfig", secrets: dict) -> None:
     """
     from ingestion.gcs_storage import read_reference_frames
 
+    # Cheap stages first: the parcel map and the projects bridge take
+    # minutes, the permits pull takes an hour. Fetching them up front means
+    # a failure here costs minutes instead of discarding a completed permits
+    # pull (measured 2026-08, when a truncated buildings page did exactly that).
+    projects = read_reference_frames(secrets, ["projects"])["projects"].select(
+        pl.col("project_id").cast(pl.Int64, strict=False),
+        pl.col("project_number").cast(pl.Int64, strict=False),
+    ).drop_nulls().unique("project_id")
+    buildings = fetch_dataset(
+        config,
+        "dld_buildings-open-api",
+        params={"order_by": "property_id", "order_dir": "asc"},
+        max_records=2_000_000,
+    )
+    parcel_map = (
+        buildings.select(
+            pl.col("parcel_id").cast(pl.Int64, strict=False),
+            pl.col("project_id").cast(pl.Int64, strict=False),
+        )
+        .drop_nulls()
+        .unique()
+    )
+    print(
+        f"parcel map: {parcel_map.height:,} parcel-project pairs covering "
+        f"{parcel_map['project_id'].n_unique():,} projects",
+        flush=True,
+    )
+
     # Yearly chunks: one token per chunk (a single multi-hour fetch expires
     # the gateway bearer token mid-pagination — measured 2026-08), visible
     # progress, and a chunk-level retry. 2010 onward is ample margin for the
@@ -462,24 +490,6 @@ def pull_permits(config: "DDAConfig", secrets: dict) -> None:
     permits = permits.unique()
     print(f"adjustment/addition permits with a permit_date: {permits.height:,}", flush=True)
 
-    buildings = fetch_dataset(
-        config,
-        "dld_buildings-open-api",
-        params={"order_by": "property_id", "order_dir": "asc"},
-        max_records=2_000_000,
-    )
-    parcel_map = (
-        buildings.select(
-            pl.col("parcel_id").cast(pl.Int64, strict=False),
-            pl.col("project_id").cast(pl.Int64, strict=False),
-        )
-        .drop_nulls()
-        .unique()
-    )
-    projects = read_reference_frames(secrets, ["projects"])["projects"].select(
-        pl.col("project_id").cast(pl.Int64, strict=False),
-        pl.col("project_number").cast(pl.Int64, strict=False),
-    ).drop_nulls().unique("project_id")
     events = (
         permits.join(parcel_map, on="parcel_id", how="inner")
         .join(projects, on="project_id", how="inner")
