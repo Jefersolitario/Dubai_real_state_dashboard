@@ -5,6 +5,11 @@ retraining more often, by another learner, by stacking, or by zero-shot
 time-series foundation models (TimesFM 3, Chronos)? Every number below comes
 from `python -m model.optimize_model_family` (commands at the end).
 
+Reviewed the same day in `reports/model_tuning_review_report.md`, which asked
+how much these verdicts depend on settings. Retraining and the foundation-model
+verdict stand, with intervals; the XGBoost figure below does not (it was its
+settings), and is annotated where it appears.
+
 ## Verdict
 
 | Lever | Result on the 69 test days | Decision |
@@ -12,7 +17,7 @@ from `python -m model.optimize_model_family` (commands at the end).
 | **Retrain at least monthly** (same design) | median error 4.37% (model as live, frozen 10 Aug) → **4.13%** | Do it: the largest gain found, no code change |
 | Average of the shipped model and its anchored-target twin | 4.27% → 4.18% when both are trained once; 4.13% → **4.06%** when both are retrained weekly | Real and confirmed, below the complexity bar: not shipped, available on request |
 | The same plus LightGBM | 4.27% → 4.16% | As above; LightGBM adds 0.02 pp for a new app dependency |
-| LightGBM, XGBoost, CatBoost on their own | no gain, or worse | Rejected |
+| LightGBM, XGBoost, CatBoost on their own | no gain | Rejected. XGBoost's −0.15 pp was its settings: set like the shipped model it equals it (review, section 6) |
 | TimesFM 3 / Chronos-2 / Chronos-Bolt forecasts as features | no gain | Rejected |
 
 The model's design stays as shipped. What it needs is to be retrained: the
@@ -104,12 +109,22 @@ Ten folds, same rows and features for every learner.
 | Same, anchored target | 3.961% | +0.020 | 15.29% | 4.70% | vetoed: more false flags |
 | LightGBM | 3.961% | +0.020 | 15.15% | 4.52% | rejected: below the gate |
 | Same, up to 2,400 iterations | 3.975% | +0.006 | 15.16% | 4.53% | rejected |
-| XGBoost | 4.135% | −0.154 | 15.56% | 4.55% | rejected |
+| XGBoost, at settings copied from the shipped model | 4.135% | −0.154 | 15.56% | 4.55% | rejected — but see below |
+| XGBoost, tuned in the review | 3.983% | −0.002 | 15.13% | 4.49% | level with shipped: nothing to gain by switching |
 | CatBoost | 4.253% | −0.272 | 15.80% | 4.40% | rejected |
 
 LightGBM and XGBoost were allowed 3,000 trees and CatBoost 1,500 (its fits
 already take seven minutes each); the later folds reached those budgets, so
 the figures are for these budgets, not for an exhaustive tuning.
+
+The review found what that sentence was hiding. Each challenger ran once.
+XGBoost had been left at one sale per leaf where the other learners require
+20, was given far too many trees (its out-of-time error is best near 200 and
+its early stopping, which watches a random tenth of the training sales, never
+fires), and loses 0.08 pp to its own handling of 200-level categories. With
+those three fixed it scores 3.983%. LightGBM was already at a good setting and
+CatBoost was stopped before it converged and has not been re-run. The three
+gradient-boosting libraries are interchangeable here once set alike.
 
 The anchored target predicts the deviation from the sale's most specific
 trailing comparable (unit-type comp, then project, building, district) instead

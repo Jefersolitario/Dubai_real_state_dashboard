@@ -249,6 +249,7 @@ audit's pagination check is the regression sentinel for this.
 | `reports/distress_validation_report.md` | Walk-forward outcome backtest of the flags |
 | `reports/fair_value_optimization_report.md` | The 110-experiment accuracy campaign log |
 | `reports/model_family_campaign_report.md` | Campaign 5: retraining cadence, other learners, blends, TimesFM 3 / Chronos forecasts |
+| `reports/model_tuning_review_report.md` | Review of campaign 5's tuning: sensitivity of TimesFM 3 / Chronos vs XGBoost to their settings, tuned learners, the ceiling for forecast features |
 | `reports/shap_insights_report.md` | SHAP analysis: drivers, insights, recommendations |
 | `reports/data_cleaning_report.md` | Cleaning rules, real-data counts, enable decision |
 | `reports/data_cleaning_research_report.md` | Industry best-practice review (IAAO, Land Registry…) |

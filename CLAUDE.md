@@ -76,6 +76,23 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m model.optimize_model_family cv hgb lgbm hgb_anchored
 .\.venv\Scripts\python.exe -m model.optimize_model_family blend hgb lgbm hgb_anchored
 
+# Campaign 5 review: how much those verdicts depend on settings. Steps:
+# forecast (Chronos-2 / Chronos-Bolt / TimesFM 3, one setting at a time),
+# xgb-forecast (XGBoost on the same weekly panel, random search), finetune,
+# score-forecasts, learners (tree learners on the late CV folds, error per tree
+# count; --all-folds to confirm), score-learners, oracle, export-forecast,
+# intervals. Needs `prep` first; same extra packages; files in .tmp/campaign5/review.
+# 2026-11 verdict (reports/model_tuning_review_report.md): the pre-trained
+# forecasters are far LESS sensitive to settings than XGBoost (spread 3-10% vs
+# 58% and 9 of 60 XGBoost settings diverging), only history length matters to
+# them, and a perfect price-level forecast is worth 0.02pp to the pricing
+# model. XGBoost's -0.15pp in the campaign was its settings (tuned: 3.983% vs
+# 3.981% shipped). The shipped settings stay.
+.\.venv\Scripts\python.exe -m model.review_model_tuning forecast --list
+.\.venv\Scripts\python.exe -m model.review_model_tuning forecast c2 c2_ctx13 tfm
+.\.venv\Scripts\python.exe -m model.review_model_tuning score-forecasts
+.\.venv\Scripts\python.exe -m model.review_model_tuning learners x_base x_tuned h_base
+
 # Pull DM building permits and publish dld_reference/modification_permits.parquet
 # (adjustment/addition permits linked to projects via parcel_id -> dld_buildings;
 # yearly chunks so the gateway token cannot expire mid-pull). Feeds the Fair
@@ -252,7 +269,9 @@ specific trailing comp), `hgb_iter2400`, `lgbm`, `xgb`, `cat`, and
 `forecast <level> <models>` has produced it (levels `area_rooms`, `project`;
 models `naive`, `mean4`, `ewma`, `bolt_small`, `bolt_base`, `chronos2`,
 `chronos2_mv`, `timesfm3`). Measured 2026-11: LightGBM +0.02pp, anchored
-+0.02pp with worse tails, XGBoost −0.15pp, CatBoost −0.27pp, more iterations
++0.02pp with worse tails, XGBoost −0.15pp (at copied settings — level with the
+shipped model once tuned, see the review below), CatBoost −0.27pp
+(under-trained, not re-run), more iterations
 +0.01pp, every forecast feature within ±0.02pp (a forecast of a district's or
 project's price level cannot see the unit-level error that is left). Plain
 averages do help — shipped + anchored +0.06pp in CV and +0.09pp on the
@@ -260,6 +279,52 @@ held-out days — but not by the +0.10pp over the best member the campaign
 required, so nothing ships; fitted blend weights add nothing over the average.
 sklearn's histogram binning raises on a feature with no observed value, which
 is why an all-missing forecast column is set to a constant per fold.
+`cadence` also saves `cadence_predictions.npy` (one column per weekly cut-off)
+for the review's `intervals` step.
+
+### -m model.review_model_tuning
+
+Second pass over campaign 5 (`reports/model_tuning_review_report.md` is its
+curated record): every challenger there ran at one configuration, so this
+measures how much the verdicts depend on settings. Forecast steps share one
+weekly panel (181 district × rooms-band series, log median AED/sqft, ≥3
+sales) and score every run on identical cells with week-block bootstrap
+intervals; `Panel.noise` is the split-half sampling noise of each weekly
+median (0.054 log points on average against a total error of ~0.097 for every
+competent forecaster). Facts worth keeping:
+
+- **Pre-trained forecasters**: history length is the only setting that
+  matters (Chronos-2 with 8 weeks +8%, 13 weeks +5%; ≥52 weeks no loss); gap
+  handling, logs vs raw, model size, covariates, joint/cross-learning all move
+  error by under 2%. None beats `ewma(0.3)` by more than its interval at 1, 4
+  or 13 weeks. TimesFM 3's `use_znorm` is inert (the model normalises itself)
+  and its default batch of 4 is five times slower than 64 for identical
+  output. Chronos-2 handed a series with no observed value in its window
+  returns a number near zero instead of failing — the runner skips those.
+- **Fine-tuning Chronos-2** (100 steps): rates 1e-6..1e-4 change nothing,
+  1e-3 makes it 3% worse than zero-shot.
+- **XGBoost as a forecaster**: 60 random settings span 58%, 9 diverge
+  (pseudo-Huber on an uncentred level target), library defaults lose to
+  "same as last week"; posed as the change from a moving average with
+  relative features, 23 settings span 6%.
+- **Tree learners on pricing** (late folds, shipped 3.775%): the loss function
+  is the big knob (squared error +0.24..0.37pp) and library defaults cost
+  0.36–0.54pp; XGBoost needs `min_child_weight` 20, category codes as plain
+  numbers (its native category splits cost 0.08pp; no such effect in LightGBM
+  or sklearn) and the incumbent's learning rate to reach 3.775%. Set alike the
+  three libraries are interchangeable.
+- **Early stopping on a random tenth never fires** for any learner — that
+  tenth shares dates and projects with the rest — while out-of-time error has
+  already turned for XGBoost and LightGBM. The shipped model is protected by
+  its 800-tree cap, chosen on out-of-time folds. `stop_on="recent"` (stop on
+  the newest tenth, refit on everything) is the alternative.
+- **Do not select on a few folds**: 100 sales per leaf + 2,400 trees looked
+  +0.05pp on folds 8–10 and was −0.03pp on folds 1–7 (3.984% vs 3.981% over
+  ten). Seed noise is ~0.005pp on MedAPE but ~0.1pp on the tail metrics on
+  three folds, so the tail vetoes only mean something on all ten.
+- **Ceiling for any forecast feature** (`oracle`): the realised same-week
+  level of the sale's district × rooms band adds 0.016pp, of its project
+  0.022pp.
 
 ### -m tests.smoke_test_fair_value
 

@@ -597,6 +597,7 @@ def run_cadence(campaign: Campaign, name: str = "hgb") -> None:
     for cutoff in cutoffs:
         predictions[cutoff], _ = fit(trim_psf(feats.filter(pl.col("date") <= cutoff)), test)
         print(f"  fitted on sales to {cutoff}", flush=True)
+    np.save(campaign.path("cadence_predictions.npy"), np.column_stack([predictions[c] for c in cutoffs]))
     first = trim_psf(feats.filter(pl.col("date") <= cutoffs[0]))
     inside = test["psf"].is_between(float(first["psf"].min()), float(first["psf"].max())).to_numpy()
 
