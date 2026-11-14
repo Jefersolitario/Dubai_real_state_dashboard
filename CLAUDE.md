@@ -186,8 +186,9 @@ sanitization), plus the Rent Scanner artifacts from the same pull:
 `rent_weekly_stats.parquet` (weekly AREA_EN × rooms-band percentile stats
 n/median/q1/q3/p10/p90, including an "All" band — quantiles don't compose
 across bands — and a `segment` all/new column) and
-`rent_recent_contracts.parquet` (contract-level slim rows for the 20 scanner
-districts, trailing 183 days, deduped), and `rent_project_index.parquet`
+`rent_recent_contracts.parquet` (contract-level slim rows for the scanner
+districts — every district in the neighbourhood picker, 76 today — trailing
+183 days, deduped), and `rent_project_index.parquet`
 (weekly per-project trailing-180d rent PSF + contract count, strictly past —
 contracts resolved to their project via the Ejari `project_name_en` join plus
 the layout fingerprint: district × exact area @2dp sqm × rooms band against

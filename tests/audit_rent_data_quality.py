@@ -588,7 +588,7 @@ def audit_gaps(pull_log: str | None, weekly: pl.DataFrame | None, recent: pl.Dat
             gap_rows.append((district, len(missing), runs))
         worst = sorted(gap_rows, key=lambda r: -r[1])[:4]
         total_missing = sum(max(g, 0) for _, g, _ in gap_rows)
-        add("4 Gaps", "week-level continuity (20 scanner districts, All band)",
+        add("4 Gaps", f"week-level continuity ({len(RENT_DISTRICTS)} scanner districts, All band)",
             OK if total_missing == 0 else WARN,
             f"{total_missing} missing weeks across districts",
             "worst: " + "; ".join(f"{AREA_DISPLAY.get(d, d)}={g}" for d, g, _ in worst),

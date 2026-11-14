@@ -12,7 +12,7 @@ service_charge feature groups:
                               rent PSF (n/median/q1/q3/p10/p90, incl. an
                               "All" band and a segment column) for the Rent
                               Opportunity Scanner's box view
-- rent_recent_contracts.parquet  contract-level slim rows for the 20 scanner
+- rent_recent_contracts.parquet  contract-level slim rows for the scanner
                               districts, trailing RENT_RECENT_DAYS, for the
                               scanner's dot view and deals table
 
@@ -48,7 +48,7 @@ RENT_YEAR_MIN, RENT_YEAR_MAX = 2020, 2027
 RENT_ANNUAL_MIN, RENT_ANNUAL_MAX = 5_000, 5_000_000
 RENT_AREA_MIN, RENT_AREA_MAX = 15.0, 1_000.0  # sqm
 
-# Contract-level rent artifact: trailing window and the 20 scanner districts
+# Contract-level rent artifact: trailing window and the scanner districts
 # (official DLD names whose display name is in the sidebar NEIGHBORHOODS
 # list) — restricted so the dashboard's resident memory stays bounded.
 RENT_RECENT_DAYS = 183
@@ -380,7 +380,7 @@ def _weekly_stats(rents: pl.DataFrame) -> pl.DataFrame:
 
 
 def _recent_contracts(rents: pl.DataFrame) -> pl.DataFrame:
-    """Contract-level slim rows: 20 scanner districts, trailing RENT_RECENT_DAYS."""
+    """Contract-level slim rows: scanner districts, trailing RENT_RECENT_DAYS."""
     cutoff = date.today() - timedelta(days=RENT_RECENT_DAYS)
     # contract_id keeps row identity honest: .unique() below then removes
     # only true repeats, never two genuinely identical units let the same day.
