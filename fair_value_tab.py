@@ -145,12 +145,15 @@ def _raw_transactions() -> pl.DataFrame:
     return pl.DataFrame()
 
 
-@st.cache_resource(show_spinner="Preparing model features...")
+@st.cache_resource(show_spinner="Preparing model features...", max_entries=1)
 def get_features(data_version: str) -> pl.DataFrame:
     """Untrimmed feature frame — one pass per data refresh, used everywhere.
 
     Untrimmed on purpose: scoring must cover the deep-discount tail; the
-    training path applies trim_psf separately.
+    training path applies trim_psf separately. ``max_entries=1``: the frame
+    is ~150 MB and every session shares one snapshot version, so an older
+    version is never read again — keeping them is what exhausts the host
+    when a catch-up advances the snapshot several times in a row.
     """
     feature_config, _ = load_shipping_config()
     reference = None
@@ -161,7 +164,7 @@ def get_features(data_version: str) -> pl.DataFrame:
 
 
 @st.cache_resource(
-    ttl=6 * 3600, show_spinner="Loading pre-trained fair-value model..."
+    ttl=6 * 3600, show_spinner="Loading pre-trained fair-value model...", max_entries=1
 )
 def get_model(data_version: str) -> tuple[FairValueResult, dict]:
     """Load the pre-trained inference bundle from GCS — the app never trains.
@@ -216,7 +219,7 @@ def get_scored(
     return score_transactions(_result, feats)
 
 
-@st.cache_resource(show_spinner="Checking for suspicious records...")
+@st.cache_resource(show_spinner="Checking for suspicious records...", max_entries=1)
 def get_review_rows(data_version: str) -> pl.DataFrame:
     """Sales the data-cleaning step excluded as non-market prices.
 

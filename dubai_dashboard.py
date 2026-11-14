@@ -17,12 +17,13 @@ Configure DDA credentials through Streamlit secrets or environment variables.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import polars as pl
 from polars.exceptions import PanicException
 import plotly.graph_objects as go
 import streamlit as st
+from google.api_core.exceptions import PreconditionFailed
 
 from ingestion.dda_api import (
     DDAApiError,
@@ -64,6 +65,7 @@ from dashboard_constants import (
 )
 from fair_value_tab import render_fair_value_tab
 from rent_scanner_tab import render_rent_scanner
+from snapshot_store import SnapshotStore, SyncStatus, TopUp
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,6 +73,19 @@ LOGGER = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 API_DEFAULT_LOOKBACK_MONTHS = DEFAULT_LOOKBACK_MONTHS
+
+# Background snapshot sync (see snapshot_store.py). A stored snapshot written
+# elsewhere (CLI refresh) is adopted within SNAPSHOT_RECHECK_SECONDS; the DLD
+# API is asked for new days at most every TOP_UP_RETRY_SECONDS.
+SNAPSHOT_RECHECK_SECONDS = 300
+TOP_UP_RETRY_SECONDS = 900
+# A long gap is fetched in windows of this many days, each stored before the
+# next starts: bounded memory, and an interrupted catch-up keeps its progress.
+TOP_UP_CHUNK_DAYS = 31
+# DLD publishes with a lag of up to a long weekend; beyond this many days
+# behind, the page says so instead of silently showing old data.
+STALE_AFTER_DAYS = 4
+CATCH_UP_POLL_SECONDS = 4
 
 TRANSACTION_SCHEMA = {
     "INSTANCE_DATE": pl.Utf8,
@@ -559,9 +574,14 @@ def _load_gcs_transactions(
             "start": date_start,
             "end": date_end,
         },
+        # Measured from the rows themselves (blob metadata can lag a manual
+        # upload); read on every rerun, so computed once per load.
+        "frame_bounds": bounds,
+        "snapshot_token": str(blob.generation),
         "gcs": {
             "bucket": bucket_name,
             "object": object_name,
+            "generation": blob.generation,
             "size": blob.size,
             "updated": blob.updated.isoformat() if blob.updated else None,
             "metadata": object_metadata,
@@ -592,33 +612,21 @@ def _date_bounds_from_transactions(df: pl.DataFrame) -> tuple[date, date] | None
     return dates["date"].min(), dates["date"].max()
 
 
-def _missing_date_windows(
-    df: pl.DataFrame,
-    requested_start: date,
-    requested_end: date,
-) -> list[tuple[date, date]]:
-    """Date spans the loaded snapshot does not cover for the request."""
-    bounds = _date_bounds_from_transactions(df)
-    if not bounds:
-        return [(requested_start, requested_end)]
-
-    loaded_start, loaded_end = bounds
-    windows = []
-    if requested_start < loaded_start:
-        windows.append((requested_start, loaded_start))
-    if requested_end > loaded_end:
-        windows.append((loaded_end, requested_end))
-    return [(start, end) for start, end in windows if start <= end]
-
-
 def _write_gcs_snapshot(
     secrets: dict,
     bucket_name: str,
     object_name: str,
     df: pl.DataFrame,
     stats: dict[str, int | str],
+    expected_generation: int | None = None,
 ) -> tuple[pl.DataFrame, dict]:
-    """Upload the merged snapshot and verify the readback matches."""
+    """Upload the merged snapshot and verify the readback matches.
+
+    ``expected_generation`` makes the upload conditional on the stored object
+    still being the one the merge started from; GCS raises
+    PreconditionFailed otherwise, so a snapshot written meanwhile by the CLI
+    refresh is never overwritten with an older base.
+    """
     bounds = _date_bounds_from_transactions(df)
     blob = gcs_client(secrets).bucket(bucket_name).blob(object_name)
     blob.metadata = {
@@ -631,6 +639,7 @@ def _write_gcs_snapshot(
     blob.upload_from_string(
         dataframe_to_parquet_bytes(df),
         content_type="application/vnd.apache.parquet",
+        if_generation_match=expected_generation,
     )
 
     refreshed_df, refreshed_meta = _load_gcs_transactions(
@@ -703,87 +712,115 @@ def _merge_incoming_rows(
     return final_df, stats
 
 
-def _ensure_transactions_cover_range(
-    df: pl.DataFrame,
-    meta: dict,
-    requested_start: date,
-    requested_end: date,
-) -> tuple[pl.DataFrame, dict, dict | None]:
-    """Top up the snapshot from the API when the picker exceeds coverage."""
-    windows = _missing_date_windows(df, requested_start, requested_end)
-    if not windows:
-        return df, meta, None
+def _top_up_snapshot(secrets: dict, df: pl.DataFrame, meta: dict) -> TopUp | None:
+    """Fetch the days after the snapshot's last one and store the result.
 
-    refresh_key = "|".join(f"{start}:{end}" for start, end in windows)
-    if st.session_state.get("gcs_refresh_checked") == refresh_key:
-        return df, meta, None
+    Runs on the snapshot store's worker thread, never inside a page render.
+    Walks forward from the last loaded day in TOP_UP_CHUNK_DAYS windows and
+    returns as soon as one window adds rows; ``None`` when DLD has nothing
+    newer than what is served.
+    """
+    bounds = meta.get("frame_bounds")
+    today = date.today()
+    if not bounds or bounds[1] >= today:
+        return None
 
-    secrets = _streamlit_secrets()
     config = load_dda_config(secrets)
     missing = config.missing_fields()
     if missing:
         raise DDAApiError(
-            "Cannot refresh missing date range; missing DDA configuration: "
+            "Cannot fetch new transactions; missing DDA configuration: "
             + ", ".join(missing)
         )
 
-    # Mark the attempt BEFORE fetching: when the API is unreachable (the
-    # normal state on Streamlit Cloud) the fetch raises, and setting the key
-    # afterwards would retry the doomed call on every widget interaction —
-    # freezing each rerun for the full network timeout.
-    st.session_state["gcs_refresh_checked"] = refresh_key
-    incoming_frames, fetched_rows = _fetch_missing_windows(config, windows)
-    if not incoming_frames:
-        return df, meta, {
-            "mode": "incremental",
-            "fetched_rows": 0,
-            "added_rows": 0,
-            "duplicate_rows_removed": 0,
-            "windows": windows,
-            "written": False,
-        }
+    # The last loaded day is fetched again: it may have been only partly
+    # published when it was first stored.
+    cursor = bounds[1]
+    while cursor < today:
+        window_end = min(today, cursor + timedelta(days=TOP_UP_CHUNK_DAYS))
+        incoming_frames, fetched_rows = _fetch_missing_windows(
+            config, [(cursor, window_end)]
+        )
+        if incoming_frames:
+            final_df, stats = _merge_incoming_rows(df, incoming_frames)
+            if stats["added_rows"] or stats["existing_duplicate_rows_removed"]:
+                return _store_top_up(
+                    secrets,
+                    final_df,
+                    meta,
+                    {**stats, "fetched_rows": fetched_rows},
+                    more_pending=window_end < today,
+                )
+        cursor = window_end
+    return None
 
-    final_df, stats = _merge_incoming_rows(df, incoming_frames)
-    stats = {**stats, "fetched_rows": fetched_rows, "windows": windows}
-    if stats["added_rows"] == 0 and stats["existing_duplicate_rows_removed"] == 0:
-        return df, meta, {**stats, "written": False}
 
+def _store_top_up(
+    secrets: dict,
+    final_df: pl.DataFrame,
+    meta: dict,
+    stats: dict,
+    more_pending: bool,
+) -> TopUp:
+    """Persist a merged frame and say what to serve next."""
+    added = int(stats["added_rows"])
+    bucket_name, object_name = configured_snapshot(secrets)
+    stored_generation = meta.get("gcs", {}).get("generation")
+    if not bucket_name or stored_generation is None:
+        # No bucket, or the served frame did not come from the stored object
+        # (API fallback after a failed read): keep the rows in memory rather
+        # than overwrite a snapshot this process never saw.
+        return TopUp(
+            final_df,
+            {
+                **meta,
+                "loaded_at": datetime.now().isoformat(timespec="seconds"),
+                "source": "dda_incremental_memory",
+                "frame_bounds": _date_bounds_from_transactions(final_df),
+            },
+            added_rows=added,
+            more_pending=more_pending,
+        )
+
+    try:
+        refreshed_df, refreshed_meta = _write_gcs_snapshot(
+            secrets,
+            bucket_name,
+            object_name,
+            final_df,
+            stats,
+            expected_generation=stored_generation,
+        )
+    except PreconditionFailed:
+        # A newer snapshot was stored while this one was being merged (CLI
+        # refresh): serve that one and let the next round top it up.
+        LOGGER.info("Stored snapshot changed during the top-up; adopting it.")
+        refreshed_df, refreshed_meta = _load_gcs_transactions(
+            secrets, bucket_name, object_name
+        )
+        return TopUp(refreshed_df, refreshed_meta, added_rows=0, more_pending=True)
+    return TopUp(refreshed_df, refreshed_meta, added_rows=added, more_pending=more_pending)
+
+
+def _stored_snapshot_token(secrets: dict) -> str | None:
+    """Generation of the stored snapshot — a cheap "did it change?" probe."""
     bucket_name, object_name = configured_snapshot(secrets)
     if not bucket_name:
-        return final_df, {
-            **meta,
-            "loaded_at": datetime.now().isoformat(timespec="seconds"),
-            "source": "dda_incremental_memory",
-        }, {**stats, "written": False}
-
-    refreshed_df, refreshed_meta = _write_gcs_snapshot(
-        secrets,
-        bucket_name,
-        object_name,
-        final_df,
-        {key: value for key, value in stats.items() if key != "windows"},
-    )
-    try:
-        load_production_transactions.clear()
-    except Exception:
-        pass
-    return refreshed_df, refreshed_meta, {**stats, "written": True}
+        return None
+    blob = gcs_client(secrets).bucket(bucket_name).get_blob(object_name)
+    return str(blob.generation) if blob is not None else None
 
 
-# cache_resource (not cache_data): avoids keeping a full pickle copy of the
-# ~300k-row frame resident plus a deserialize copy on every rerun.
-@st.cache_resource(
-    show_spinner="Loading latest DLD transactions...",
-    ttl=60 * 60,
-)
-def load_production_transactions() -> tuple[pl.DataFrame, dict]:
-    """Session data loader: GCS snapshot first, DDA API fallback (cached)."""
-    secrets = _streamlit_secrets()
+def load_production_transactions(secrets: dict) -> tuple[pl.DataFrame, dict]:
+    """Stored GCS snapshot first, a DDA API pull as the fallback."""
     bucket_name, object_name = configured_snapshot(secrets)
     gcs_error: Exception | None = None
+    gcs_missing = False
     if bucket_name:
         try:
             return _load_gcs_transactions(secrets, bucket_name, object_name)
+        except FileNotFoundError as exc:
+            gcs_error, gcs_missing = exc, True
         except Exception as exc:
             gcs_error = exc
             LOGGER.exception("GCS transaction snapshot load failed: %s", exc)
@@ -817,7 +854,7 @@ def load_production_transactions() -> tuple[pl.DataFrame, dict]:
         raise DDAApiError("Production data source schema is incomplete.")
 
     bounds = _date_bounds_from_transactions(df)
-    return df, {
+    fallback_meta = {
         **meta,
         "source": "dda_api",
         "loaded_at": datetime.now().isoformat(timespec="seconds"),
@@ -825,25 +862,99 @@ def load_production_transactions() -> tuple[pl.DataFrame, dict]:
             "start": bounds[0].isoformat() if bounds else start.isoformat(),
             "end": bounds[1].isoformat() if bounds else end.isoformat(),
         },
+        "frame_bounds": bounds,
+        "snapshot_token": None,
         "gcs_fallback_error": str(gcs_error) if gcs_error else None,
     }
+    if gcs_missing:
+        # No stored snapshot yet: generation 0 lets the first top-up create
+        # the object, and only if nobody else created it meanwhile.
+        fallback_meta["gcs"] = {"bucket": bucket_name, "object": object_name, "generation": 0}
+    return df, fallback_meta
 
 
-def _loaded_date_bounds() -> tuple[date, date]:
-    """Date coverage of the currently loaded transactions."""
-    api_df = st.session_state.get("api_raw_df")
-    if isinstance(api_df, pl.DataFrame):
-        bounds = _date_bounds_from_transactions(api_df)
-        if bounds:
-            return bounds
-    return last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
+@st.cache_resource(show_spinner=False)
+def _snapshot_store() -> SnapshotStore:
+    """The app's one shared snapshot and its background sync worker."""
+    secrets = _streamlit_secrets()
+    return SnapshotStore(
+        load=lambda: load_production_transactions(secrets),
+        top_up=lambda df, meta: _top_up_snapshot(secrets, df, meta),
+        remote_token=lambda: _stored_snapshot_token(secrets),
+        recheck_seconds=SNAPSHOT_RECHECK_SECONDS,
+        retry_seconds=TOP_UP_RETRY_SECONDS,
+    )
 
 
-def _date_picker_bounds() -> tuple[date, date, date]:
+def _date_picker_bounds(loaded: tuple[date, date] | None) -> tuple[date, date, date]:
     """(min, max, default_end) limits for the sidebar date picker."""
-    loaded_start, loaded_end = _loaded_date_bounds()
     default_start, today = last_months_date_range(API_DEFAULT_LOOKBACK_MONTHS)
+    loaded_start = loaded[0] if loaded else default_start
     return min(loaded_start, default_start), today, today
+
+
+def _freshness_notice(
+    status: SyncStatus, loaded_end: date | None, today: date
+) -> tuple[str, str] | None:
+    """("updating" | "stale", message) when the data is behind, else None."""
+    if loaded_end is None:
+        return None
+    days = (today - loaded_end).days
+    if days < STALE_AFTER_DAYS:
+        return None
+    through = f"{loaded_end:%d %b %Y}"
+    retry_minutes = TOP_UP_RETRY_SECONDS // 60
+    if status.running:
+        return "updating", (
+            f"Downloading {days} days of new transactions from DLD. Showing data "
+            f"through {through} for now — this page updates itself as they arrive."
+        )
+    if status.error:
+        return "stale", (
+            f"Data is only current through {through} ({days} days ago): the last "
+            "download from DLD failed. The dashboard retries about every "
+            f"{retry_minutes} minutes while it is open."
+        )
+    return "stale", (
+        f"The newest DLD transactions are from {through} ({days} days ago). DLD "
+        "had nothing newer at the last check; the dashboard checks again about "
+        f"every {retry_minutes} minutes while it is open."
+    )
+
+
+def _sync_caption(status: SyncStatus) -> str:
+    """One sidebar line on the last finished DLD check ("" before the first)."""
+    if status.checked_at is None:
+        return ""
+    stamp = f"{status.checked_at:%d %b %H:%M} UTC"
+    if status.error:
+        return f"Last DLD check failed ({stamp})."
+    if status.added_rows:
+        return f"Updated from DLD {stamp} (+{status.added_rows:,} rows)."
+    return f"Checked DLD {stamp}: nothing newer."
+
+
+@st.fragment(run_every=CATCH_UP_POLL_SECONDS)
+def _catch_up_notice(message: str, seen_version: int) -> None:
+    """The "downloading" notice; reloads the page as new data lands."""
+    status = _snapshot_store().status()
+    if status.version != seen_version or not status.running:
+        st.rerun()
+    st.info(message, icon="⏳")
+
+
+def _render_freshness_notice(
+    status: SyncStatus, loaded_end: date | None, today: date
+) -> None:
+    """Tell the visitor when the data is behind, and why."""
+    notice = _freshness_notice(status, loaded_end, today)
+    if notice is None:
+        return
+    kind, message = notice
+    if kind == "updating":
+        _catch_up_notice(message, status.version)
+    else:
+        st.warning(message, icon="⚠️")
 
 
 # ---------------------------------------------------------------------------
@@ -1635,8 +1746,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+store = _snapshot_store()
 try:
-    api_snapshot, api_meta = load_production_transactions()
+    if store.loaded:
+        api_snapshot, api_meta = store.current()
+    else:
+        with st.spinner("Loading latest DLD transactions..."):
+            api_snapshot, api_meta = store.current()
 except Exception as exc:
     LOGGER.exception("DDA production data source startup failed: %s", exc)
     st.error(
@@ -1648,6 +1764,15 @@ st.session_state["api_raw_df"] = api_snapshot
 st.session_state["api_meta"] = api_meta
 data_version = api_meta.get("loaded_at", "production")
 active_api_rows = api_snapshot.height
+
+# The page renders from the snapshot it has; anything newer is fetched by the
+# store's background worker and shows up on a later rerun. request_sync is a
+# no-op while a sync is running or cooling down.
+today = date.today()
+loaded_bounds = api_meta.get("frame_bounds")
+loaded_end = loaded_bounds[1] if loaded_bounds else None
+store.request_sync(top_up=loaded_end is None or loaded_end < today)
+sync_status = store.status()
 
 # ── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -1677,7 +1802,7 @@ with st.sidebar:
         horizontal=True,
     )
 
-    date_min, date_max, default_end = _date_picker_bounds()
+    date_min, date_max, default_end = _date_picker_bounds(loaded_bounds)
     # Show the last 12 months by default; the snapshot keeps 24 months for
     # model training, and the picker still allows selecting the full range.
     default_start = max(date_min, months_before(default_end, 12))
@@ -1701,39 +1826,6 @@ with st.sidebar:
     end_date = min(end_date, date_max)
     if start_date > end_date:
         start_date, end_date = date_min, date_max
-    refresh_info = None
-    try:
-        with st.spinner("Refreshing missing DLD transactions..."):
-            api_snapshot, api_meta, refresh_info = _ensure_transactions_cover_range(
-                api_snapshot,
-                api_meta,
-                start_date,
-                end_date,
-            )
-    except Exception as exc:
-        LOGGER.exception("Incremental transaction refresh failed: %s", exc)
-        st.warning(
-            "Could not refresh the missing date range from DDA. "
-            "Showing the available GCS snapshot."
-        )
-
-    st.session_state["api_raw_df"] = api_snapshot
-    st.session_state["api_meta"] = api_meta
-    data_version = api_meta.get("loaded_at", data_version)
-    active_api_rows = api_snapshot.height
-    api_bounds = _date_bounds_from_transactions(api_snapshot)
-    if api_bounds:
-        date_min = min(date_min, api_bounds[0])
-        date_max = max(date_max, api_bounds[1])
-    if refresh_info:
-        if refresh_info.get("written"):
-            added = refresh_info.get("added_rows", 0)
-            if added:
-                st.caption(f"Updated GCS cache: +{added:,} rows.")
-            else:
-                st.caption("Cleaned and verified the GCS cache.")
-        elif refresh_info.get("added_rows", 0) == 0:
-            st.caption("No newer DLD records were available for the requested range.")
 
     if (start_date, end_date) != (requested_start_date, requested_end_date):
         st.caption(
@@ -1742,9 +1834,14 @@ with st.sidebar:
         )
     st.divider()
     date_summary = f"{date_min:%Y-%m-%d} to {date_max:%Y-%m-%d}"
-    if api_bounds:
-        date_summary = f"{api_bounds[0]:%Y-%m-%d} to {api_bounds[1]:%Y-%m-%d}"
+    if loaded_bounds:
+        date_summary = f"{loaded_bounds[0]:%Y-%m-%d} to {loaded_bounds[1]:%Y-%m-%d}"
     st.caption(f"Data covers {date_summary} ({active_api_rows:,} transactions).")
+    sync_caption = _sync_caption(sync_status)
+    if sync_caption:
+        st.caption(sync_caption)
+
+_render_freshness_notice(sync_status, loaded_end, today)
 
 # ── Load & filter data ───────────────────────────────────────────────────────
 DAILY_DATA = generate_dubai_data(trans_type, data_version)
