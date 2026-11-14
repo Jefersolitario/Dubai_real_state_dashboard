@@ -197,6 +197,14 @@ once on sales to 3 Sep 4.27%, retrained every 28 days 4.13%, every 7 days
 rises from 3.5% in a model's first fortnight to 4.1% by weeks 9-10. A fit
 takes about 40 seconds on four cores.
 
+Caution: the bundle is refitted on every sale and the tab rescores its whole
+window with it, so sales already in the training data get in-sample, shrunken
+spreads. Measured for 2026-10-13..11-12: 415 sales below −15% when each is
+scored by the weekly model that had not seen it, 368 when one model refitted
+on everything scores them all (distressed 22 vs 14). The flags were validated
+on out-of-sample scores (`reports/distress_validation_report.md`); publishing
+each week's out-of-sample predictions with the bundle is the open follow-up.
+
 ### ingestion/store_reference_data_gcs.py
 
 Pulls DLD reference datasets to GCS under `dld_reference/`: `projects.parquet`

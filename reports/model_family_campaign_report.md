@@ -18,6 +18,11 @@ from `python -m model.optimize_model_family` (commands at the end).
 The model's design stays as shipped. What it needs is to be retrained: the
 bundle the app serves was trained on 10 August and is 96 days old.
 
+One caution before retraining routinely (section 1): the app scores every sale
+with the newest bundle, and a model refitted on everything has already seen
+the sales it then scores, which shrinks their discounts. Retraining pays off
+on sales that arrive after it.
+
 ## Protocol
 
 - **Data**: the stored snapshot with one row per transaction and tidy names —
@@ -67,6 +72,27 @@ Out-of-fold error by the age of the model that made the prediction (folds
 | 42-55 | 3.78% |
 | 56-69 | 4.12% |
 | 70-83 (two folds) | 4.21% |
+
+### What a retrain does to the flags
+
+The gain above is for sales the model has not seen. The app, though, rescores
+its whole window with the newest bundle, and `train_fair_value` refits on
+every sale. The same sales scored three ways (default −15% threshold):
+
+| Scored by | Last month, 8,656 sales: median abs. spread | below −15% | distressed | All 69 days: below −15% | distressed |
+|---|---:|---:|---:|---:|---:|
+| Frozen 10 Aug model (out-of-sample, stale) | 4.45% | 425 | 19 | 960 | 57 |
+| The weekly model in force when each sale happened (out-of-sample) | 4.23% | 415 | 22 | 947 | 62 |
+| One model refitted today on everything (in-sample) | 3.40% | 368 | 14 | 814 | 45 |
+
+Refitting on everything removes about one flag in eight, not because the
+model got better at pricing those flats but because it has seen their prices.
+With weekly retraining only the newest week is out-of-sample at any time. The
+walk-forward backtest that validated the flags (`distress_validation_report.md`)
+used out-of-sample scores throughout, so the clean way to retrain often is to
+keep each sale's out-of-sample score — publish the weekly walk-forward
+predictions for the recent months alongside the bundle and let the tab prefer
+them. That is not built.
 
 ## 2. Other learners
 
