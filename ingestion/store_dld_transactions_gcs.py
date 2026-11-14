@@ -28,6 +28,9 @@ from ingestion.gcs_storage import (
 
 
 IGNORED_DEDUPE_COLUMNS = {"load_timestamp"}
+# DLD's ``transaction_id``: unique per row of the feed, so it identifies a sale
+# across fetches even after DLD re-dates or amends it.
+TRANSACTION_KEY = "TRANSACTION_NUMBER"
 
 
 def main() -> int:
@@ -157,7 +160,12 @@ def merge_snapshots(
     incoming: pl.DataFrame,
     full_refresh: bool,
 ) -> tuple[pl.DataFrame, dict[str, int | str]]:
-    """Combine existing + fetched rows: dedupe, stable-sort, report stats."""
+    """Combine existing + fetched rows into one row per transaction, with stats.
+
+    Fetched rows go after the stored ones, so a sale DLD has re-dated or
+    amended since it was stored is replaced by its fetched version
+    (``updated_rows``) rather than kept alongside it.
+    """
     if full_refresh or existing is None:
         final = dedupe_snapshot(incoming)
         return stable_sort(final), {
@@ -166,6 +174,7 @@ def merge_snapshots(
             "existing_rows": 0,
             "fetched_rows": incoming.height,
             "added_rows": final.height,
+            "updated_rows": 0,
             "existing_duplicate_rows_removed": 0,
             "incoming_duplicate_rows_removed": incoming.height - final.height,
             "overlap_duplicate_rows": 0,
@@ -175,17 +184,20 @@ def merge_snapshots(
     incoming_deduped = dedupe_snapshot(incoming)
     combined = pl.concat([existing_deduped, incoming_deduped], how="diagonal_relaxed")
     final = stable_sort(dedupe_snapshot(combined))
-    added_rows = count_new_rows(existing_deduped, final)
+    added_rows, updated_rows = count_changes(existing_deduped, final)
     existing_duplicate_rows_removed = existing.height - existing_deduped.height
     incoming_duplicate_rows_removed = incoming.height - incoming_deduped.height
     overlap_duplicate_rows = existing_deduped.height + incoming_deduped.height - final.height
 
     return final, {
         "mode": "incremental",
-        "write_required": added_rows > 0 or existing_duplicate_rows_removed > 0,
+        "write_required": (
+            added_rows > 0 or updated_rows > 0 or existing_duplicate_rows_removed > 0
+        ),
         "existing_rows": existing.height,
         "fetched_rows": incoming.height,
         "added_rows": added_rows,
+        "updated_rows": updated_rows,
         "existing_duplicate_rows_removed": existing_duplicate_rows_removed,
         "incoming_duplicate_rows_removed": incoming_duplicate_rows_removed,
         "overlap_duplicate_rows": overlap_duplicate_rows,
@@ -209,6 +221,7 @@ def write_snapshot(secrets: dict, bucket_name: str, object_name: str, df: pl.Dat
     print(
         f"Writing {df.height:,} rows to gs://{bucket_name}/{object_name} "
         f"({stats['mode']}, added {stats['added_rows']:,}, "
+        f"updated {stats['updated_rows']:,}, "
         f"cleaned {stats['existing_duplicate_rows_removed']:,} existing duplicates)"
     )
     blob.upload_from_string(
@@ -255,14 +268,26 @@ def stable_sort(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def dedupe_snapshot(df: pl.DataFrame) -> pl.DataFrame:
-    """Drop exact duplicate rows over the canonical column set."""
+    """One row per transaction; of several versions the last in frame order wins.
+
+    DLD re-dates and amends sales after publishing them, so one transaction
+    number can arrive more than once with different content. Callers put the
+    most recently fetched rows last. A stored snapshot is date-sorted and DLD
+    only moves dates forward (341 of 341 measured against the feed,
+    2026-11), so there too the current version is the last one. Rows without
+    a transaction number only lose exact duplicates.
+    """
     if df.is_empty():
         return df
-    return df.unique(subset=dedupe_key_columns(df), keep="last", maintain_order=True)
+    df = df.unique(subset=dedupe_key_columns(df), keep="last", maintain_order=True)
+    if TRANSACTION_KEY not in df.columns:
+        return df
+    number = pl.col(TRANSACTION_KEY)
+    return df.filter(number.is_null() | number.is_last_distinct())
 
 
 def dedupe_key_columns(df: pl.DataFrame) -> list[str]:
-    """Columns that participate in duplicate detection (all present ones)."""
+    """Columns compared when looking for exact duplicates (all present ones)."""
     return [
         column
         for column in df.columns
@@ -270,21 +295,31 @@ def dedupe_key_columns(df: pl.DataFrame) -> list[str]:
     ]
 
 
-def count_new_rows(existing: pl.DataFrame, final: pl.DataFrame) -> int:
-    """How many rows of ``final`` were not already in ``existing``."""
+def count_changes(existing: pl.DataFrame, final: pl.DataFrame) -> tuple[int, int]:
+    """(added, updated) rows of ``final`` relative to the deduplicated ``existing``.
+
+    A row whose transaction number ``existing`` already holds is an update —
+    DLD re-dated or amended that sale; any other row ``existing`` lacks is new.
+    """
     if existing.is_empty():
-        return final.height
+        return final.height, 0
 
-    key_columns = dedupe_key_columns(final)
-    existing_hashes = key_hashes(existing, key_columns)
-    final_hashes = key_hashes(final, key_columns)
-    return final_hashes.join(existing_hashes, on="_key", how="anti").height
+    shared = [column for column in dedupe_key_columns(final) if column in existing.columns]
+    # Row hashes depend on dtype (Int64 1 != Float64 1.0), and the merge may
+    # have widened a column, so compare both frames under final's schema.
+    schema = {column: final.schema[column] for column in shared}
+    known_rows = pl.DataFrame(
+        {"_row": existing.select(shared).cast(schema).hash_rows()}
+    ).unique()
+    changed = final.with_columns(
+        final.select(shared).hash_rows().alias("_row")
+    ).join(known_rows, on="_row", how="anti")
+    if TRANSACTION_KEY not in shared:
+        return changed.height, 0
 
-
-def key_hashes(df: pl.DataFrame, key_columns: list[str]) -> pl.DataFrame:
-    """One hash per row over ``key_columns`` for set comparisons."""
-    aligned_columns = [column for column in key_columns if column in df.columns]
-    return pl.DataFrame({"_key": df.select(aligned_columns).hash_rows()}).unique()
+    known_numbers = existing.select(TRANSACTION_KEY).drop_nulls().unique()
+    updated = changed.join(known_numbers, on=TRANSACTION_KEY, how="semi").height
+    return changed.height - updated, updated
 
 
 def date_bound(df: pl.DataFrame, bound: str) -> str:
@@ -303,7 +338,7 @@ def verify_readback(expected: pl.DataFrame, actual: pl.DataFrame) -> None:
     if actual.columns != expected.columns:
         raise ValueError("Column mismatch after GCS readback.")
     if actual.height != dedupe_snapshot(actual).height:
-        raise ValueError("Readback snapshot still contains duplicate rows.")
+        raise ValueError("Readback snapshot holds a transaction on more than one row.")
     if date_bound(actual, "min") != date_bound(expected, "min"):
         raise ValueError("Minimum INSTANCE_DATE mismatch after GCS readback.")
     if date_bound(actual, "max") != date_bound(expected, "max"):

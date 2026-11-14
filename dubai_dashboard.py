@@ -48,9 +48,8 @@ from ingestion.gcs_storage import (
     read_parquet_object,
 )
 from ingestion.store_dld_transactions_gcs import (
-    count_new_rows,
     dedupe_snapshot,
-    stable_sort,
+    merge_snapshots,
 )
 
 from dashboard_constants import (
@@ -653,7 +652,9 @@ def _write_gcs_snapshot(
             f"read back {refreshed_df.height:,}."
         )
     if dedupe_snapshot(refreshed_df).height != refreshed_df.height:
-        raise DDAApiError("GCS write verification failed: duplicate rows remain.")
+        raise DDAApiError(
+            "GCS write verification failed: a transaction is stored on more than one row."
+        )
     return refreshed_df, refreshed_meta
 
 
@@ -689,27 +690,15 @@ def _fetch_missing_windows(
 def _merge_incoming_rows(
     df: pl.DataFrame, incoming_frames: list[pl.DataFrame]
 ) -> tuple[pl.DataFrame, dict]:
-    """Dedupe and combine existing + fetched rows; returns (final frame, stats).
+    """Existing + fetched rows as one row per transaction; returns (frame, stats).
 
-    Both merge sides already share the canonical schema:
-    normalize_dld_transactions projects every frame at the source.
+    The same merge the CLI refresh uses. Both sides already share the
+    canonical schema: normalize_dld_transactions projects every frame at the
+    source.
     """
     incoming_df = pl.concat(incoming_frames, how="diagonal_relaxed")
-    existing_deduped = dedupe_snapshot(df)
-    incoming_deduped = dedupe_snapshot(incoming_df)
-    combined = pl.concat([existing_deduped, incoming_deduped], how="diagonal_relaxed")
-    final_df = stable_sort(dedupe_snapshot(combined))
-    stats = {
-        "mode": "incremental_dashboard",
-        "existing_rows": df.height,
-        "added_rows": count_new_rows(existing_deduped, final_df),
-        "existing_duplicate_rows_removed": df.height - existing_deduped.height,
-        "incoming_duplicate_rows_removed": incoming_df.height - incoming_deduped.height,
-        "overlap_duplicate_rows": (
-            existing_deduped.height + incoming_deduped.height - final_df.height
-        ),
-    }
-    return final_df, stats
+    final_df, stats = merge_snapshots(df, incoming_df, full_refresh=False)
+    return final_df, {**stats, "mode": "incremental_dashboard"}
 
 
 def _top_up_snapshot(secrets: dict, df: pl.DataFrame, meta: dict) -> TopUp | None:
@@ -717,8 +706,9 @@ def _top_up_snapshot(secrets: dict, df: pl.DataFrame, meta: dict) -> TopUp | Non
 
     Runs on the snapshot store's worker thread, never inside a page render.
     Walks forward from the last loaded day in TOP_UP_CHUNK_DAYS windows and
-    returns as soon as one window adds rows; ``None`` when DLD has nothing
-    newer than what is served.
+    returns as soon as one window changes the snapshot — new sales, or stored
+    ones DLD has since re-dated or amended; ``None`` when the feed matches
+    what is served.
     """
     bounds = meta.get("frame_bounds")
     today = date.today()
@@ -738,17 +728,15 @@ def _top_up_snapshot(secrets: dict, df: pl.DataFrame, meta: dict) -> TopUp | Non
     cursor = bounds[1]
     while cursor < today:
         window_end = min(today, cursor + timedelta(days=TOP_UP_CHUNK_DAYS))
-        incoming_frames, fetched_rows = _fetch_missing_windows(
-            config, [(cursor, window_end)]
-        )
+        incoming_frames, _ = _fetch_missing_windows(config, [(cursor, window_end)])
         if incoming_frames:
             final_df, stats = _merge_incoming_rows(df, incoming_frames)
-            if stats["added_rows"] or stats["existing_duplicate_rows_removed"]:
+            if stats.pop("write_required"):
                 return _store_top_up(
                     secrets,
                     final_df,
                     meta,
-                    {**stats, "fetched_rows": fetched_rows},
+                    stats,
                     more_pending=window_end < today,
                 )
         cursor = window_end

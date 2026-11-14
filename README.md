@@ -211,8 +211,9 @@ python -m model.train_fair_value
 # End-to-end smoke test (synthetic; run before touching model logic)
 python -m tests.smoke_test_fair_value
 
-# Offline checks of the app's snapshot holder and the rent pipeline
+# Offline checks of the app's snapshot holder, the snapshot merge and the rent pipeline
 python -m tests.smoke_test_snapshot_store
+python -m tests.smoke_test_snapshot_merge
 python -m tests.smoke_test_rent_pipeline
 ```
 
@@ -221,7 +222,9 @@ snapshot straight away. One background worker per app process then asks the
 DLD API for the days after the snapshot's last one (at most every 15
 minutes, in month-sized steps), stores them, and swaps the new data in for
 every open session; a snapshot refreshed from the command line is picked up
-within five minutes. When the data is four or more days behind, the page
+within five minutes. DLD keeps revising recent sales (it moves their dates
+forward and corrects details), so a fetched sale replaces the stored row with
+the same transaction number instead of being added next to it. When the data is four or more days behind, the page
 says why — downloading, last download failed, or DLD has nothing newer —
 instead of showing old charts without comment. The worker only runs while
 someone has the app open, so after a long idle spell the first visitor sees

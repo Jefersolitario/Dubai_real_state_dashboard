@@ -42,9 +42,10 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m tests.smoke_test_fair_value
 .\.venv\Scripts\python.exe -m model.optimize_fair_value
 
-# Offline checks of the app's shared snapshot holder and the rent pipeline
-# (no network, no credentials; run before touching either)
+# Offline checks of the app's shared snapshot holder, the snapshot merge and
+# the rent pipeline (no network, no credentials; run before touching any)
 .\.venv\Scripts\python.exe -m tests.smoke_test_snapshot_store
+.\.venv\Scripts\python.exe -m tests.smoke_test_snapshot_merge
 .\.venv\Scripts\python.exe -m tests.smoke_test_rent_pipeline
 
 # Campaign runner for unit-signal features (rents, renovation permits) with
@@ -216,6 +217,13 @@ Synthetic end-to-end test of the fair-value pipeline (planted underpriced rows m
 
 Drives `SnapshotStore` with in-memory fakes and a fake clock: one load, a top-up served to every later caller, one fetch for five simultaneous visitors, the cooldown, failures reported without sticking, adoption of a snapshot stored elsewhere, and a multi-round catch-up.
 
+### -m tests.smoke_test_snapshot_merge
+
+Drives the real `merge_snapshots` with small normalized frames: a re-dated or
+amended sale replaces its stored version (`updated_rows`), a pair already
+stored collapses to its later date, an identical re-fetch requires no write,
+rows without a transaction number only lose exact duplicates.
+
 ### -m tests.smoke_test_rent_pipeline
 
 Synthetic Ejari-shaped data through the real `_slim_rents` / `_weekly_stats` / `_recent_contracts` helpers and the Rent Scanner chart builders (district round-trip, rooms banding, the "All" band and new-contract segment, the dot/box view switch).
@@ -270,6 +278,24 @@ deduplicates, rewrites the compact Parquet object, and verifies row count,
 columns, duplicate removal, and date coverage. Use `--full-refresh` to replace
 the snapshot from a requested API window.
 
+`merge_snapshots` is the one merge for this CLI and for the dashboard's
+background top-up, and it keeps **one row per transaction**:
+`TRANSACTION_NUMBER` is DLD's `transaction_id`, unique per row of the feed,
+and `dedupe_snapshot` keeps the last version in frame order (fetched rows go
+after stored ones; rows without a number only lose exact duplicates). The
+feed is reloaded in full every day and DLD keeps revising recent sales.
+Measured against the feed on 2026-11-14 for sales since 2026-08-01 (40.5k
+stored rows): 341 had been re-dated — always forward, mostly 1-9 days, nearly
+all `Sell - Pre registration` — and the old exact-row rule kept both
+versions, about 2% of a month's rows when the snapshot was topped up daily.
+A re-dated sale always lands on or after the last stored day, so the
+ordinary top-up window catches it. Not handled, because they are rare and
+fixing them means deleting or re-fetching old days: 21 sales DLD withdrew
+altogether, 10 that arrived late with a past date, and 72 with a later
+correction on an old day (mostly building names; 2 prices, 3 areas). A
+`--full-refresh --start-date 2024-08-12` rebuild is the way to reconcile all
+of them.
+
 ### Google Cloud Storage
 
 Current GCS resources:
@@ -297,8 +323,8 @@ GCP_SERVICE_ACCOUNT_JSON = '''
 ```
 
 Every snapshot write stamps blob metadata (`stored_at_utc`, `mode`,
-`existing_rows`, `fetched_rows`, `added_rows`, `date_end`; dashboard writes
-carry `mode=incremental_dashboard`), and the bucket keeps overwritten
+`existing_rows`, `fetched_rows`, `added_rows`, `updated_rows`, `date_end`;
+dashboard writes carry `mode=incremental_dashboard`), and the bucket keeps overwritten
 generations for about a week. To see when and by what the snapshot was last
 advanced, list them: `client.list_blobs(bucket, prefix=<object>,
 soft_deleted=True)`. The service account has object permissions only
