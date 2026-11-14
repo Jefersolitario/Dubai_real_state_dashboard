@@ -62,6 +62,20 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m model.optimize_rent_features
 .\.venv\Scripts\python.exe -m model.optimize_rent_features --rungs renovation
 
+# Campaign 5 runner: other learners (LightGBM, XGBoost, CatBoost), an anchored
+# target, blends, zero-shot time-series forecasts (Chronos, TimesFM 3) as
+# features, and what retraining more often is worth. Steps: prep, cv, blend,
+# age, forecast, cadence, holdout. Its extra packages are NOT app requirements
+# (see the module docstring); working files go to .tmp/campaign5.
+# 2026-11 verdict (reports/model_family_campaign_report.md): the design stays
+# and retraining is the lever — on 69 held-out days the live 96-day-old bundle
+# scored 4.37% MedAPE, the same design retrained monthly or weekly 4.13%.
+# Averaging the model with its anchored-target twin adds a confirmed 0.09pp
+# but is below the complexity bar; every other candidate was null or worse.
+.\.venv\Scripts\python.exe -m model.optimize_model_family prep
+.\.venv\Scripts\python.exe -m model.optimize_model_family cv hgb lgbm hgb_anchored
+.\.venv\Scripts\python.exe -m model.optimize_model_family blend hgb lgbm hgb_anchored
+
 # Pull DM building permits and publish dld_reference/modification_permits.parquet
 # (adjustment/addition permits linked to projects via parcel_id -> dld_buildings;
 # yearly chunks so the gateway token cannot expire mid-pull). Feeds the Fair
@@ -175,6 +189,14 @@ reference data when stale (`python -m ingestion.store_reference_data_gcs`,
 monthly is plenty) → `python -m model.train_fair_value` → the deployed app
 picks the new bundle up automatically.
 
+Retrain at least monthly, weekly for preference: a fitted model ages even
+though its comps features stay live. Measured on 2026-09-04..11-12 (campaign
+5): the bundle trained 10 Aug scored 4.37% MedAPE, the same design trained
+once on sales to 3 Sep 4.27%, retrained every 28 days 4.13%, every 7 days
+4.13% with the lowest false-flag share (4.99% vs 5.20%). Out-of-fold, error
+rises from 3.5% in a model's first fortnight to 4.1% by weeks 9-10. A fit
+takes about 40 seconds on four cores.
+
 ### ingestion/store_reference_data_gcs.py
 
 Pulls DLD reference datasets to GCS under `dld_reference/`: `projects.parquet`
@@ -208,6 +230,28 @@ gateway blip costs one chunk (HTTP 408 is retryable in `dda_api`).
 ### -m model.optimize_fair_value
 
 Improvement loop: ladder of feature/model proposals measured by mean CV MedAPE, accepts a change only if it improves ≥0.05pp, stops after <0.2pp gains for 2 consecutive iterations or 10 iterations. Writes `reports/fair_value_optimization_report.md`, optional `--progress-json`, and `fair_value_config.json` (the shipping config).
+
+### -m model.optimize_model_family
+
+Campaign 5 runner (`reports/model_family_campaign_report.md` is its curated
+record). Selection uses sales through `SELECTION_END` on the same
+`TimeSeriesSplit(10)` as `cross_validate`, keeps every learner's out-of-fold
+predictions (so blends are judged on rows neither their members nor their
+weights saw), and leaves the following test window to `cadence` and `holdout`.
+`cv` names: `hgb` (shipped), `hgb_anchored` (target = deviation from the most
+specific trailing comp), `hgb_iter2400`, `lgbm`, `xgb`, `cat`, and
+`hgb@<level>:<model>` to add a forecast as features after
+`forecast <level> <models>` has produced it (levels `area_rooms`, `project`;
+models `naive`, `mean4`, `ewma`, `bolt_small`, `bolt_base`, `chronos2`,
+`chronos2_mv`, `timesfm3`). Measured 2026-11: LightGBM +0.02pp, anchored
++0.02pp with worse tails, XGBoost −0.15pp, CatBoost −0.27pp, more iterations
++0.01pp, every forecast feature within ±0.02pp (a forecast of a district's or
+project's price level cannot see the unit-level error that is left). Plain
+averages do help — shipped + anchored +0.06pp in CV and +0.09pp on the
+held-out days — but not by the +0.10pp over the best member the campaign
+required, so nothing ships; fitted blend weights add nothing over the average.
+sklearn's histogram binning raises on a feature with no observed value, which
+is why an all-missing forecast column is set to a constant per fold.
 
 ### -m tests.smoke_test_fair_value
 

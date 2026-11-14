@@ -233,7 +233,9 @@ the model bundle are refreshed only by the commands above.
 
 The deployed app never trains — it loads the published bundle (6h cache).
 Monitoring rules: retrain weekly (a 4-month-stale model overstates fair
-values ≈1.1% in a falling market); alarm if the live monthly median spread
+values ≈1.1% in a falling market; on 69 held-out days in autumn 2026 a
+96-day-old model scored 4.37% median error against 4.13% for the same design
+retrained at least monthly); alarm if the live monthly median spread
 drifts beyond ±2% or cleaning counts jump (repairs > 0.2%, review > 2%).
 All gateway fetches page by a unique key (`transaction_id` for sales,
 `contract_id` for rents) — paging by date shuffled page boundaries between
@@ -246,6 +248,7 @@ audit's pagination check is the regression sentinel for this.
 |---|---|
 | `reports/distress_validation_report.md` | Walk-forward outcome backtest of the flags |
 | `reports/fair_value_optimization_report.md` | The 110-experiment accuracy campaign log |
+| `reports/model_family_campaign_report.md` | Campaign 5: retraining cadence, other learners, blends, TimesFM 3 / Chronos forecasts |
 | `reports/shap_insights_report.md` | SHAP analysis: drivers, insights, recommendations |
 | `reports/data_cleaning_report.md` | Cleaning rules, real-data counts, enable decision |
 | `reports/data_cleaning_research_report.md` | Industry best-practice review (IAAO, Land Registry…) |
