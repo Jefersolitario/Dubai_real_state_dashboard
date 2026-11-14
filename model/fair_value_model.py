@@ -32,7 +32,7 @@ from sklearn.inspection import permutation_importance
 from sklearn.model_selection import TimeSeriesSplit
 
 from model import data_cleaning
-from dashboard_constants import DISTRICT_TIER, SQM_TO_SQFT
+from dashboard_constants import DISTRICT_TIER, NAME_COLUMNS, SQM_TO_SQFT, tidy_name_expr
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -302,9 +302,10 @@ def _backfill_optional_columns(raw: pl.DataFrame) -> pl.DataFrame:
 def _filter_scoreable_sales(raw: pl.DataFrame) -> pl.DataFrame:
     """Apartment Sales rows with positive price/area, market procedures only.
 
-    Also merges case variants of project/building names (e.g. "Imperial
-    Residence" vs "IMPERIAL RESIDENCE") so the encoder sees one category
-    per real-world name.
+    Also merges case and whitespace variants of project/building names
+    (e.g. "Imperial Residence" vs "IMPERIAL RESIDENCE", "SOL BAY " vs
+    "SOL BAY") so the encoder and every per-project statistic see one
+    category per real-world name.
     """
     df = raw.filter(
         (pl.col("GROUP_EN").cast(pl.Utf8).str.to_lowercase().str.contains("sale"))
@@ -319,8 +320,8 @@ def _filter_scoreable_sales(raw: pl.DataFrame) -> pl.DataFrame:
     if df.is_empty():
         return df
     return df.with_columns(
-        pl.col(c).cast(pl.Utf8).str.to_uppercase().alias(c)
-        for c in ("PROJECT_EN", "MASTER_PROJECT_EN", "BUILDING_NAME_EN")
+        tidy_name_expr(c).str.to_uppercase().alias(c)
+        for c in NAME_COLUMNS
         if c in df.columns
     )
 
@@ -1244,6 +1245,34 @@ BUNDLE_VERSION = 2  # v2: feature-config key "te_hist" renamed to "price_history
 CONFIG_KEY_MIGRATIONS = {"te_hist": "price_history"}
 
 
+def _tidy_name_categories(
+    encoders: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int]]:
+    """Name-category keys spelled the way feature_engineering spells names.
+
+    A bundle trained before names were whitespace-tidied holds keys such as
+    "SOL BAY "; left alone, every sale of that project would encode as
+    unseen. Where two keys tidy to the same name the more frequent one
+    (lower code) wins. A no-op for bundles trained on tidy names.
+    """
+    tidied = dict(encoders)
+    for column in NAME_COLUMNS:
+        mapping = encoders.get(column)
+        if not mapping:
+            continue
+        keys = (
+            pl.DataFrame(
+                {"name": list(mapping.keys()), "code": list(mapping.values())},
+                schema={"name": pl.Utf8, "code": pl.Int64},
+            )
+            .with_columns(tidy_name_expr("name"))
+            .sort("code")
+            .unique(subset="name", keep="first", maintain_order=True)
+        )
+        tidied[column] = dict(zip(keys["name"].to_list(), keys["code"].to_list()))
+    return tidied
+
+
 def export_bundle(result: FairValueResult, extra: dict | None = None) -> bytes:
     """Serialize a trained model + everything inference needs.
 
@@ -1275,7 +1304,8 @@ def load_bundle(data: bytes) -> tuple[FairValueResult, dict]:
 
     Warns (does not fail) on sklearn version mismatch — HGB pickles are
     generally forward-compatible within minor releases, and the weekly
-    retrain refreshes the bundle anyway.
+    retrain refreshes the bundle anyway. Name-category keys are tidied to
+    match feature_engineering (see :func:`_tidy_name_categories`).
     """
     import sklearn
 
@@ -1293,7 +1323,7 @@ def load_bundle(data: bytes) -> tuple[FairValueResult, dict]:
     }
     result = FairValueResult(
         model=payload["model"],
-        encoders=payload["encoders"],
+        encoders=_tidy_name_categories(payload["encoders"]),
         feature_names=payload["feature_names"],
         categorical_idx=payload["categorical_idx"],
         feature_config=feature_config,

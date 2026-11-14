@@ -13,6 +13,8 @@ import time
 import polars as pl
 import requests
 
+from dashboard_constants import NAME_COLUMNS, tidy_name_expr
+
 
 DEFAULT_BASE_URL = "https://apis.data.dubai"
 STAGING_BASE_URL = "https://stg-apis.data.dubai"
@@ -738,6 +740,13 @@ def _normalize_types(df: pl.DataFrame) -> pl.DataFrame:
             if column == "AREA_EN":
                 value = value.str.to_uppercase()
             expressions.append(value.alias(column))
+
+    # DLD re-published ~190 project names without their trailing padding in
+    # autumn 2026. Stored untidied, the two spellings split one project into
+    # two for every consumer and defeat the full-row dedupe.
+    for column in NAME_COLUMNS:
+        if column in df.columns:
+            expressions.append(tidy_name_expr(column))
 
     if expressions:
         return df.with_columns(expressions)

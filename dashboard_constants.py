@@ -174,6 +174,16 @@ for _area, _tier in TIER_MAP.items():
 # DLD reports ACTUAL_AREA in square metres; the dashboard displays sqft.
 SQM_TO_SQFT = 10.7639
 
+# Free-text DLD names. The feed has published the same project padded
+# ("SOL BAY ") and later unpadded ("SOL BAY"); anything that groups or encodes
+# by name must see one spelling per real-world name.
+NAME_COLUMNS = ("PROJECT_EN", "MASTER_PROJECT_EN", "BUILDING_NAME_EN")
+
+
+def tidy_name_expr(column: str) -> pl.Expr:
+    """``column`` as text with whitespace runs collapsed and the ends trimmed."""
+    return pl.col(column).cast(pl.Utf8).str.replace_all(r"\s+", " ").str.strip_chars()
+
 
 def area_display_expr() -> pl.Expr:
     """AREA_EN mapped to its friendly display name (unmapped pass through)."""

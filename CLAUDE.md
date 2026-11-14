@@ -209,7 +209,7 @@ Improvement loop: ladder of feature/model proposals measured by mean CV MedAPE, 
 
 ### -m tests.smoke_test_fair_value
 
-Synthetic end-to-end test of the fair-value pipeline (planted underpriced rows must dominate the flags). Run before touching model logic.
+Synthetic end-to-end test of the fair-value pipeline (planted underpriced rows must dominate the flags; padded and tidy spellings of a project name must store once, build identical features and score identically from a bundle trained on the padded spelling). Run before touching model logic.
 
 ### -m tests.smoke_test_snapshot_store
 
@@ -227,7 +227,7 @@ Dubai Data API helper module. It handles:
 - requesting an OAuth bearer token for the Dubai Data API
 - fetching paginated dataset records
 - building DLD transaction filters
-- normalizing DLD transaction records to the dashboard column names
+- normalizing DLD transaction records to the dashboard column names (text columns are trimmed; project, master-project and building names are also whitespace-tidied via `tidy_name_expr`)
 - validating required dashboard columns
 
 `DEFAULT_LOOKBACK_MONTHS = 24` and `DEFAULT_MAX_RECORDS = 1_000_000` size the default fetch window. `fetch_dataset_records` retries each page with exponential backoff (the gateway intermittently returns 502).
@@ -310,6 +310,7 @@ soft_deleted=True)`. The service account has object permissions only
 - `AREA_EN` holds official DLD district names (e.g. `MARSA DUBAI` is Dubai Marina, `AL BARSHA SOUTH FOURTH` is JVC, `AL JADAF` is Al Jadaf). Always map through `AREA_DISPLAY` / `_area_display_expr()` before showing areas to users; unmapped districts pass through unchanged.
 - `ACTUAL_AREA` is in square metres. Convert with `SQM_TO_SQFT` (10.7639) before displaying any sqft figure — `meter_sale_price` in the raw data confirms per-square-metre units.
 - `ROOMS_EN` values such as `"1 B/R"` and `"2 B/R"` are normalized to `"1BR"` and `"2BR"`.
+- One real-world name must have one spelling. `PROJECT_EN`, `MASTER_PROJECT_EN` and `BUILDING_NAME_EN` (`NAME_COLUMNS`) go through `tidy_name_expr` (whitespace runs collapsed, ends trimmed) in `normalize_dld_transactions`, again in the model's `_filter_scoreable_sales` (which also upper-cases), and `load_bundle` tidies the name-category keys of a bundle trained on older spellings. Between 2026-09 and 2026-11 DLD re-published ~190 project names without their trailing padding (`"SOL BAY "` → `"SOL BAY"`); untidied, each such project split in two — its recent sales lost their project comps and counted as an "illiquid project", so distressed flags for the month to 2026-11-12 read 31 where 19 were real. Tidying moved no accuracy figure (69-day out-of-sample MedAPE 4.32% → 4.33%) and merges no two project numbers. The model still keys projects on the name, not `PROJECT_NUMBER`.
 - The bedroom filter uses `"All"` as the unfiltered option.
 - `_layout_defaults()` should not include `margin`; individual charts set margins themselves.
 - Keep API credentials out of git. `.streamlit/secrets.toml` is intentionally ignored.

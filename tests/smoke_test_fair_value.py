@@ -8,13 +8,16 @@ planted bargains dominate the flagged set, and unseen categories score
 without errors. No Streamlit, no network.
 """
 
+import dataclasses
 import sys
 from datetime import date, timedelta
 
 import numpy as np
 import polars as pl
 
-from dashboard_constants import SQM_TO_SQFT
+from dashboard_constants import NAME_COLUMNS, SQM_TO_SQFT, tidy_name_expr
+from ingestion.dda_api import normalize_dld_transactions
+from ingestion.store_dld_transactions_gcs import dedupe_snapshot
 from model.fair_value_model import (
     cross_validate,
     export_bundle,
@@ -189,11 +192,64 @@ def main() -> int:
     top = result.importances.head(3).get_column("feature").to_list()
     print(f"       top importances: {top}")
 
+    ok &= check_name_spellings(raw, result, feats, scored)
     ok &= check_reference_groups(raw)
     ok &= check_data_cleaning()
 
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
+
+
+def check_name_spellings(raw: pl.DataFrame, result, feats: pl.DataFrame, scored: pl.DataFrame) -> bool:
+    """A project stays one project however the feed pads its name.
+
+    Replays the autumn-2026 feed change: sales before a cut-off carry padded
+    names (" P1 ", doubled inner spaces), later ones the tidy spelling.
+    """
+    base = raw.with_columns(pl.col("BUILDING_NAME_EN").str.replace("-", " "))
+    early = pl.col("INSTANCE_DATE") < "2025-07-01"
+    padded = base.with_columns(
+        pl.when(early)
+        .then(pl.format(" {} ", pl.col(c).str.replace_all(" ", "  ")))
+        .otherwise(pl.col(c))
+        .alias(c)
+        for c in NAME_COLUMNS
+    )
+
+    # Storage: the same sale fetched under both spellings is stored once, tidy.
+    stored = dedupe_snapshot(
+        normalize_dld_transactions(pl.concat([padded.filter(early).head(50), base.filter(early).head(50)]))
+    )
+    untidy = stored.select(
+        pl.any_horizontal([pl.col(c) != tidy_name_expr(c) for c in NAME_COLUMNS]).any()
+    ).item()
+    ok = check(stored.height == 50 and not untidy, "names: both spellings of a sale are stored once, tidied")
+
+    # Features: comps, project totals and the unit key ignore the padding.
+    cfg = {
+        "project": True, "building": True, "comps_project": True,
+        "repeat_sale": True, "price_history": True, "rel_size": True,
+    }
+    ok &= check(
+        feature_engineering(padded, cfg).equals(feature_engineering(base, cfg)),
+        "names: padded and tidy spellings build identical features",
+    )
+
+    # Saved model: a bundle trained on padded names still recognises them.
+    old_encoders = {
+        column: (
+            {(f"{name} " if isinstance(name, str) else name): code for name, code in mapping.items()}
+            if column in NAME_COLUMNS
+            else mapping
+        )
+        for column, mapping in result.encoders.items()
+    }
+    migrated, _ = load_bundle(export_bundle(dataclasses.replace(result, encoders=old_encoders)))
+    same = migrated.encoders == result.encoders and np.array_equal(
+        score_transactions(migrated, feats).get_column("pred_psf").to_numpy(),
+        scored.get_column("pred_psf").to_numpy(),
+    )
+    return ok & check(same, "names: a bundle trained on padded names scores tidy names identically")
 
 
 def check_reference_groups(raw: pl.DataFrame) -> bool:
