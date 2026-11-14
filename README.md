@@ -181,9 +181,10 @@ dubai_dashboard.py       # Streamlit entrypoint (Market Overview, Buyer Opportun
 fair_value_tab.py        # Fair Value page UI
 rent_scanner_tab.py      # Rent Opportunity Scanner page UI
 dashboard_constants.py   # shared constants (areas, tiers, unit conversion)
+snapshot_store.py        # shared transactions snapshot + its background sync (no Streamlit)
 ingestion/               # DLD API client, GCS storage, snapshot & reference pulls
 model/                   # fair-value model, data cleaning, training, optimization, backtest
-tests/                   # smoke tests (API, GCS, model) + rent data-quality audit
+tests/                   # smoke tests (API, GCS, model, snapshot store, rent pipeline) + rent data-quality audit
 reports/                 # research & results reports with findings (+ figures/)
 docs/                    # access notes, phase-3 plan
 ```
@@ -209,7 +210,23 @@ python -m model.train_fair_value
 
 # End-to-end smoke test (synthetic; run before touching model logic)
 python -m tests.smoke_test_fair_value
+
+# Offline checks of the app's snapshot holder and the rent pipeline
+python -m tests.smoke_test_snapshot_store
+python -m tests.smoke_test_rent_pipeline
 ```
+
+**How the deployed app stays current.** Every page renders from the stored
+snapshot straight away. One background worker per app process then asks the
+DLD API for the days after the snapshot's last one (at most every 15
+minutes, in month-sized steps), stores them, and swaps the new data in for
+every open session; a snapshot refreshed from the command line is picked up
+within five minutes. When the data is four or more days behind, the page
+says why — downloading, last download failed, or DLD has nothing newer —
+instead of showing old charts without comment. The worker only runs while
+someone has the app open, so after a long idle spell the first visitor sees
+the catch-up notice for a couple of minutes; the Rent Scanner artifacts and
+the model bundle are refreshed only by the commands above.
 
 The deployed app never trains — it loads the published bundle (6h cache).
 Monitoring rules: retrain weekly (a 4-month-stale model overstates fair
@@ -252,7 +269,8 @@ GCP_SERVICE_ACCOUNT_JSON = '''
 '''
 ```
 
-DDA API secrets are needed only for refreshing the snapshot / API fallback:
+DDA API secrets let the deployed app top up its own snapshot (and run the
+refresh commands); without them the app still serves the stored snapshot:
 
 ```toml
 DDA_BASE_URL = "https://apis.data.dubai"
@@ -272,10 +290,11 @@ Bucket: dubai-real-estate-dashboard-jef (EU multi-region, uniform access, public
 Service account: dubai-dashboard-gcs@realstateproject-500813.iam.gserviceaccount.com (Storage Object Admin)
 ```
 
-Current snapshot: **363,219 rows, 24 months** (verified row count, columns,
-dedup, and date coverage on every refresh; rebuilt 2026-08-10 with stable
-`transaction_id` pagination, recovering ~40k transactions that date-ordered
-paging had silently skipped).
+Current snapshot: **about 401k rows from 2024-08-12 onward** (row count,
+columns, dedup, and date coverage verified on every write). It was rebuilt
+on 2026-08-10 as a 363,219-row, 24-month pull with stable `transaction_id`
+pagination — recovering ~40k transactions that date-ordered paging had
+silently skipped — and has been topped up by the dashboard since.
 
 ## Commit safety
 

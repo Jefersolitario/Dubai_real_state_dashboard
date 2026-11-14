@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Interactive Streamlit dashboard for Dubai real estate apartment transactions. The app loads normalized DLD transaction snapshots from Google Cloud Storage Parquet first, with the production Dubai Data API kept as a fallback/source for refreshing the snapshot. The snapshot holds 24 months of history.
+Interactive Streamlit dashboard for Dubai real estate apartment transactions. The app serves the normalized DLD transaction snapshot stored in Google Cloud Storage and keeps it current itself: a background worker tops it up from the production Dubai Data API, never inside a page render. The snapshot started as a 24-month pull (from 2024-08) and grows with every top-up.
 
 ## Commands
 
@@ -42,6 +42,11 @@ Interactive Streamlit dashboard for Dubai real estate apartment transactions. Th
 .\.venv\Scripts\python.exe -m tests.smoke_test_fair_value
 .\.venv\Scripts\python.exe -m model.optimize_fair_value
 
+# Offline checks of the app's shared snapshot holder and the rent pipeline
+# (no network, no credentials; run before touching either)
+.\.venv\Scripts\python.exe -m tests.smoke_test_snapshot_store
+.\.venv\Scripts\python.exe -m tests.smoke_test_rent_pipeline
+
 # Campaign runner for unit-signal features (rents, renovation permits) with
 # reference frames + tail-veto gate. --rungs filters to named candidates; the
 # run's own table goes to reports/campaign_last_run.md, while
@@ -77,7 +82,7 @@ pip install -r requirements.txt
 Single-file Streamlit app with this flow:
 
 1. **Constants** - schema assumptions and chart colors. `AREA_DISPLAY`, `NEIGHBORHOODS`, tier definitions, `SQM_TO_SQFT`, and shared expressions/`layout_defaults` live in `dashboard_constants.py` (import from there).
-2. **Data loading** - cached GCS Parquet snapshot handling, falling back to the production DDA API when needed.
+2. **Data loading** - `_snapshot_store()` holds one `SnapshotStore` per app process (see `snapshot_store.py`): every session renders from the stored GCS snapshot (a DDA API pull is only the fallback when no stored object can be read) and a single background worker keeps it current. `_top_up_snapshot` fetches the days after the last loaded one in `TOP_UP_CHUNK_DAYS` windows and stores each window with a generation precondition, so a snapshot written meanwhile by the CLI is adopted rather than overwritten; `_render_freshness_notice` tells the visitor when the data is `STALE_AFTER_DAYS` or more behind (downloading / last download failed / DLD has nothing newer).
 3. **Data normalization** - maps DDA API columns into the dashboard schema.
 4. **Aggregation helpers** - daily, weekly, Dubai-wide, tier, and area-level metrics using Polars.
 5. **Chart builders** - Plotly figures for price trends, volume, momentum, tiers, and scatter views.
@@ -86,6 +91,30 @@ Single-file Streamlit app with this flow:
 ### dashboard_constants.py (root)
 
 Shared constants and pure Polars/layout helpers (`AREA_DISPLAY`, `NEIGHBORHOODS`, `TIER_*`, `DISTRICT_TIER`, `SQM_TO_SQFT`, `area_display_expr`, `bedroom_type_expr`, `layout_defaults`). No Streamlit/Plotly imports so pure modules can use it.
+
+### snapshot_store.py (root)
+
+Process-wide holder for the transactions snapshot and its background sync;
+no Streamlit imports. Contract: `current()` returns the served
+`(frame, meta)` and only ever waits for the first load; `request_sync()` is
+called on every rerun and starts at most one worker, which (a) adopts a
+stored snapshot whose generation differs from `meta["snapshot_token"]`
+(checked every `SNAPSHOT_RECHECK_SECONDS`) and (b) runs the injected top-up
+(at most every `TOP_UP_RETRY_SECONDS`, success or failure). A top-up result
+replaces the served frame for all sessions at once and bumps `version`; a
+failure — including polars' `PanicException`, a `BaseException` — is
+recorded in `status().error` and never leaves the store stuck. Invariant to
+keep: **no page render may call the DLD API or wait on it**. The old
+in-render top-up left a stale snapshot blank for minutes while it fetched,
+ran once per visitor in parallel, and after a failed fetch showed old data
+with no explanation.
+
+To replay a stale visit locally, copy the snapshot truncated at some date
+under `GCS_TEST_PREFIX` and start the app with a second secrets file that
+points `GCS_TRANSACTIONS_OBJECT` at it
+(`streamlit run dubai_dashboard.py --secrets.files <file>`). An environment
+variable does not work for this: Streamlit exports every root-level secret
+into `os.environ`, overwriting it.
 
 ### model/fair_value_model.py
 
@@ -182,6 +211,14 @@ Improvement loop: ladder of feature/model proposals measured by mean CV MedAPE, 
 
 Synthetic end-to-end test of the fair-value pipeline (planted underpriced rows must dominate the flags). Run before touching model logic.
 
+### -m tests.smoke_test_snapshot_store
+
+Drives `SnapshotStore` with in-memory fakes and a fake clock: one load, a top-up served to every later caller, one fetch for five simultaneous visitors, the cooldown, failures reported without sticking, adoption of a snapshot stored elsewhere, and a multi-round catch-up.
+
+### -m tests.smoke_test_rent_pipeline
+
+Synthetic Ejari-shaped data through the real `_slim_rents` / `_weekly_stats` / `_recent_contracts` helpers and the Rent Scanner chart builders (district round-trip, rooms banding, the "All" band and new-contract segment, the dot/box view switch).
+
 ### ingestion/dda_api.py
 
 Dubai Data API helper module. It handles:
@@ -258,6 +295,14 @@ GCP_SERVICE_ACCOUNT_JSON = '''
 '''
 ```
 
+Every snapshot write stamps blob metadata (`stored_at_utc`, `mode`,
+`existing_rows`, `fetched_rows`, `added_rows`, `date_end`; dashboard writes
+carry `mode=incremental_dashboard`), and the bucket keeps overwritten
+generations for about a week. To see when and by what the snapshot was last
+advanced, list them: `client.list_blobs(bucket, prefix=<object>,
+soft_deleted=True)`. The service account has object permissions only
+(`client.bucket(name)`, not `get_bucket`).
+
 ## Key Patterns
 
 - Use Polars for data processing. Do not introduce pandas unless there is a strong reason.
@@ -269,9 +314,10 @@ GCP_SERVICE_ACCOUNT_JSON = '''
 - `_layout_defaults()` should not include `margin`; individual charts set margins themselves.
 - Keep API credentials out of git. `.streamlit/secrets.toml` is intentionally ignored.
 - Keep GCS service account JSON out of git. Use Streamlit Cloud secrets for deployment.
+- `requirements.txt` pins every package exactly. Streamlit Cloud reinstalls on each wake, so an unpinned package jumps to its newest release unannounced (polars 2.0 removed string-to-date casts). `scikit-learn` must equal the version that trained the published bundle (`load_bundle` warns otherwise): bump it only together with a retrain.
 
 ## API Notes
 
 - Test/STG and production credentials are different.
-- The DDA API may be restricted by region/network policy.
+- The DDA API may be restricted by region/network policy. The deployed app does reach it from Streamlit Cloud for its own top-ups, but not reliably — which is why a failed download surfaces as a notice instead of blocking the page.
 - Never print or commit `client_secret`, `client_id`, or `x-DDA-SecurityApplicationIdentifier`.
