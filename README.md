@@ -186,6 +186,7 @@ ingestion/               # DLD API client, GCS storage, snapshot & reference pul
 model/                   # fair-value model, data cleaning, training, optimization, backtest
 tests/                   # smoke tests (API, GCS, model, snapshot store, rent pipeline) + rent data-quality audit
 reports/                 # research & results reports with findings (+ figures/)
+research_notes/          # cited source notes behind the research reports, one folder per report
 docs/                    # access notes, phase-3 plan
 ```
 
@@ -247,6 +248,7 @@ audit's pagination check is the regression sentinel for this.
 | Report | What it contains |
 |---|---|
 | `reports/distress_validation_report.md` | Walk-forward outcome backtest of the flags |
+| `reports/Dubai below market property sourcing.md` | Step back, with sources: whether the model and its median-error metric are the right way to find distressed, urgent and auction sales, the industry-standard error for valuation models, and what to change |
 | `reports/fair_value_optimization_report.md` | The 110-experiment accuracy campaign log |
 | `reports/model_family_campaign_report.md` | Campaign 5: retraining cadence, other learners, blends, TimesFM 3 / Chronos forecasts |
 | `reports/model_tuning_review_report.md` | Review of campaign 5's tuning: sensitivity of TimesFM 3 / Chronos vs XGBoost to their settings, tuned learners, the ceiling for forecast features |
